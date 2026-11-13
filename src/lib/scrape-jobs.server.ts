@@ -149,12 +149,16 @@ export async function requireAdminApiRequest(
   | { ok: true; userId: string; supabase: SupabaseClient<Database> }
   | { ok: false; response: Response }
 > {
-  const SUPABASE_URL = process.env["SUPABASE_URL"];
-  const SUPABASE_PUBLISHABLE_KEY = process.env["SUPABASE_PUBLISHABLE_KEY"];
-  if (!SUPABASE_URL || !SUPABASE_PUBLISHABLE_KEY) {
+  const SUPABASE_URL = process.env["SUPABASE_URL"] || process.env["VITE_SUPABASE_URL"];
+  const SUPABASE_ANON_KEY =
+    process.env["SUPABASE_ANON_KEY"] ||
+    process.env["VITE_SUPABASE_ANON_KEY"] ||
+    process.env["SUPABASE_PUBLISHABLE_KEY"] ||
+    process.env["VITE_SUPABASE_PUBLISHABLE_KEY"];
+  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     console.error("[AdminAuth] Missing Supabase configuration", {
       hasUrl: Boolean(SUPABASE_URL),
-      hasPublishableKey: Boolean(SUPABASE_PUBLISHABLE_KEY),
+      hasAnonKey: Boolean(SUPABASE_ANON_KEY),
     });
     return {
       ok: false,
@@ -173,9 +177,9 @@ export async function requireAdminApiRequest(
     return { ok: false, response: Response.json({ error: "Invalid token" }, { status: 401 }) };
   }
 
-  const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_PUBLISHABLE_KEY, {
+  const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_ANON_KEY, {
     global: {
-      fetch: createAuthCheckFetch(SUPABASE_PUBLISHABLE_KEY),
+      fetch: createAuthCheckFetch(SUPABASE_ANON_KEY),
       headers: { Authorization: `Bearer ${token}` },
     },
     auth: { storage: undefined, persistSession: false, autoRefreshToken: false },

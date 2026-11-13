@@ -119,11 +119,26 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
   errorComponent: ErrorComponent,
 });
 
+function getPublicSupabaseEnvScript(): string {
+  if (typeof process === "undefined") return "";
+  const url = process.env["SUPABASE_URL"] || process.env["VITE_SUPABASE_URL"] || "";
+  const anonKey =
+    process.env["SUPABASE_ANON_KEY"] ||
+    process.env["VITE_SUPABASE_ANON_KEY"] ||
+    process.env["SUPABASE_PUBLISHABLE_KEY"] ||
+    process.env["VITE_SUPABASE_PUBLISHABLE_KEY"] ||
+    "";
+  if (!url && !anonKey) return "";
+  return `window.__SUPABASE_ENV__=${JSON.stringify({ url, anonKey }).replace(/</g, "\\u003c")}`;
+}
+
 function RootShell({ children }: { children: ReactNode }) {
+  const supabaseEnvScript = getPublicSupabaseEnvScript();
   return (
     <html lang="en" className="dark" suppressHydrationWarning>
       <head>
         <ScriptOnce>{themeInitScript}</ScriptOnce>
+        {supabaseEnvScript ? <ScriptOnce>{supabaseEnvScript}</ScriptOnce> : null}
         <HeadContent />
       </head>
       <body>
