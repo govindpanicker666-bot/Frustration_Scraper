@@ -1,0 +1,6 @@
+{
+  "name": "Churnhound",
+  "description": "Turn competitor frustration into pipeline. Find people publicly complaining about competitors and generate outreach pitches.",
+  "permissions": [],
+  "capabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}

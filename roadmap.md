@@ -1,0 +1,3 @@
+- [x] Reject neutral/positive mentions and require explicit negative evidence.
+- [x] Deduplicate leads by stable contact/profile identity and cross-posted text, not display names.
+- [x] Correct existing neutral leads and verify signed-in Leads view.

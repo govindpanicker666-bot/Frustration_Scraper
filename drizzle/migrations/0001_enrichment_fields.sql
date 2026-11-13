@@ -1,0 +1,2 @@
+ALTER TABLE public.competitors ADD COLUMN IF NOT EXISTS domain text, ADD COLUMN IF NOT EXISTS description text, ADD COLUMN IF NOT EXISTS keywords text[] NOT NULL DEFAULT '{}';
+ALTER TABLE public.leads ADD COLUMN IF NOT EXISTS email text, ADD COLUMN IF NOT EXISTS email_status text, ADD COLUMN IF NOT EXISTS job_title text, ADD COLUMN IF NOT EXISTS company text, ADD COLUMN IF NOT EXISTS company_domain text, ADD COLUMN IF NOT EXISTS linkedin_url text, ADD COLUMN IF NOT EXISTS lead_type text NOT NULL DEFAULT 'social_signal';

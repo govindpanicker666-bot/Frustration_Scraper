@@ -1,0 +1,1 @@
+ALTER TABLE public.competitor_news ADD COLUMN IF NOT EXISTS why_it_matters text;
