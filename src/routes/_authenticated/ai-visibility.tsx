@@ -107,7 +107,7 @@ function AIVisibilityPage() {
     return scans.filter(
       (row) =>
         row.brand_name === key &&
-        Math.abs(new Date(row.created_at).getTime() - timestamp) < 5 * 60_000,
+        row.created_at === latest.created_at,
     );
   }, [latest, scans]);
 
@@ -118,9 +118,10 @@ function AIVisibilityPage() {
     const averageScore = total
       ? Math.round(rows.reduce((sum, row) => sum + row.visibility_score, 0) / total)
       : 0;
-    const positive = rows.filter((row) => row.sentiment === "positive").length;
-    const neutral = rows.filter((row) => row.sentiment === "neutral").length;
-    const negative = rows.filter((row) => row.sentiment === "negative").length;
+    const mentionedRows = rows.filter((row) => row.rank_position !== null);
+    const positive = mentionedRows.filter((row) => row.sentiment === "positive").length;
+    const neutral = mentionedRows.filter((row) => row.sentiment === "neutral").length;
+    const negative = mentionedRows.filter((row) => row.sentiment === "negative").length;
     const ranked = rows.filter((row) => row.rank_position !== null);
     const averageRank = ranked.length
       ? Number((ranked.reduce((sum, row) => sum + (row.rank_position ?? 0), 0) / ranked.length).toFixed(1))
