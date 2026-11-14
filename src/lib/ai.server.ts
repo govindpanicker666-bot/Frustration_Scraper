@@ -33,11 +33,11 @@ async function callOnce(key: string, model: string, body: unknown, timeoutMs: nu
   }
 }
 
-async function callGemini(
+async function callGeminiWithModel(
   system: string,
   user: string,
   options: GeminiCallOptions = {},
-): Promise<string> {
+): Promise<{ text: string; model: string }> {
   const keys = [process.env["GEMINI_API_KEY"], process.env["GEMINI_API_KEY_2"]].filter(isUsableKey);
   if (!keys.length) throw new Error("GEMINI_API_KEY is not set");
 
@@ -72,7 +72,7 @@ async function callGemini(
           };
           const text =
             json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
-          if (text.trim().length > 0) return text;
+          if (text.trim().length > 0) return { text, model };
           const reason =
             json.candidates?.[0]?.finishReason ??
             json.promptFeedback?.blockReason ??
@@ -91,6 +91,15 @@ async function callGemini(
   throw new Error(lastErr || "Gemini request failed");
 }
 
+async function callGemini(
+  system: string,
+  user: string,
+  options: GeminiCallOptions = {},
+): Promise<string> {
+  const result = await callGeminiWithModel(system, user, options);
+  return result.text;
+}
+
 function parseJson<T>(text: string): T {
   const cleaned = text.replace(/```(?:json)?/g, "").trim();
   const start = cleaned.search(/[[{]/);
@@ -107,6 +116,16 @@ export async function geminiJson<T>(
   options?: GeminiCallOptions,
 ): Promise<T> {
   return parseJson<T>(await callGemini(system, user, options));
+}
+
+/** JSON result plus the exact model selected by the existing key/model fallback loop. */
+export async function geminiJsonWithModel<T>(
+  system: string,
+  user: string,
+  options?: GeminiCallOptions,
+): Promise<{ data: T; model: string }> {
+  const result = await callGeminiWithModel(system, user, options);
+  return { data: parseJson<T>(result.text), model: result.model };
 }
 
 /** Raw JSON text (caller parses). */
