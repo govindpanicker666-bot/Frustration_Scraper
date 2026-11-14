@@ -8,6 +8,45 @@ export type Database = {
   };
   public: {
     Tables: {
+      ai_visibility_scans: {
+        Row: {
+          brand_name: string;
+          citations: Json;
+          created_at: string;
+          id: string;
+          model_name: string;
+          prompt_text: string;
+          rank_position: number | null;
+          sentiment: string;
+          user_id: string;
+          visibility_score: number;
+        };
+        Insert: {
+          brand_name: string;
+          citations?: Json;
+          created_at?: string;
+          id?: string;
+          model_name: string;
+          prompt_text: string;
+          rank_position?: number | null;
+          sentiment?: string;
+          user_id: string;
+          visibility_score?: number;
+        };
+        Update: {
+          brand_name?: string;
+          citations?: Json;
+          created_at?: string;
+          id?: string;
+          model_name?: string;
+          prompt_text?: string;
+          rank_position?: number | null;
+          sentiment?: string;
+          user_id?: string;
+          visibility_score?: number;
+        };
+        Relationships: [];
+      };
       ai_brand_insights: {
         Row: {
           generated_at: string;
