@@ -12,6 +12,7 @@ import {
   Users,
   Crosshair,
   Newspaper,
+  Radar,
   LayoutTemplate,
 } from "lucide-react";
 import { ThemeToggle } from "@/components/ThemeToggle";
@@ -38,6 +39,7 @@ function AppLayout() {
     { to: "/leads", label: "Leads", icon: Users },
     { to: "/insights", label: "Insights", icon: BarChart3 },
     { to: "/brand-listening", label: "Brand Listening", icon: Megaphone },
+    { to: "/ai-visibility", label: "AI Visibility", icon: Radar },
     { to: "/news", label: "Competitor News", icon: Newspaper },
     { to: "/onboarding", label: "Competitors", icon: Crosshair },
     ...(me?.isAdmin
