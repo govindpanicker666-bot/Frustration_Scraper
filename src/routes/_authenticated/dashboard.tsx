@@ -3,6 +3,7 @@ import { useQuery } from "@tanstack/react-query";
 import { motion } from "framer-motion";
 import { Flame, Users, Gauge, Sparkles } from "lucide-react";
 import { AutoScrape } from "@/components/AutoScrape";
+import { CompanyBrandCard } from "@/components/CompanyBrandCard";
 import { leadsQuery, competitorsQuery } from "@/lib/queries";
 import { ScoreBadge } from "@/components/ScoreBadge";
 import { Button } from "@/components/ui/button";
@@ -70,14 +71,17 @@ function Dashboard() {
 
   if (!compsQ.isPending && !compsQ.isError && comps.length === 0)
     return (
-      <div className="glass p-10 text-center">
-        <h1 className="text-2xl font-semibold tracking-tight">Let's find your competitors</h1>
-        <p className="mt-2 text-muted-foreground">
-          Tell us your company and AI will suggest 40 or more competitors to watch.
-        </p>
-        <Button asChild variant="hero" className="mt-6">
-          <Link to="/onboarding">Get started</Link>
-        </Button>
+      <div className="space-y-6">
+        <CompanyBrandCard />
+        <div className="glass p-10 text-center">
+          <h1 className="text-2xl font-semibold tracking-tight">Let's find your competitors</h1>
+          <p className="mt-2 text-muted-foreground">
+            Tell us your company and AI will suggest 40 or more competitors to watch.
+          </p>
+          <Button asChild variant="hero" className="mt-6">
+            <Link to="/onboarding">Get started</Link>
+          </Button>
+        </div>
       </div>
     );
 
@@ -121,6 +125,7 @@ function Dashboard() {
           </motion.div>
         ))}
       </div>
+      <CompanyBrandCard />
       <AutoScrape />
       <div className="glass p-6">
         <div className="mb-4 flex items-center justify-between">

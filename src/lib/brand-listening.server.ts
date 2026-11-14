@@ -98,6 +98,15 @@ async function loadBrandUserContext(
 
   const blob = parseProgressBrandBlob(settings?.progress);
 
+  const fallbackName =
+    typeof blob["company_name"] === "string" && blob["company_name"].trim()
+      ? blob["company_name"].trim()
+      : null;
+  const fallbackUrl =
+    typeof blob["company_url"] === "string" && blob["company_url"].trim()
+      ? blob["company_url"].trim()
+      : null;
+
   const fullProfile = await db
     .from("profiles")
     .select("email,company_name,company_url,has_completed_brand_baseline")
@@ -110,8 +119,8 @@ async function loadBrandUserContext(
       ctx: {
         userId,
         email,
-        company_name: fullProfile.data?.company_name ?? null,
-        company_url: fullProfile.data?.company_url ?? null,
+        company_name: fullProfile.data?.company_name?.trim() || fallbackName,
+        company_url: fullProfile.data?.company_url?.trim() || fallbackUrl,
         has_completed_brand_baseline: Boolean(fullProfile.data?.has_completed_brand_baseline),
         supportsBaselineColumn: true,
       },
@@ -135,8 +144,8 @@ async function loadBrandUserContext(
     ctx: {
       userId,
       email,
-      company_name: basicProfile.data?.company_name ?? null,
-      company_url: basicProfile.data?.company_url ?? null,
+      company_name: basicProfile.data?.company_name?.trim() || fallbackName,
+      company_url: basicProfile.data?.company_url?.trim() || fallbackUrl,
       has_completed_brand_baseline: Boolean(blob["has_completed_brand_baseline"]),
       supportsBaselineColumn: false,
     },
@@ -421,9 +430,15 @@ export async function readBrandListeningState(
   return {
     ...base,
     company_name:
-      ctx.company_name ?? (typeof blob["company_name"] === "string" ? blob["company_name"] : null),
+      ctx.company_name ||
+      (typeof blob["company_name"] === "string" && blob["company_name"].trim()
+        ? blob["company_name"].trim()
+        : null),
     company_url:
-      ctx.company_url ?? (typeof blob["company_url"] === "string" ? blob["company_url"] : null),
+      ctx.company_url ||
+      (typeof blob["company_url"] === "string" && blob["company_url"].trim()
+        ? blob["company_url"].trim()
+        : null),
     last_scraped_at: typeof blob["last_scraped_at"] === "string" ? blob["last_scraped_at"] : null,
     has_completed_brand_baseline: ctx.has_completed_brand_baseline,
     baseline_running,
@@ -974,4 +989,69 @@ export async function generateAIBrandBaselineForUser(
   return generateAIBrandBaseline(db, userId, brandName, ctx.company_url, competitorNames, {
     force: Boolean(options.force),
   });
+}
+
+export async function readCompanyProfile(
+  db: DB,
+  userId: string,
+  emailHint?: string | null,
+): Promise<{ company_name: string | null; company_url: string | null }> {
+  const { ctx } = await loadBrandUserContext(db, userId, emailHint);
+  return {
+    company_name: ctx.company_name,
+    company_url: ctx.company_url,
+  };
+}
+
+export async function saveCompanyProfileToDb(
+  db: DB,
+  userId: string,
+  input: {
+    company_name?: string | null | undefined;
+    company_url?: string | null | undefined;
+    emailHint?: string | null | undefined;
+    preserveEmptyName?: boolean | undefined;
+  },
+): Promise<{ company_name: string | null; company_url: string | null }> {
+  const { ctx } = await loadBrandUserContext(db, userId, input.emailHint);
+  const nextNameRaw = input.company_name?.trim() ?? "";
+  const nextUrlRaw = input.company_url?.trim() ?? "";
+
+  const resolvedName = nextNameRaw || (input.preserveEmptyName ? ctx.company_name : null) || null;
+  const resolvedUrl = nextUrlRaw || (input.preserveEmptyName ? ctx.company_url : null) || null;
+
+  const { data: updatedRows, error: updateErr } = await db
+    .from("profiles")
+    .update({
+      company_name: resolvedName,
+      company_url: resolvedUrl,
+    })
+    .eq("id", userId)
+    .select("id");
+
+  if (updateErr || !updatedRows?.length) {
+    const email = ctx.email || `${userId}@users.local`;
+    const { error: upsertErr } = await db.from("profiles").upsert(
+      {
+        id: userId,
+        email,
+        company_name: resolvedName,
+        company_url: resolvedUrl,
+      },
+      { onConflict: "id" },
+    );
+    if (upsertErr && !isMissingSchemaError(upsertErr)) {
+      console.warn("[BrandListening] profiles upsert warning:", upsertErr.message);
+    }
+  }
+
+  await saveProgressMetadata(db, userId, {
+    company_name: resolvedName,
+    company_url: resolvedUrl,
+  });
+
+  return {
+    company_name: resolvedName,
+    company_url: resolvedUrl,
+  };
 }

@@ -3,7 +3,7 @@ import { z } from "zod";
 import { domainOf } from "./pipeline";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "@/integrations/supabase/types";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireAppSupabaseAuth } from "@/lib/supabase-auth";
 import { PLATFORMS, stripHtml, type Platform, type RawReview } from "./pipeline";
 
 export interface DetectedCompetitor {
@@ -15,7 +15,7 @@ export interface DetectedCompetitor {
 }
 
 export const detectCompetitors = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) =>
     z
       .object({
@@ -27,10 +27,17 @@ export const detectCompetitors = createServerFn({ method: "POST" })
   )
   .handler(async ({ data, context }) => {
     const { geminiJson } = await import("./ai.server");
-    await context.supabase
-      .from("profiles")
-      .update({ company_url: data.company_url, company_name: data.company_name ?? null })
-      .eq("id", context.userId);
+    const { saveCompanyProfileToDb } = await import("./brand-listening.server");
+    const emailClaim =
+      context.claims && typeof context.claims["email"] === "string"
+        ? context.claims["email"]
+        : null;
+    await saveCompanyProfileToDb(context.supabase, context.userId, {
+      company_name: data.company_name ?? null,
+      company_url: data.company_url,
+      emailHint: emailClaim,
+      preserveEmptyName: true,
+    });
     const url = /^https?:/i.test(data.company_url)
       ? data.company_url
       : `https://${data.company_url}`;
@@ -92,7 +99,7 @@ const platformIds = PLATFORMS.map((p) => p.id) as [Platform, ...Platform[]];
 const platformSchema = z.enum(platformIds);
 
 export const scrapeReviews = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) =>
     z
       .object({
@@ -117,7 +124,7 @@ const rawSchema = z.object({
 });
 
 export const analyzeAndEnrich = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) =>
     z.object({ competitor_id: z.string().uuid(), reviews: z.array(rawSchema).max(60) }).parse(d),
   )
@@ -128,7 +135,7 @@ export const analyzeAndEnrich = createServerFn({ method: "POST" })
   });
 
 export const generatePitchMessage = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ lead_id: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
     const { data: l } = await context.supabase
@@ -168,7 +175,7 @@ const settingsSchema = z.object({
 });
 
 export const getScrapeSettings = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .handler(async ({ context }) => {
     const { data } = await context.supabase
       .from("user_scrape_settings")
@@ -192,7 +199,7 @@ export const getScrapeSettings = createServerFn({ method: "POST" })
   });
 
 export const updateScrapeSettings = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) => settingsSchema.parse(d))
   .handler(async ({ data, context }) => {
     const { error } = await context.supabase.from("user_scrape_settings").upsert(
@@ -211,7 +218,7 @@ export const updateScrapeSettings = createServerFn({ method: "POST" })
 export type { RawReview };
 
 export const reenrichContacts = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) =>
     z.object({ lead_ids: z.array(z.string().uuid()).max(20).nullable() }).parse(d),
   )
@@ -223,4 +230,42 @@ export const reenrichContacts = createServerFn({ method: "POST" })
       data.lead_ids,
       data.lead_ids ? data.lead_ids.length : 10,
     );
+  });
+
+export const getCompanyProfile = createServerFn({ method: "GET" })
+  .middleware([requireAppSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { readCompanyProfile } = await import("./brand-listening.server");
+    const emailClaim =
+      context.claims && typeof context.claims["email"] === "string"
+        ? context.claims["email"]
+        : null;
+    return readCompanyProfile(context.supabase, context.userId, emailClaim);
+  });
+
+export const saveCompanyProfile = createServerFn({ method: "POST" })
+  .middleware([requireAppSupabaseAuth])
+  .inputValidator((d: unknown) =>
+    z
+      .object({
+        company_name: z.string().trim().max(200).default(""),
+        company_url: z.string().trim().max(300).default(""),
+      })
+      .refine((v) => v.company_name.length > 0 || v.company_url.length > 0, {
+        message: "Enter your company name or website URL",
+      })
+      .parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    const { saveCompanyProfileToDb } = await import("./brand-listening.server");
+    const emailClaim =
+      context.claims && typeof context.claims["email"] === "string"
+        ? context.claims["email"]
+        : null;
+    return saveCompanyProfileToDb(context.supabase, context.userId, {
+      company_name: data.company_name,
+      company_url: data.company_url,
+      emailHint: emailClaim,
+      preserveEmptyName: false,
+    });
   });

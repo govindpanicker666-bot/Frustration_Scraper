@@ -1,6 +1,6 @@
 import { createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireAppSupabaseAuth } from "@/lib/supabase-auth";
 
 function extractEmailFromClaims(claims: unknown): string | null {
   if (!claims || typeof claims !== "object") return null;
@@ -9,7 +9,7 @@ function extractEmailFromClaims(claims: unknown): string | null {
 }
 
 export const getBrandListeningData = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .handler(async ({ context }) => {
     const { readBrandListeningState } = await import("./brand-listening.server");
     return readBrandListeningState(
@@ -20,7 +20,7 @@ export const getBrandListeningData = createServerFn({ method: "GET" })
   });
 
 export const scanOwnBrandMentions = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .handler(async ({ context }) => {
     const { startBrandListeningScan } = await import("./brand-listening.server");
     return startBrandListeningScan(
@@ -31,7 +31,7 @@ export const scanOwnBrandMentions = createServerFn({ method: "POST" })
   });
 
 export const getBrandHealthRecommendations = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ force: z.boolean().default(false) }).parse(d ?? {}))
   .handler(async ({ data, context }) => {
     const { generateBrandHealthRecommendations } = await import("./brand-listening.server");
@@ -39,7 +39,7 @@ export const getBrandHealthRecommendations = createServerFn({ method: "POST" })
   });
 
 export const generateAiBrandBaselineFn = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ force: z.boolean().default(false) }).parse(d ?? {}))
   .handler(async ({ data, context }) => {
     const { generateAIBrandBaselineForUser } = await import("./brand-listening.server");

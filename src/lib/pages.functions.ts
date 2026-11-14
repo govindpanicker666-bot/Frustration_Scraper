@@ -4,7 +4,7 @@ import { z } from "zod";
 import { createClient } from "@supabase/supabase-js";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database, Json } from "@/integrations/supabase/types";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireAppSupabaseAuth } from "@/lib/supabase-auth";
 import { SUPABASE_ANON_KEY, SUPABASE_URL } from "@/integrations/supabase/constants";
 
 type DB = SupabaseClient<Database>;
@@ -32,7 +32,7 @@ function publicClient() {
 export type PageBlock = { id?: string; block_type: string; content: Record<string, unknown> };
 
 export const listPages = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .handler(async ({ context }) => {
     await assertAdmin(context.supabase, context.userId);
     const { data } = await context.supabase
@@ -43,7 +43,7 @@ export const listPages = createServerFn({ method: "POST" })
   });
 
 export const createPage = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .handler(async ({ context }) => {
     await assertAdmin(context.supabase, context.userId);
     const { data, error } = await context.supabase
@@ -56,7 +56,7 @@ export const createPage = createServerFn({ method: "POST" })
   });
 
 export const getPageForEdit = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ id: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
     await assertAdmin(context.supabase, context.userId);
@@ -97,7 +97,7 @@ const saveSchema = z.object({
     .max(80),
 });
 export const savePage = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) => saveSchema.parse(d))
   .handler(async ({ data, context }) => {
     await assertAdmin(context.supabase, context.userId);
@@ -136,7 +136,7 @@ export const savePage = createServerFn({ method: "POST" })
   });
 
 export const deletePage = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ id: z.string().uuid() }).parse(d))
   .handler(async ({ data, context }) => {
     await assertAdmin(context.supabase, context.userId);
@@ -145,7 +145,7 @@ export const deletePage = createServerFn({ method: "POST" })
   });
 
 export const listPageSubmissions = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .handler(async ({ context }) => {
     await assertAdmin(context.supabase, context.userId);
     const { data } = await context.supabase

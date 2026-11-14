@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireAppSupabaseAuth } from "@/lib/supabase-auth";
 import { createClient } from "@supabase/supabase-js";
 import type { Database } from "@/integrations/supabase/types";
 import type { SupabaseClient } from "@supabase/supabase-js";
@@ -130,7 +130,7 @@ export const getPublishedPostBySlug = createServerFn({ method: "GET" })
 // ---------------- ADMIN OPS ----------------
 
 export const adminListAllPosts = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .handler(async ({ context }) => {
     await assertAdmin(context);
     const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
@@ -143,7 +143,7 @@ export const adminListAllPosts = createServerFn({ method: "GET" })
   });
 
 export const adminGetPost = createServerFn({ method: "GET" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: { id: string }) => d)
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
@@ -177,7 +177,7 @@ export type SavePostInput = {
 };
 
 export const adminSavePost = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: SavePostInput) => d)
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
@@ -242,7 +242,7 @@ export const adminSavePost = createServerFn({ method: "POST" })
   });
 
 export const adminDeletePost = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: { id: string }) => d)
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
@@ -273,7 +273,7 @@ function jsonExtract(text: string): unknown | null {
 }
 
 export const adminAiDraftFromSource = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: { source: string; hint?: string | undefined }) => d)
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
@@ -344,7 +344,7 @@ export const listAuthors = createServerFn({ method: "GET" }).handler(async () =>
 });
 
 export const adminSaveAuthor = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: Partial<BlogAuthor> & { name: string }) => d)
   .handler(async ({ data, context }) => {
     await assertAdmin(context);
@@ -366,7 +366,7 @@ export const adminSaveAuthor = createServerFn({ method: "POST" })
   });
 
 export const adminDeleteAuthor = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: { id: string }) => d)
   .handler(async ({ data, context }) => {
     await assertAdmin(context);

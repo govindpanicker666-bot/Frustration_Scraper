@@ -1,12 +1,16 @@
 import { createFileRoute, useNavigate } from "@tanstack/react-router";
-import { useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import { motion } from "framer-motion";
 import { Check, Loader2, Plus, Trash2, Wand2 } from "lucide-react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
-import { detectCompetitors, type DetectedCompetitor } from "@/lib/leads.functions";
+import {
+  detectCompetitors,
+  getCompanyProfile,
+  type DetectedCompetitor,
+} from "@/lib/leads.functions";
 import { competitorsQuery } from "@/lib/queries";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
@@ -29,6 +33,7 @@ export const Route = createFileRoute("/_authenticated/onboarding")({
 function Onboarding() {
   const { data: existing } = useSuspenseQuery(competitorsQuery);
   const detect = useServerFn(detectCompetitors);
+  const fetchProfile = useServerFn(getCompanyProfile);
   const qc = useQueryClient();
   const navigate = useNavigate();
   const [url, setUrl] = useState("");
@@ -39,6 +44,21 @@ function Onboarding() {
   const [list, setList] = useState<(DetectedCompetitor & { on: boolean })[]>([]);
   const [manual, setManual] = useState("");
 
+  const profileQuery = useQuery({
+    queryKey: ["company_profile"],
+    queryFn: () => fetchProfile(),
+    staleTime: 30_000,
+  });
+
+  const prefilledRef = useRef(false);
+
+  useEffect(() => {
+    if (!profileQuery.data || prefilledRef.current) return;
+    prefilledRef.current = true;
+    setName((prev) => prev || profileQuery.data?.company_name || "");
+    setUrl((prev) => prev || profileQuery.data?.company_url || "");
+  }, [profileQuery.data]);
+
   async function run(e: React.FormEvent) {
     e.preventDefault();
     setLoading(true);
@@ -46,6 +66,10 @@ function Onboarding() {
       const r = await detect({
         data: { company_url: url, company_name: name || undefined, description: desc || undefined },
       });
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["company_profile"] }),
+        qc.invalidateQueries({ queryKey: ["brand_listening"] }),
+      ]);
       if (r.error) toast.error(r.error);
       setList(r.competitors.map((c) => ({ ...c, on: true })));
     } catch (err) {

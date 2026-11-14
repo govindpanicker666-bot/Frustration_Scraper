@@ -1,5 +1,5 @@
 import { createServerFn } from "@tanstack/react-start";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireAppSupabaseAuth } from "@/lib/supabase-auth";
 
 export type UploadInput = {
   fileName: string;
@@ -16,7 +16,7 @@ function safeName(name: string) {
 }
 
 export const uploadBlogMedia = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: UploadInput) => d)
   .handler(async ({ data, context }) => {
     const { data: isAdmin } = await context.supabase.rpc("has_role", {

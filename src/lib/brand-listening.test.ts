@@ -1,7 +1,12 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "@/integrations/supabase/types";
-import { generateAIBrandBaseline, runBrandListeningForUser } from "./brand-listening.server";
+import {
+  generateAIBrandBaseline,
+  readCompanyProfile,
+  runBrandListeningForUser,
+  saveCompanyProfileToDb,
+} from "./brand-listening.server";
 
 const mocks = vi.hoisted(() => ({
   scrapePlatform: vi.fn(),
@@ -52,8 +57,15 @@ function makeMockDb(opts: {
           update: (payload: Record<string, unknown>) => {
             profileUpdates.push(payload);
             return {
-              eq: async () => ({ error: null }),
+              eq: () =>
+                Object.assign(Promise.resolve({ error: null }), {
+                  select: async () => ({ data: [{ id: "user-1" }], error: null }),
+                }),
             };
+          },
+          upsert: async (payload: Record<string, unknown>) => {
+            profileUpdates.push(payload);
+            return { error: null };
           },
         };
       }
@@ -354,5 +366,45 @@ describe("generateAIBrandBaseline", () => {
       "ai_brand_insights"
     ];
     expect(savedBlob).toBeTruthy();
+  });
+});
+
+describe("saveCompanyProfileToDb & readCompanyProfile", () => {
+  it("saves company_name and company_url and preserves brand name when detectCompetitors omits name", async () => {
+    const { db, profileUpdates, getProgress } = makeMockDb({
+      email: "founder@churnhound.io",
+      hasCompleted: false,
+    });
+
+    const saved = await saveCompanyProfileToDb(db, "user-p1", {
+      company_name: "Churnhound",
+      company_url: "https://churnhound.io",
+      preserveEmptyName: false,
+    });
+    expect(saved).toEqual({
+      company_name: "Churnhound",
+      company_url: "https://churnhound.io",
+    });
+
+    const preserved = await saveCompanyProfileToDb(db, "user-p1", {
+      company_name: null,
+      company_url: "https://churnhound.io",
+      preserveEmptyName: true,
+    });
+    expect(preserved).toEqual({
+      company_name: "Churnhound",
+      company_url: "https://churnhound.io",
+    });
+    expect(profileUpdates).toContainEqual({
+      company_name: "Churnhound",
+      company_url: "https://churnhound.io",
+    });
+
+    const blob = getProgress()?.["brand_listening"] as Record<string, unknown> | undefined;
+    expect(blob?.["company_name"]).toBe("Churnhound");
+
+    const loaded = await readCompanyProfile(db, "user-p1");
+    expect(loaded.company_name).toBe("Churnhound");
+    expect(loaded.company_url).toBe("https://churnhound.io");
   });
 });

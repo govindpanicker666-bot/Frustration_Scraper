@@ -1,6 +1,6 @@
 import { createMiddleware, createServerFn } from "@tanstack/react-start";
 import { z } from "zod";
-import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
+import { requireAppSupabaseAuth } from "@/lib/supabase-auth";
 import {
   domainOf,
   extractNewsPicks,
@@ -52,7 +52,7 @@ async function ourCompany(supabase: SupabaseClient<Database>, userId: string) {
 
 /** Cached strategic recommendations. Only regenerated when the lead count changed, or on force. */
 export const getRecommendations = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) => z.object({ force: z.boolean().default(false) }).parse(d ?? {}))
   .handler(async ({ data, context }) => {
     const sb = context.supabase;
@@ -125,7 +125,7 @@ export interface ContentIdeaSocialHook {
 }
 
 export const generateContentIdeas = createServerFn({ method: "POST" })
-  .middleware([requireSupabaseAuth])
+  .middleware([requireAppSupabaseAuth])
   .inputValidator((d: unknown) =>
     z
       .object({
