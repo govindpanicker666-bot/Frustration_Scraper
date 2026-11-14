@@ -266,8 +266,8 @@ describe("insights cache", () => {
   it("stale when never generated", () => expect(insightsStale(null, 0)).toBe(true));
 });
 
-import { parseNewsHtml as _pnh } from "./pipeline";
-describe("parseNewsHtml", () => {
+import { parseNewsHtml as _pnh, extractNewsPicks, normalizeNewsType } from "./pipeline";
+describe("parseNewsHtml and news picks", () => {
   it("reads JSON-LD articles from a blog page", () => {
     const html = `<script type="application/ld+json">{"@type":"BlogPosting","headline":"We raised $50M","url":"/blog/raise","datePublished":"2026-11-01"}</script>`;
     expect(_pnh(html, "https://acme.com/blog")[0]).toMatchObject({
@@ -275,10 +275,66 @@ describe("parseNewsHtml", () => {
       link: "https://acme.com/blog/raise",
     });
   });
-  it("falls back to article links under the blog section", () => {
-    const html = `<a href="/blog/new-pricing-for-teams-2026">New pricing for teams starting in 2026</a><a href="/pricing">Pricing page link text here</a>`;
+  it("reads JSON-LD @type arrays and mainEntityOfPage fallback", () => {
+    const html = `<script type="application/ld+json">{"@type":["Article","BlogPosting"],"headline":"Pricing Update 2026","mainEntityOfPage":{"@id":"https://acme.com/blog/pricing-2026"}}</script>`;
+    expect(_pnh(html, "https://acme.com/blog")[0]).toMatchObject({
+      title: "Pricing Update 2026",
+      link: "https://acme.com/blog/pricing-2026",
+    });
+  });
+  it("falls back to article links under the blog section (including www host)", () => {
+    const html = `<a href="https://www.acme.com/blog/new-pricing-for-teams-2026">New pricing for teams starting in 2026</a><a href="/pricing">Pricing page link text here</a>`;
     const out = _pnh(html, "https://acme.com/blog");
-    expect(out.map((o) => o.link)).toEqual(["https://acme.com/blog/new-pricing-for-teams-2026"]);
+    expect(out.map((o) => o.link)).toEqual([
+      "https://www.acme.com/blog/new-pricing-for-teams-2026",
+    ]);
+  });
+  it("resolves Atom alternate links and relative feed links when baseUrl is given", () => {
+    const xml = `<feed><entry><title>Major Launch</title><link rel="self" href="https://acme.com/feed.xml"/><link rel="alternate" href="/blog/launch"/></entry></feed>`;
+    expect(parseFeed(xml, "https://acme.com/feed.xml")[0]?.link).toBe(
+      "https://acme.com/blog/launch",
+    );
+  });
+  it("normalizes AI news picks across wrapper keys, string indices, and news types", () => {
+    expect(normalizeNewsType("Acquisition")).toBe("funding");
+    expect(normalizeNewsType("Pricing Change")).toBe("pricing");
+    const picks = extractNewsPicks(
+      {
+        picks: [
+          {
+            index: "[1]",
+            summary: "Raised Series B",
+            type: "funding",
+            why_it_matters: "A",
+            tactical_advice: "B",
+          },
+          {
+            index: 1,
+            summary: "Duplicate",
+            type: "other",
+            why_it_matters: "C",
+            tactical_advice: "D",
+          },
+          {
+            index: 99,
+            summary: "Out of bounds",
+            type: "other",
+            why_it_matters: "E",
+            tactical_advice: "F",
+          },
+        ],
+      },
+      3,
+    );
+    expect(picks).toEqual([
+      {
+        index: 1,
+        summary: "Raised Series B",
+        type: "funding",
+        why_it_matters: "A",
+        tactical_advice: "B",
+      },
+    ]);
   });
 });
 

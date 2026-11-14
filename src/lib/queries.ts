@@ -98,6 +98,8 @@ export type Lead = Database["public"]["Tables"]["leads"]["Row"] & {
 };
 export const newsQuery = queryOptions({
   queryKey: ["competitor_news"],
+  staleTime: 0,
+  refetchOnMount: "always",
   queryFn: async () => {
     const { data, error } = await supabase.from("competitor_news").select("*").limit(200);
     if (error) {

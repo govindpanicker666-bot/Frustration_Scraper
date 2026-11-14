@@ -60,10 +60,17 @@ function News() {
   async function run() {
     setBusy(true);
     try {
-      const { results, saved } = await refresh();
+      const { results, saved, reason } = await refresh();
       setNoFeed(results.filter((r) => r.status === "no_feed").map((r) => r.name));
-      toast.success(`${saved} key insights picked`);
+      if (saved > 0) {
+        toast.success(`${saved} key insights picked`);
+      } else if (reason === "no_competitors") {
+        toast.info("Add at least one competitor first to track competitor news.");
+      } else {
+        toast.info("No recent news or blog announcements found for your competitors.");
+      }
       await qc.invalidateQueries({ queryKey: newsQuery.queryKey });
+      await qc.refetchQueries({ queryKey: newsQuery.queryKey });
     } catch (e) {
       toast.error(e instanceof Error ? e.message : "Refresh failed");
     } finally {

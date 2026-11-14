@@ -8,6 +8,27 @@ export type Database = {
   };
   public: {
     Tables: {
+      ai_brand_insights: {
+        Row: {
+          generated_at: string;
+          negative_hypotheses: Json;
+          positive_hypotheses: Json;
+          user_id: string;
+        };
+        Insert: {
+          generated_at?: string;
+          negative_hypotheses: Json;
+          positive_hypotheses: Json;
+          user_id: string;
+        };
+        Update: {
+          generated_at?: string;
+          negative_hypotheses?: Json;
+          positive_hypotheses?: Json;
+          user_id?: string;
+        };
+        Relationships: [];
+      };
       blog_authors: {
         Row: {
           avatar_url: string | null;

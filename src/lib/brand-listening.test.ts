@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "@/integrations/supabase/types";
-import { runBrandListeningForUser } from "./brand-listening.server";
+import { generateAIBrandBaseline, runBrandListeningForUser } from "./brand-listening.server";
 
 const mocks = vi.hoisted(() => ({
   scrapePlatform: vi.fn(),
@@ -16,10 +16,17 @@ vi.mock("./ai.server", () => ({
   geminiJson: mocks.geminiJson,
 }));
 
-function makeMockDb(opts: { email: string; hasCompleted: boolean }) {
-  const insertedBrandMentions: Record<string, unknown>[] = [];
+function makeMockDb(opts: {
+  email: string;
+  hasCompleted: boolean;
+  initialMentions?: Record<string, unknown>[];
+  missingAiTable?: boolean;
+}) {
+  const insertedBrandMentions: Record<string, unknown>[] = [...(opts.initialMentions ?? [])];
   const profileUpdates: Record<string, unknown>[] = [];
   const leadsTouched = vi.fn();
+  let aiInsightsRow: Record<string, unknown> | null = null;
+  let currentProgress: Record<string, unknown> | null = null;
 
   const db = {
     from: (table: string) => {
@@ -50,8 +57,43 @@ function makeMockDb(opts: { email: string; hasCompleted: boolean }) {
           },
         };
       }
+      if (table === "competitors") {
+        return {
+          select: () => ({
+            eq: () => ({
+              limit: async () => ({
+                data: [{ name: "Intercom" }, { name: "Zendesk" }],
+                error: null,
+              }),
+            }),
+          }),
+        };
+      }
+      if (table === "ai_brand_insights") {
+        if (opts.missingAiTable) {
+          const err = { code: "PGRST205", message: "Could not find the table" };
+          return {
+            select: () => ({
+              eq: () => ({
+                maybeSingle: async () => ({ data: null, error: err }),
+              }),
+            }),
+            upsert: async () => ({ error: err }),
+          };
+        }
+        return {
+          select: () => ({
+            eq: () => ({
+              maybeSingle: async () => ({ data: aiInsightsRow, error: null }),
+            }),
+          }),
+          upsert: async (payload: Record<string, unknown>) => {
+            aiInsightsRow = payload;
+            return { error: null };
+          },
+        };
+      }
       if (table === "user_scrape_settings") {
-        let currentProgress: Record<string, unknown> | null = null;
         return {
           select: () => ({
             eq: () => ({
@@ -69,24 +111,33 @@ function makeMockDb(opts: { email: string; hasCompleted: boolean }) {
       }
       if (table === "brand_mentions") {
         return {
-          select: () => ({
-            eq: () => ({
-              order: () => ({
-                limit: async () => ({
-                  data: insertedBrandMentions.map((r, i) => ({
-                    id: `bm-${i}`,
-                    created_at: r["created_at"] ?? new Date().toISOString(),
-                    ...r,
-                  })),
+          select: (_cols?: string, selectOpts?: { count?: string; head?: boolean }) => ({
+            eq: () => {
+              if (selectOpts?.head) {
+                return Promise.resolve({
+                  count: insertedBrandMentions.length,
+                  data: null,
                   error: null,
+                });
+              }
+              return {
+                order: () => ({
+                  limit: async () => ({
+                    data: insertedBrandMentions.map((r, i) => ({
+                      id: `bm-${i}`,
+                      created_at: r["created_at"] ?? new Date().toISOString(),
+                      ...r,
+                    })),
+                    error: null,
+                  }),
                 }),
-              }),
-              then: (cb: (v: { data: { post_url: string }[]; error: null }) => void) =>
-                cb({
-                  data: insertedBrandMentions.map((r) => ({ post_url: String(r["post_url"]) })),
-                  error: null,
-                }),
-            }),
+                then: (cb: (v: { data: { post_url: string }[]; error: null }) => void) =>
+                  cb({
+                    data: insertedBrandMentions.map((r) => ({ post_url: String(r["post_url"]) })),
+                    error: null,
+                  }),
+              };
+            },
           }),
           insert: async (rows: Record<string, unknown>[]) => {
             insertedBrandMentions.push(...rows);
@@ -98,7 +149,14 @@ function makeMockDb(opts: { email: string; hasCompleted: boolean }) {
     },
   } as unknown as SupabaseClient<Database>;
 
-  return { db, insertedBrandMentions, profileUpdates, leadsTouched };
+  return {
+    db,
+    insertedBrandMentions,
+    profileUpdates,
+    leadsTouched,
+    getAiInsightsRow: () => aiInsightsRow,
+    getProgress: () => currentProgress,
+  };
 }
 
 describe("runBrandListeningForUser baseline & 48h exception", () => {
@@ -132,6 +190,8 @@ describe("runBrandListeningForUser baseline & 48h exception", () => {
           summary: "Praises Churnhound alerts.",
         },
       ],
+      positive_hypotheses: ["Great alerts", "Easy setup", "Fast onboarding"],
+      negative_hypotheses: ["Pricing tiers", "Mobile UI", "Limited exports"],
     });
 
     const { db, insertedBrandMentions, profileUpdates, leadsTouched } = makeMockDb({
@@ -182,6 +242,8 @@ describe("runBrandListeningForUser baseline & 48h exception", () => {
           summary: "Author found pricing unclear.",
         },
       ],
+      positive_hypotheses: ["Great alerts", "Easy setup", "Fast onboarding"],
+      negative_hypotheses: ["Pricing tiers", "Mobile UI", "Limited exports"],
     });
 
     const { db, insertedBrandMentions, profileUpdates, leadsTouched } = makeMockDb({
@@ -200,5 +262,97 @@ describe("runBrandListeningForUser baseline & 48h exception", () => {
     expect(insertedBrandMentions[0]?.["post_url"]).toBe("https://reddit.com/r/saas/recent-1");
     expect(profileUpdates).toContainEqual({ has_completed_brand_baseline: true });
     expect(leadsTouched).not.toHaveBeenCalled();
+  });
+});
+
+describe("generateAIBrandBaseline", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
+  it("generates and saves 3 positive and 3 negative hypotheses when brand_mentions < 3", async () => {
+    mocks.geminiJson.mockResolvedValue({
+      positive_hypotheses: [
+        "Customers praise quick setup.",
+        "Teams love real-time lead alerts.",
+        "Founders appreciate clear sentiment scoring.",
+      ],
+      negative_hypotheses: [
+        "Smaller teams want a lower starter tier.",
+        "Users ask for deeper CRM integrations.",
+        "Onboarding docs could be more detailed.",
+      ],
+    });
+
+    const { db, getAiInsightsRow } = makeMockDb({
+      email: "founder@churnhound.io",
+      hasCompleted: true,
+      initialMentions: [{ post_url: "https://example.com/1" }],
+    });
+
+    const res = await generateAIBrandBaseline(
+      db,
+      "user-ai-1",
+      "Churnhound",
+      "https://churnhound.io",
+      ["Intercom", "Zendesk"],
+    );
+
+    expect(res.mentionCount).toBe(1);
+    expect(res.insights?.positive_hypotheses).toHaveLength(3);
+    expect(res.insights?.negative_hypotheses).toHaveLength(3);
+    expect(getAiInsightsRow()?.["user_id"]).toBe("user-ai-1");
+    expect(mocks.geminiJson).toHaveBeenCalledTimes(1);
+  });
+
+  it("skips Gemini generation when brand_mentions >= 3", async () => {
+    const { db } = makeMockDb({
+      email: "founder@churnhound.io",
+      hasCompleted: true,
+      initialMentions: [
+        { post_url: "https://example.com/1" },
+        { post_url: "https://example.com/2" },
+        { post_url: "https://example.com/3" },
+      ],
+    });
+
+    const res = await generateAIBrandBaseline(
+      db,
+      "user-ai-2",
+      "Churnhound",
+      "https://churnhound.io",
+      ["Intercom"],
+    );
+
+    expect(res.mentionCount).toBe(3);
+    expect(res.skippedReason).toBe("enough_mentions");
+    expect(mocks.geminiJson).not.toHaveBeenCalled();
+  });
+
+  it("falls back to progress metadata cache when ai_brand_insights table is not yet created", async () => {
+    mocks.geminiJson.mockResolvedValue({
+      positive_hypotheses: ["P1", "P2", "P3"],
+      negative_hypotheses: ["N1", "N2", "N3"],
+    });
+
+    const { db, getProgress } = makeMockDb({
+      email: "founder@churnhound.io",
+      hasCompleted: true,
+      missingAiTable: true,
+    });
+
+    const res = await generateAIBrandBaseline(
+      db,
+      "user-ai-3",
+      "Churnhound",
+      "https://churnhound.io",
+      [],
+    );
+
+    expect(res.insights?.positive_hypotheses).toEqual(["P1", "P2", "P3"]);
+    const savedBlob = (getProgress()?.["brand_listening"] as Record<string, unknown> | undefined)?.[
+      "ai_brand_insights"
+    ];
+    expect(savedBlob).toBeTruthy();
   });
 });

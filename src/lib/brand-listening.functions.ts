@@ -37,3 +37,14 @@ export const getBrandHealthRecommendations = createServerFn({ method: "POST" })
     const { generateBrandHealthRecommendations } = await import("./brand-listening.server");
     return generateBrandHealthRecommendations(context.supabase, context.userId, data.force);
   });
+
+export const generateAiBrandBaselineFn = createServerFn({ method: "POST" })
+  .middleware([requireSupabaseAuth])
+  .inputValidator((d: unknown) => z.object({ force: z.boolean().default(false) }).parse(d ?? {}))
+  .handler(async ({ data, context }) => {
+    const { generateAIBrandBaselineForUser } = await import("./brand-listening.server");
+    return generateAIBrandBaselineForUser(context.supabase, context.userId, {
+      force: data.force,
+      emailHint: extractEmailFromClaims(context.claims),
+    });
+  });

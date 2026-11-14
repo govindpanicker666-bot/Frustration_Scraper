@@ -8,6 +8,7 @@ import {
   normalizeBrandSentiment,
   PLATFORMS,
   shouldApply48HourBrandFilter,
+  type AiBrandInsights,
   type BrandBaselineProgress,
   type BrandListeningState,
   type BrandMention,
@@ -304,6 +305,81 @@ async function markBaselineCompleted(db: DB, ctx: BrandUserContext): Promise<voi
   });
 }
 
+function parseHypothesesArray(raw: unknown): string[] {
+  if (!Array.isArray(raw)) return [];
+  const out: string[] = [];
+  for (const item of raw) {
+    if (typeof item === "string" && item.trim()) {
+      out.push(item.trim());
+    } else if (item && typeof item === "object") {
+      const rec = item as Record<string, unknown>;
+      const val = rec["statement"] ?? rec["text"] ?? rec["hypothesis"] ?? rec["complaint"];
+      if (typeof val === "string" && val.trim()) out.push(val.trim());
+    }
+    if (out.length >= 3) break;
+  }
+  return out;
+}
+
+function parseAiBrandInsightsBlob(raw: unknown): AiBrandInsights | null {
+  if (!raw || typeof raw !== "object" || Array.isArray(raw)) return null;
+  const obj = raw as Record<string, unknown>;
+  const positive_hypotheses = parseHypothesesArray(obj["positive_hypotheses"]);
+  const negative_hypotheses = parseHypothesesArray(obj["negative_hypotheses"]);
+  if (positive_hypotheses.length === 0 && negative_hypotheses.length === 0) return null;
+  return {
+    positive_hypotheses,
+    negative_hypotheses,
+    generated_at:
+      typeof obj["generated_at"] === "string" && obj["generated_at"].trim()
+        ? obj["generated_at"]
+        : new Date().toISOString(),
+  };
+}
+
+async function readAiBrandInsights(
+  db: DB,
+  userId: string,
+  settingsProgress: Json | null,
+): Promise<AiBrandInsights | null> {
+  const { data, error } = await db
+    .from("ai_brand_insights")
+    .select("positive_hypotheses,negative_hypotheses,generated_at")
+    .eq("user_id", userId)
+    .maybeSingle();
+
+  if (!error && data) {
+    const positive_hypotheses = parseHypothesesArray(data.positive_hypotheses);
+    const negative_hypotheses = parseHypothesesArray(data.negative_hypotheses);
+    if (positive_hypotheses.length > 0 || negative_hypotheses.length > 0) {
+      return {
+        positive_hypotheses,
+        negative_hypotheses,
+        generated_at: data.generated_at,
+      };
+    }
+  } else if (error && !isMissingSchemaError(error)) {
+    console.warn("[BrandListening] readAiBrandInsights warning:", error.message);
+  }
+
+  const blob = parseProgressBrandBlob(settingsProgress);
+  return parseAiBrandInsightsBlob(blob["ai_brand_insights"]);
+}
+
+async function loadCompetitorNamesForUser(db: DB, userId: string): Promise<string[]> {
+  try {
+    const { data, error } = await db
+      .from("competitors")
+      .select("name")
+      .eq("user_id", userId)
+      .limit(20);
+    if (error || !Array.isArray(data)) return [];
+    return data.map((r) => (typeof r.name === "string" ? r.name.trim() : "")).filter(Boolean);
+  } catch {
+    return [];
+  }
+}
+
 export async function readBrandListeningState(
   db: DB,
   userId: string,
@@ -311,6 +387,7 @@ export async function readBrandListeningState(
 ): Promise<BrandListeningState> {
   const { ctx, settingsProgress } = await loadBrandUserContext(db, userId, emailHint);
   const { mentions } = await readStoredMentions(db, userId, settingsProgress);
+  const ai_brand_insights = await readAiBrandInsights(db, userId, settingsProgress);
   const blob = parseProgressBrandBlob(settingsProgress);
   const base = emptyBrandListeningState(
     ctx.company_name,
@@ -319,10 +396,7 @@ export async function readBrandListeningState(
   );
 
   const activeLoopRunning = getBrandLoops().has(userId);
-  const storedRunning = Boolean(blob["baseline_running"]);
-  const baseline_running =
-    activeLoopRunning ||
-    (storedRunning && !ctx.has_completed_brand_baseline && !blob["baseline_error"]);
+  const baseline_running = activeLoopRunning;
 
   const rawProgress = blob["baseline_progress"];
   const baseline_progress: BrandBaselineProgress | null =
@@ -365,6 +439,7 @@ export async function readBrandListeningState(
       typeof blob["recommendations_mention_count"] === "number"
         ? blob["recommendations_mention_count"]
         : 0,
+    ai_brand_insights,
   };
 }
 
@@ -584,7 +659,25 @@ export async function runBrandListeningForUser(
       await markBaselineCompleted(db, ctx);
     }
 
-    const finalState = await readBrandListeningState(db, userId, ctx.email);
+    let finalState = await readBrandListeningState(db, userId, ctx.email);
+    if (finalState.mentions.length < 3 && !finalState.ai_brand_insights) {
+      try {
+        const competitorNames = await loadCompetitorNamesForUser(db, userId);
+        const generated = await generateAIBrandBaseline(
+          db,
+          userId,
+          finalState.company_name || brandName,
+          finalState.company_url,
+          competitorNames,
+        );
+        if (generated.insights) {
+          finalState = { ...finalState, ai_brand_insights: generated.insights };
+        }
+      } catch (baselineErr) {
+        console.warn("[BrandListening] AI baseline audit skipped:", baselineErr);
+      }
+    }
+
     return {
       skipped: false,
       apply48HourFilter,
@@ -742,4 +835,143 @@ Analyze both what users love and what they complain about, and generate 3 short,
       error: "Could not generate brand health recommendations right now.",
     };
   }
+}
+
+/**
+ * Generates an AI Baseline Audit when a user has fewer than 3 real brand mentions.
+ * Persists results to `public.ai_brand_insights` (and caches in user_scrape_settings fallback if table is not yet created).
+ */
+export async function generateAIBrandBaseline(
+  db: DB,
+  userId: string,
+  companyName: string,
+  companyUrl: string | null,
+  competitorNames: string[],
+  options: { force?: boolean } = {},
+): Promise<{
+  insights: AiBrandInsights | null;
+  mentionCount: number;
+  skippedReason?: string;
+  error?: string;
+}> {
+  const { settingsProgress } = await loadBrandUserContext(db, userId);
+
+  let mentionCount = 0;
+  const countRes = await db
+    .from("brand_mentions")
+    .select("id", { count: "exact", head: true })
+    .eq("user_id", userId);
+
+  if (!countRes.error) {
+    mentionCount = countRes.count ?? 0;
+  } else if (isMissingSchemaError(countRes.error)) {
+    const stored = await readStoredMentions(db, userId, settingsProgress);
+    mentionCount = stored.mentions.length;
+  } else {
+    throw new Error(`Failed to count brand_mentions: ${countRes.error.message}`);
+  }
+
+  const existing = await readAiBrandInsights(db, userId, settingsProgress);
+  if (mentionCount >= 3) {
+    return {
+      insights: existing,
+      mentionCount,
+      skippedReason: "enough_mentions",
+    };
+  }
+
+  if (!options.force && existing) {
+    return {
+      insights: existing,
+      mentionCount,
+    };
+  }
+
+  const resolvedName = companyName.trim();
+  const resolvedUrl = (companyUrl ?? "").trim();
+  if (!resolvedName && !resolvedUrl) {
+    return {
+      insights: null,
+      mentionCount,
+      skippedReason: "missing_brand",
+    };
+  }
+
+  try {
+    const { geminiJson } = await import("./ai.server");
+    const out = await geminiJson<Record<string, unknown>>(
+      "You are a senior market research analyst specializing in SaaS customer perception and brand positioning.",
+      `Analyze this company based on its website and competitors. Generate 3 likely positive customer statements and 3 likely negative complaints. Format as JSON.
+
+Company Name: ${resolvedName || "Unknown"}
+Company Website: ${resolvedUrl || "Not provided"}
+Competitors: ${competitorNames.length ? competitorNames.join(", ") : "None listed"}
+
+Return strictly this JSON format with 3 concise, realistic customer statements in each array:
+{"positive_hypotheses":["...","...","..."],"negative_hypotheses":["...","...","..."]}`,
+    );
+
+    const positive_hypotheses = parseHypothesesArray(
+      out["positive_hypotheses"] ??
+        out["positive"] ??
+        out["positives"] ??
+        out["positive_statements"],
+    );
+    const negative_hypotheses = parseHypothesesArray(
+      out["negative_hypotheses"] ??
+        out["negative"] ??
+        out["negatives"] ??
+        out["negative_complaints"],
+    );
+
+    const generatedAt = new Date().toISOString();
+    const insights: AiBrandInsights = {
+      positive_hypotheses,
+      negative_hypotheses,
+      generated_at: generatedAt,
+    };
+
+    const { error: upsertErr } = await db.from("ai_brand_insights").upsert(
+      {
+        user_id: userId,
+        positive_hypotheses,
+        negative_hypotheses,
+        generated_at: generatedAt,
+      },
+      { onConflict: "user_id" },
+    );
+
+    if (upsertErr && !isMissingSchemaError(upsertErr)) {
+      console.warn("[BrandListening] ai_brand_insights upsert warning:", upsertErr.message);
+    }
+
+    await saveProgressMetadata(db, userId, {
+      ai_brand_insights: insights,
+    });
+
+    return {
+      insights,
+      mentionCount,
+    };
+  } catch (err) {
+    console.error("AI brand baseline error:", err);
+    return {
+      insights: existing,
+      mentionCount,
+      error: "Could not generate AI market analysis right now.",
+    };
+  }
+}
+
+export async function generateAIBrandBaselineForUser(
+  db: DB,
+  userId: string,
+  options: { force?: boolean; emailHint?: string | null } = {},
+) {
+  const { ctx } = await loadBrandUserContext(db, userId, options.emailHint);
+  const competitorNames = await loadCompetitorNamesForUser(db, userId);
+  const brandName = (ctx.company_name || domainOf(ctx.company_url) || "").trim();
+  return generateAIBrandBaseline(db, userId, brandName, ctx.company_url, competitorNames, {
+    force: Boolean(options.force),
+  });
 }

@@ -635,54 +635,507 @@ async function googlereviews(c: CompetitorCtx, opts: ScrapePlatformOptions = {})
       published_at: r.date,
     }));
 }
-async function linkedin(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  const { linkedinAuthorFromPost } = await import("./pipeline");
-  const posts = await indexed(c, "linkedin.com/posts", opts);
-  return posts
-    .filter((p) => /linkedin\.com\/(posts|pulse)\//.test(p.url))
-    .map((p): RawReview => {
-      const a = linkedinAuthorFromPost(p.url);
-      return {
-        platform: "linkedin",
-        reviewer_name: p.author || a?.name || null,
-        reviewer_profile_url: a?.profile ?? p.url,
-        source_url: p.url.split("?")[0]!,
-        text: p.text,
-        published_at: p.date,
-      };
-    });
+const JIROSEARCH_PLATFORM_SET = new Set<Platform>([
+  "instagram",
+  "linkedin",
+  "x",
+  "youtube",
+  "tiktok",
+  "facebook",
+  "telegram",
+  "pinterest",
+  "threads",
+]);
+
+function normalizeJirosearchPlatform(raw: unknown, fallback: Platform): Platform {
+  if (typeof raw === "string") {
+    const lower = raw.trim().toLowerCase();
+    if (lower === "twitter" || lower === "x") return "x";
+    if (lower === "youtube" || lower === "yt") return "youtube";
+    if (lower === "linkedin" || lower === "li") return "linkedin";
+    if (lower === "instagram" || lower === "ig") return "instagram";
+    if (lower === "tiktok" || lower === "tt") return "tiktok";
+    if (lower === "facebook" || lower === "fb") return "facebook";
+    if (lower === "telegram" || lower === "tg") return "telegram";
+    if (lower === "pinterest" || lower === "pin") return "pinterest";
+    if (lower === "threads") return "threads";
+  }
+  return fallback;
 }
-async function x(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  const posts = await indexed(c, "x.com", opts);
-  const out: RawReview[] = [];
-  for (const p of posts
-    .filter((p) => /(x|twitter)\.com\/[^/]+\/status\/\d+/.test(p.url))
-    .slice(0, 10)) {
-    let name = p.author,
-      text = p.text;
-    try {
-      const o = await getJson<{ author_name: string; html: string }>(
-        `https://publish.twitter.com/oembed?omit_script=1&url=${encodeURIComponent(p.url)}`,
-      );
-      name = o.author_name || name;
-      text =
-        stripHtml(o.html.replace(/<a[^>]*>(?:pic\.twitter|https?:\/\/t\.co)[\s\S]*?<\/a>/g, ""))
-          .replace(/— .*$/, "")
-          .trim() || text;
-    } catch {
-      /* deleted/protected tweet: keep search snippet */
+
+function inferAuthorFromUrl(sourceUrl: string, platform: Platform): string | null {
+  try {
+    const u = new URL(sourceUrl);
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (platform === "x" && parts[0] && !["i", "search", "explore", "hashtag"].includes(parts[0])) {
+      return `@${parts[0].replace(/^@/, "")}`;
     }
-    const handle = p.url.match(/\.com\/([^/]+)\/status/)![1];
+    if (
+      platform === "instagram" &&
+      parts[0] &&
+      !["p", "reel", "reels", "stories", "explore"].includes(parts[0])
+    ) {
+      return `@${parts[0].replace(/^@/, "")}`;
+    }
+    if (platform === "tiktok" && parts[0]?.startsWith("@")) {
+      return parts[0];
+    }
+    if (platform === "threads" && parts[0]?.startsWith("@")) {
+      return parts[0];
+    }
+    if (platform === "telegram" && parts[0] && parts[0] !== "s") {
+      return `@${parts[0].replace(/^@/, "")}`;
+    }
+    if (platform === "telegram" && parts[0] === "s" && parts[1]) {
+      return `@${parts[1].replace(/^@/, "")}`;
+    }
+    if (platform === "pinterest" && parts[0] && !["pin", "search", "ideas"].includes(parts[0])) {
+      return parts[0];
+    }
+    if (
+      platform === "facebook" &&
+      parts[0] &&
+      !["watch", "reel", "share", "groups"].includes(parts[0])
+    ) {
+      return parts[0];
+    }
+    if (platform === "linkedin" && parts[0] === "in" && parts[1]) {
+      return parts[1].replace(/-/g, " ");
+    }
+  } catch {
+    /* ignore malformed URL */
+  }
+  return null;
+}
+
+function inferProfileUrl(sourceUrl: string, platform: Platform): string | null {
+  try {
+    const u = new URL(sourceUrl);
+    const parts = u.pathname.split("/").filter(Boolean);
+    if (platform === "x" && parts[0] && !["i", "search", "explore", "hashtag"].includes(parts[0])) {
+      return `https://x.com/${parts[0].replace(/^@/, "")}`;
+    }
+    if (
+      platform === "instagram" &&
+      parts[0] &&
+      !["p", "reel", "reels", "stories", "explore"].includes(parts[0])
+    ) {
+      return `https://www.instagram.com/${parts[0].replace(/^@/, "")}`;
+    }
+    if (platform === "tiktok" && parts[0]?.startsWith("@")) {
+      return `https://www.tiktok.com/${parts[0]}`;
+    }
+    if (platform === "threads" && parts[0]?.startsWith("@")) {
+      return `https://www.threads.net/${parts[0]}`;
+    }
+    if (platform === "telegram" && parts[0]) {
+      const chan = parts[0] === "s" ? parts[1] : parts[0];
+      if (chan) return `https://t.me/${chan.replace(/^@/, "")}`;
+    }
+  } catch {
+    /* ignore */
+  }
+  return null;
+}
+
+function parseSnippetDate(snippet: string): string {
+  const mRel = snippet.match(/^(\d+)\s+(minute|hour|day|week|month)s?\s+ago\b/i);
+  if (mRel) {
+    const n = Number(mRel[1]);
+    const unit = mRel[2]!.toLowerCase();
+    const mult =
+      unit === "minute"
+        ? 60_000
+        : unit === "hour"
+          ? 3_600_000
+          : unit === "day"
+            ? 86_400_000
+            : unit === "week"
+              ? 7 * 86_400_000
+              : 30 * 86_400_000;
+    return new Date(Date.now() - n * mult).toISOString();
+  }
+  const mAbs = snippet.match(/^([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})\b/);
+  if (mAbs) {
+    const parsed = iso(mAbs[1]);
+    if (parsed) return parsed;
+  }
+  return new Date().toISOString();
+}
+
+function jirosearchSearchSpec(
+  query: string,
+  platform: Platform,
+): { searchQuery: string; hostRe: RegExp } {
+  const q = exactQuery(query);
+  switch (platform) {
+    case "linkedin":
+      return {
+        searchQuery: `(site:linkedin.com/posts OR site:linkedin.com/pulse) ${q}`,
+        hostRe: /linkedin\.com/i,
+      };
+    case "x":
+      return {
+        searchQuery: `(site:x.com OR site:twitter.com) ${q}`,
+        hostRe: /(?:x|twitter)\.com/i,
+      };
+    case "youtube":
+      return {
+        searchQuery: `site:youtube.com ${q}`,
+        hostRe: /(?:youtube\.com|youtu\.be)/i,
+      };
+    case "instagram":
+      return {
+        searchQuery: `site:instagram.com ${q}`,
+        hostRe: /instagram\.com/i,
+      };
+    case "tiktok":
+      return {
+        searchQuery: `site:tiktok.com ${q}`,
+        hostRe: /tiktok\.com/i,
+      };
+    case "facebook":
+      return {
+        searchQuery: `site:facebook.com ${q}`,
+        hostRe: /(?:facebook\.com|fb\.watch)/i,
+      };
+    case "telegram":
+      return {
+        searchQuery: `site:t.me ${q}`,
+        hostRe: /t\.me/i,
+      };
+    case "pinterest":
+      return {
+        searchQuery: `site:pinterest.com ${q}`,
+        hostRe: /pinterest\./i,
+      };
+    case "threads":
+      return {
+        searchQuery: `site:threads.net ${q}`,
+        hostRe: /threads\.net/i,
+      };
+    default:
+      return {
+        searchQuery: `${platform} ${q}`,
+        hostRe: /^https?:/i,
+      };
+  }
+}
+
+async function scrapeJirosearchFallback(
+  query: string,
+  platforms: Platform[],
+): Promise<RawReview[]> {
+  const { execFile } = await import("node:child_process");
+  const path = await import("node:path");
+  const { promisify } = await import("node:util");
+  const { linkedinAuthorFromPost } = await import("./pipeline");
+  const execFileAsync = promisify(execFile);
+  const cliPath = path.resolve(process.cwd(), "node_modules/truescrape/dist/index.js");
+  const hasTrueScrape = Boolean(process.env["TRUESCRAPE_API_KEY"]?.trim());
+  const out: RawReview[] = [];
+  const seenUrls = new Set<string>();
+
+  for (const platform of platforms) {
+    const { searchQuery, hostRe } = jirosearchSearchSpec(query, platform);
+    let hits: Array<{ url: string; title: string; text: string; publishedAt: string | null }> = [];
+
+    if (hasTrueScrape) {
+      try {
+        const { stdout } = await execFileAsync(
+          process.execPath,
+          [cliPath, "google", "search", "--query", searchQuery, "--envelope", "--quiet"],
+          { env: process.env, timeout: 25_000, maxBuffer: 2 * 1024 * 1024 },
+        );
+        const parsed = JSON.parse(stdout) as {
+          data?: {
+            items?: Array<{
+              url?: string;
+              title?: string;
+              text?: string;
+              publishedAt?: string | null;
+            }>;
+          };
+        };
+        for (const item of parsed.data?.items ?? []) {
+          if (typeof item.url === "string" && hostRe.test(item.url)) {
+            hits.push({
+              url: item.url.split("#")[0]!,
+              title: stripHtml(item.title ?? ""),
+              text: stripHtml(item.text ?? ""),
+              publishedAt: typeof item.publishedAt === "string" ? item.publishedAt : null,
+            });
+          }
+        }
+      } catch {
+        /* fall back to webSearch below */
+      }
+    }
+
+    if (hits.length === 0) {
+      try {
+        const { webSearch } = await import("./search.server");
+        const webHits = await webSearch(searchQuery, { recent: true });
+        hits = webHits
+          .filter((h) => hostRe.test(h.url))
+          .map((h) => ({
+            url: h.url.split("#")[0]!,
+            title: stripHtml(h.title),
+            text: stripHtml(h.snippet),
+            publishedAt: null,
+          }));
+      } catch {
+        /* ignore webSearch error */
+      }
+    }
+
+    for (const h of hits.slice(0, 15)) {
+      const cleanUrl = h.url.split("?")[0] ?? h.url;
+      if (!/^https?:\/\//i.test(cleanUrl) || seenUrls.has(cleanUrl)) continue;
+      seenUrls.add(cleanUrl);
+
+      const combinedText = (
+        h.title && h.text && !h.text.toLowerCase().startsWith(h.title.toLowerCase())
+          ? `${h.title}. ${h.text}`
+          : h.text || h.title
+      )
+        .trim()
+        .slice(0, 3000);
+      if (!combinedText) continue;
+
+      let reviewerName: string | null = null;
+      let profileUrl: string | null = null;
+
+      if (platform === "linkedin") {
+        const li = linkedinAuthorFromPost(cleanUrl);
+        const titleAuthor = h.title
+          .replace(/\s+posted this\s*[-–—|].*$/i, "")
+          .replace(/\s+on LinkedIn[:\s].*$/i, "")
+          .replace(/\s*[-–—|]\s*LinkedIn.*$/i, "")
+          .trim();
+        reviewerName =
+          (titleAuthor && titleAuthor.length <= 60 && !/\bposts?\b/i.test(titleAuthor)
+            ? titleAuthor
+            : null) ??
+          li?.name ??
+          inferAuthorFromUrl(cleanUrl, platform);
+        profileUrl = li?.profile ?? null;
+      } else {
+        const titleAuthor = h.title
+          .split(/\s+on\s+(?:X|Twitter|Instagram|TikTok|Facebook|Threads)\b|\s*[|·-]\s*/i)[0]
+          ?.trim();
+        reviewerName =
+          inferAuthorFromUrl(cleanUrl, platform) ??
+          (titleAuthor && titleAuthor.length <= 50 ? titleAuthor : null);
+        profileUrl = inferProfileUrl(cleanUrl, platform);
+      }
+
+      const publishedAt = (h.publishedAt ? iso(h.publishedAt) : "") || parseSnippetDate(h.text);
+
+      out.push({
+        platform,
+        reviewer_name: reviewerName,
+        reviewer_profile_url: profileUrl,
+        source_url: cleanUrl,
+        text: combinedText,
+        published_at: publishedAt,
+      });
+    }
+  }
+
+  return out;
+}
+
+export async function scrapeJirosearch(query: string, platforms: string[]): Promise<RawReview[]> {
+  const apiKey = process.env["JIROSEARCH_API_KEY"]?.trim();
+  const hasTrueScrape = Boolean(process.env["TRUESCRAPE_API_KEY"]?.trim());
+
+  const normalizedPlatforms = platforms
+    .map((p) => p.trim().toLowerCase())
+    .map((p) => (p === "twitter" ? "x" : p))
+    .filter((p): p is Platform => JIROSEARCH_PLATFORM_SET.has(p as Platform));
+
+  if (!query.trim() || normalizedPlatforms.length === 0) return [];
+
+  if (!apiKey) {
+    if (!hasTrueScrape) throw new Error("no_key");
+    return scrapeJirosearchFallback(query.trim(), normalizedPlatforms);
+  }
+
+  // TODO: Switch to self-hosted Jirosearch URL before commercial launch
+  const endpoint =
+    process.env["JIROSEARCH_API_URL"]?.trim() || "https://api.jirosearch.com/v1/search";
+  let res: Response;
+  try {
+    res = await fetch(endpoint, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        Accept: "application/json",
+        Authorization: `Bearer ${apiKey}`,
+        "X-API-Key": apiKey,
+      },
+      body: JSON.stringify({
+        query: query.trim(),
+        platforms: normalizedPlatforms,
+      }),
+      signal: AbortSignal.timeout(15_000),
+    });
+  } catch (err) {
+    if (hasTrueScrape) {
+      return scrapeJirosearchFallback(query.trim(), normalizedPlatforms);
+    }
+    throw err;
+  }
+
+  if (res.status === 401 || res.status === 403 || res.status === 429 || res.status === 503) {
+    if (hasTrueScrape) {
+      return scrapeJirosearchFallback(query.trim(), normalizedPlatforms);
+    }
+    throw new Blocked(`jirosearch ${res.status}`);
+  }
+  if (!res.ok) {
+    if (hasTrueScrape) {
+      return scrapeJirosearchFallback(query.trim(), normalizedPlatforms);
+    }
+    throw new Blocked(`jirosearch ${res.status}`);
+  }
+
+  const payload = (await res.json()) as unknown;
+  const rawList: unknown[] = Array.isArray(payload)
+    ? payload
+    : payload && typeof payload === "object"
+      ? (() => {
+          const obj = payload as Record<string, unknown>;
+          for (const key of ["results", "data", "items", "posts", "reviews"]) {
+            if (Array.isArray(obj[key])) return obj[key] as unknown[];
+          }
+          return [];
+        })()
+      : [];
+
+  const fallbackPlatform = (normalizedPlatforms[0] as Platform | undefined) ?? "x";
+  const nowIso = new Date().toISOString();
+  const out: RawReview[] = [];
+
+  for (const entry of rawList) {
+    if (!entry || typeof entry !== "object") continue;
+    const item = entry as Record<string, unknown>;
+    const userObj =
+      item["user"] && typeof item["user"] === "object"
+        ? (item["user"] as Record<string, unknown>)
+        : item["author"] && typeof item["author"] === "object"
+          ? (item["author"] as Record<string, unknown>)
+          : null;
+
+    const platform = normalizeJirosearchPlatform(
+      item["source"] ?? item["platform"],
+      fallbackPlatform,
+    );
+
+    const rawSourceUrl =
+      item["sourceUrl"] ?? item["source_url"] ?? item["url"] ?? item["link"] ?? item["permalink"];
+    const sourceUrl = typeof rawSourceUrl === "string" ? rawSourceUrl.trim() : "";
+    if (!/^https?:\/\//i.test(sourceUrl)) continue;
+
+    const rawTitle = typeof item["title"] === "string" ? stripHtml(item["title"]) : "";
+    const rawBodyVal =
+      item["body"] ??
+      item["text"] ??
+      item["content"] ??
+      item["snippet"] ??
+      item["caption"] ??
+      item["description"];
+    const rawBody = typeof rawBodyVal === "string" ? stripHtml(rawBodyVal) : "";
+    const text = (
+      rawTitle && rawBody && !rawBody.toLowerCase().startsWith(rawTitle.toLowerCase())
+        ? `${rawTitle}. ${rawBody}`
+        : rawBody || rawTitle
+    )
+      .trim()
+      .slice(0, 3000);
+    if (!text) continue;
+
+    const rawReviewer =
+      item["reviewerName"] ??
+      item["reviewer_name"] ??
+      item["authorName"] ??
+      item["author_name"] ??
+      (typeof item["author"] === "string" ? item["author"] : null) ??
+      item["username"] ??
+      item["handle"] ??
+      item["channelTitle"] ??
+      userObj?.["name"] ??
+      userObj?.["username"] ??
+      userObj?.["handle"];
+    const reviewerName =
+      (typeof rawReviewer === "string" && rawReviewer.trim() ? rawReviewer.trim() : null) ??
+      inferAuthorFromUrl(sourceUrl, platform);
+
+    const rawProfileUrl =
+      item["reviewerProfileUrl"] ??
+      item["reviewer_profile_url"] ??
+      item["authorUrl"] ??
+      item["author_url"] ??
+      item["profileUrl"] ??
+      item["profile_url"] ??
+      userObj?.["url"] ??
+      userObj?.["profileUrl"];
+    const profileUrl =
+      typeof rawProfileUrl === "string" && /^https?:\/\//i.test(rawProfileUrl.trim())
+        ? rawProfileUrl.trim()
+        : null;
+
+    const rawDate =
+      item["reviewedAt"] ??
+      item["reviewed_at"] ??
+      item["publishedAt"] ??
+      item["published_at"] ??
+      item["createdAt"] ??
+      item["created_at"] ??
+      item["date"] ??
+      item["timestamp"];
+    const parsedDate =
+      typeof rawDate === "number"
+        ? new Date(rawDate < 1e12 ? rawDate * 1000 : rawDate).toISOString()
+        : iso(rawDate);
+
     out.push({
-      platform: "x",
-      reviewer_name: name || `@${handle}`,
-      reviewer_profile_url: `https://x.com/${handle}`,
-      source_url: p.url.split("?")[0]!.replace("twitter.com", "x.com"),
+      platform,
+      reviewer_name: reviewerName,
+      reviewer_profile_url: profileUrl,
+      source_url: sourceUrl,
       text,
-      published_at: p.date,
+      published_at: parsedDate || nowIso,
     });
   }
+
   return out;
+}
+
+async function linkedin(c: CompetitorCtx) {
+  return scrapeJirosearch(c.name, ["linkedin"]);
+}
+async function x(c: CompetitorCtx) {
+  return scrapeJirosearch(c.name, ["x"]);
+}
+async function youtube(c: CompetitorCtx) {
+  return scrapeJirosearch(c.name, ["youtube"]);
+}
+async function instagram(c: CompetitorCtx) {
+  return scrapeJirosearch(c.name, ["instagram"]);
+}
+async function tiktok(c: CompetitorCtx) {
+  return scrapeJirosearch(c.name, ["tiktok"]);
+}
+async function facebook(c: CompetitorCtx) {
+  return scrapeJirosearch(c.name, ["facebook"]);
+}
+async function telegram(c: CompetitorCtx) {
+  return scrapeJirosearch(c.name, ["telegram"]);
+}
+async function pinterest(c: CompetitorCtx) {
+  return scrapeJirosearch(c.name, ["pinterest"]);
 }
 
 // ---------- Newer free sources ----------
@@ -800,46 +1253,7 @@ async function quora(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
     published_at: h.date,
   }));
 }
-async function youtube(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  const apply48HourFilter = opts.apply48HourFilter ?? true;
-  // Comments for recent review/alternative videos via the public watch page's embedded data.
-  const spParam = apply48HourFilter ? "&sp=EgIIBA%253D%253D" : "";
-  const query = apply48HourFilter ? `${c.name} review alternative` : `${c.name} review`;
-  const r = await get(
-    `https://www.youtube.com/results?search_query=${encodeURIComponent(query)}${spParam}`,
-  );
-  if (!r.ok) throw new Blocked(`youtube ${r.status}`);
-  const maxVideos = apply48HourFilter ? 5 : 8;
-  const ids = [
-    ...new Set([...(await r.text()).matchAll(/"videoId":"([\w-]{11})"/g)].map((m) => m[1]!)),
-  ].slice(0, maxVideos);
-  if (!ids.length) throw new NoMatch("no videos");
-  const out: RawReview[] = [];
-  for (const id of ids) {
-    try {
-      const html = await (await get(`https://www.youtube.com/watch?v=${id}`)).text();
-      const title = html.match(/<title>([^<]+)<\/title>/)?.[1]?.replace(/ - YouTube$/, "") ?? "";
-      if (!new RegExp(c.name.replace(/[.*+?^${}()|[\]\\]/g, "\\$&"), "i").test(title)) continue;
-      const desc = html.match(/"shortDescription":"((?:[^"\\]|\\.)*)"/)?.[1] ?? "";
-      const date =
-        html.match(/"publishDate":"([^"]+)"/)?.[1] ??
-        html.match(/itemprop="datePublished" content="([^"]+)"/)?.[1];
-      const author = html.match(/"ownerChannelName":"([^"]+)"/)?.[1] ?? null;
-      const chan = html.match(/"canonicalBaseUrl":"(\/@[^"]+)"/)?.[1];
-      out.push({
-        platform: "youtube",
-        reviewer_name: author,
-        reviewer_profile_url: chan ? `https://www.youtube.com${chan}` : null,
-        source_url: `https://www.youtube.com/watch?v=${id}`,
-        text: `${title}. ${JSON.parse(`"${desc}"`).slice(0, 1500)}`,
-        published_at: iso(date),
-      });
-    } catch {
-      /* skip video */
-    }
-  }
-  return out;
-}
+
 async function sitejabber(c: CompetitorCtx) {
   if (!c.domain) throw new NoMatch("no domain");
   const r = await get(`https://www.sitejabber.com/reviews/${c.domain.replace(/^www\./, "")}`);
@@ -947,7 +1361,13 @@ export async function scrapeThreadsReviews(
 
 async function threads(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   const apply48HourFilter = opts.apply48HourFilter ?? true;
-  return scrapeThreadsReviews(c.name, { limit: apply48HourFilter ? 15 : 50 });
+  try {
+    const cliReviews = await scrapeThreadsReviews(c.name, { limit: apply48HourFilter ? 15 : 50 });
+    if (cliReviews.length > 0) return cliReviews;
+  } catch {
+    /* threads-scraper unavailable or blocked; fall back to Jirosearch */
+  }
+  return scrapeJirosearch(c.name, ["threads"]);
 }
 
 const SOURCES: Record<
@@ -983,6 +1403,11 @@ const SOURCES: Record<
   feedback,
   bbb,
   threads,
+  instagram,
+  tiktok,
+  facebook,
+  telegram,
+  pinterest,
 };
 
 export async function scrapePlatform(
@@ -1000,7 +1425,9 @@ export async function scrapePlatform(
         (platform === "threads"
           ? !Number.isNaN(new Date(r.published_at).getTime()) &&
             Boolean(r.reviewer_name && r.reviewer_name !== "[deleted]")
-          : keepReview(r, undefined, { skipRecencyCheck: !apply48HourFilter })),
+          : JIROSEARCH_PLATFORM_SET.has(platform)
+            ? !Number.isNaN(new Date(r.published_at).getTime()) && r.reviewer_name !== "[deleted]"
+            : keepReview(r, undefined, { skipRecencyCheck: !apply48HourFilter })),
     );
     return { status: "ok", reviews };
   } catch (e) {

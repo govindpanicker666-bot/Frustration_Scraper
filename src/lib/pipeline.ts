@@ -28,7 +28,12 @@ export type Platform =
   | "trustradius"
   | "feedback"
   | "bbb"
-  | "threads";
+  | "threads"
+  | "instagram"
+  | "tiktok"
+  | "facebook"
+  | "telegram"
+  | "pinterest";
 
 export const PLATFORMS: { id: Platform; label: string; kind: "review" | "social" }[] = [
   { id: "hackernews", label: "Hacker News", kind: "social" },
@@ -60,6 +65,11 @@ export const PLATFORMS: { id: Platform; label: string; kind: "review" | "social"
   { id: "feedback", label: "Feedback boards (Canny/Featurebase/Upvoty)", kind: "social" },
   { id: "bbb", label: "Better Business Bureau", kind: "review" },
   { id: "threads", label: "Threads", kind: "social" },
+  { id: "instagram", label: "Instagram", kind: "social" },
+  { id: "tiktok", label: "TikTok", kind: "social" },
+  { id: "facebook", label: "Facebook", kind: "social" },
+  { id: "telegram", label: "Telegram", kind: "social" },
+  { id: "pinterest", label: "Pinterest", kind: "social" },
 ];
 export const platformLabel = (p: string) => PLATFORMS.find((x) => x.id === p)?.label ?? p;
 export const isReviewSite = (p: string) => PLATFORMS.find((x) => x.id === p)?.kind === "review";
@@ -290,36 +300,71 @@ export function feedCandidates(domain: string): string[] {
     "/rss.xml",
     "/feed.xml",
     "/blog/rss.xml",
+    "/blog/feed.xml",
+    "/blog/atom.xml",
     "/atom.xml",
+    "/news/rss.xml",
+    "/news/feed",
+    "/changelog/rss.xml",
+    "/changelog.xml",
+    "/index.xml",
   ].map((p) => `https://${domain}${p}`);
 }
 /** Parse RSS or Atom XML into items (newest first as given). */
 export function parseFeed(
   xml: string,
+  baseUrl?: string,
 ): { title: string; link: string; summary: string; date: string }[] {
   const items = [...xml.matchAll(/<(item|entry)[\s>][\s\S]*?<\/\1>/gi)].map((m) => m[0]);
   const tag = (b: string, t: string) =>
     (b.match(new RegExp(`<${t}[^>]*>([\\s\\S]*?)</${t}>`, "i"))?.[1] ?? "")
       .replace(/<!\[CDATA\[|\]\]>/g, "")
       .trim();
+  const resolveLink = (raw: string) => {
+    const clean = raw.trim();
+    if (!clean) return "";
+    if (/^https?:\/\//i.test(clean)) return clean;
+    if (!baseUrl) return "";
+    try {
+      return new URL(clean, baseUrl).toString();
+    } catch {
+      return "";
+    }
+  };
   return items
-    .map((b) => ({
-      title: stripHtml(tag(b, "title")),
-      link: tag(b, "link") || (b.match(/<link[^>]+href=["']([^"']+)/i)?.[1] ?? ""),
-      summary: stripHtml(tag(b, "description") || tag(b, "summary") || tag(b, "content")).slice(
-        0,
-        800,
-      ),
-      date: tag(b, "pubDate") || tag(b, "published") || tag(b, "updated"),
-    }))
+    .map((b) => {
+      const rawLink =
+        tag(b, "link") ||
+        (b.match(/<link[^>]+rel=["']alternate["'][^>]*href=["']([^"']+)/i)?.[1] ??
+          b.match(/<link[^>]+href=["']([^"']+)["'][^>]*rel=["']alternate["']/i)?.[1] ??
+          b.match(/<link[^>]+href=["']([^"']+)/i)?.[1] ??
+          tag(b, "id"));
+      return {
+        title: stripHtml(tag(b, "title")),
+        link: resolveLink(rawLink),
+        summary: stripHtml(tag(b, "description") || tag(b, "summary") || tag(b, "content")).slice(
+          0,
+          800,
+        ),
+        date: tag(b, "pubDate") || tag(b, "published") || tag(b, "updated"),
+      };
+    })
     .filter((i) => i.title && /^https?:/.test(i.link));
 }
 
 /** Candidate HTML news/blog pages for a competitor site. */
 export function newsPageCandidates(domain: string): string[] {
-  return ["/blog", "/news", "/newsroom", "/articles", "/press", "/changelog", "/updates"].map(
-    (p) => `https://${domain}${p}`,
-  );
+  return [
+    "/blog",
+    "/news",
+    "/newsroom",
+    "/articles",
+    "/press",
+    "/changelog",
+    "/updates",
+    "/releases",
+    "/whats-new",
+  ].map((p) => `https://${domain}${p}`);
 }
 /** Extract dated or titled article links from an HTML blog/news index page (JSON-LD first, then <article>/links). */
 export function parseNewsHtml(
@@ -343,11 +388,20 @@ export function parseNewsHtml(
         }
         if (!n || typeof n !== "object") return;
         const o = n as Record<string, unknown>;
-        const t = String(o["@type"] ?? "");
-        if (/Article|BlogPosting|NewsArticle/.test(t) && (o["headline"] || o["name"]) && o["url"]) {
+        const rawType = Array.isArray(o["@type"]) ? o["@type"].join(" ") : String(o["@type"] ?? "");
+        const mainEntity =
+          o["mainEntityOfPage"] && typeof o["mainEntityOfPage"] === "object"
+            ? (o["mainEntityOfPage"] as Record<string, unknown>)["@id"]
+            : o["mainEntityOfPage"];
+        const urlVal = o["url"] ?? mainEntity ?? o["@id"];
+        if (
+          /Article|BlogPosting|NewsArticle/i.test(rawType) &&
+          (o["headline"] || o["name"]) &&
+          urlVal
+        ) {
           out.push({
             title: stripHtml(String(o["headline"] ?? o["name"])),
-            link: abs(String(o["url"])),
+            link: abs(String(urlVal)),
             summary: stripHtml(String(o["description"] ?? "")).slice(0, 800),
             date: String(o["datePublished"] ?? ""),
           });
@@ -360,6 +414,7 @@ export function parseNewsHtml(
     }
   }
   const base = new URL(pageUrl);
+  const baseHost = base.hostname.replace(/^www\./, "").toLowerCase();
   const section = base.pathname.replace(/\/$/, "");
   for (const m of html.matchAll(/<article[\s\S]*?<\/article>/gi)) {
     const b = m[0];
@@ -374,7 +429,7 @@ export function parseNewsHtml(
       });
   }
   if (out.length < 3) {
-    for (const m of html.matchAll(/<a[^>]+href=["']([^"'#?]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
+    for (const m of html.matchAll(/<a[^>]+href=["']([^"'#]+)["'][^>]*>([\s\S]*?)<\/a>/gi)) {
       const link = abs(m[1]!);
       const title = stripHtml(m[2]!);
       let u: URL;
@@ -384,16 +439,18 @@ export function parseNewsHtml(
         continue;
       }
       if (
-        u.hostname !== base.hostname ||
+        u.hostname.replace(/^www\./, "").toLowerCase() !== baseHost ||
         !section ||
         !u.pathname.startsWith(section + "/") ||
         u.pathname.split("/").filter(Boolean).length < 2
       )
         continue;
       if (
-        title.length < 20 ||
+        title.length < 12 ||
         title.length > 200 ||
-        /^(page|next|prev|older|newer|category|tag)/i.test(title)
+        /^(page|next|prev|older|newer|category|tag|read more|learn more|view all|home|about|pricing|contact|careers|privacy|terms|login|sign in|sign up)\b/i.test(
+          title,
+        )
       )
         continue;
       out.push({ title, link, summary: "", date: "" });
@@ -403,6 +460,66 @@ export function parseNewsHtml(
   return out
     .filter((i) => /^https?:/.test(i.link) && !seen.has(i.link) && seen.add(i.link))
     .slice(0, 15);
+}
+
+export interface NormalizedNewsPick {
+  index: number;
+  summary: string;
+  type: NewsType;
+  why_it_matters: string;
+  tactical_advice: string;
+}
+
+export function normalizeNewsType(raw: unknown): NewsType {
+  const v = typeof raw === "string" ? raw.trim().toLowerCase() : "";
+  if (v === "funding" || v === "pr" || v === "pricing" || v === "product" || v === "other") {
+    return v;
+  }
+  if (/fund|rais|invest|acqui/i.test(v)) return "funding";
+  if (/pric|plan|tier|cost/i.test(v)) return "pricing";
+  if (/launch|releas|featur|product|ai|update/i.test(v)) return "product";
+  if (/press|partner|award|lead|pr/i.test(v)) return "pr";
+  return "other";
+}
+
+export function extractNewsPicks(rawOutput: unknown, poolLength: number): NormalizedNewsPick[] {
+  const list = Array.isArray(rawOutput)
+    ? rawOutput
+    : rawOutput && typeof rawOutput === "object"
+      ? (() => {
+          const obj = rawOutput as Record<string, unknown>;
+          for (const key of ["results", "picks", "insights", "items", "news"]) {
+            if (Array.isArray(obj[key])) return obj[key] as unknown[];
+          }
+          return [];
+        })()
+      : [];
+
+  const seen = new Set<number>();
+  const picks: NormalizedNewsPick[] = [];
+  for (const item of list) {
+    if (!item || typeof item !== "object") continue;
+    const rec = item as Record<string, unknown>;
+    const rawIdx = rec["index"];
+    const idx =
+      typeof rawIdx === "number"
+        ? rawIdx
+        : typeof rawIdx === "string"
+          ? Number(rawIdx.replace(/[^\d-]/g, ""))
+          : Number.NaN;
+    if (!Number.isInteger(idx) || idx < 0 || idx >= poolLength || seen.has(idx)) continue;
+    seen.add(idx);
+    picks.push({
+      index: idx,
+      summary: typeof rec["summary"] === "string" ? rec["summary"].trim() : "",
+      type: normalizeNewsType(rec["type"] ?? rec["news_type"]),
+      why_it_matters: typeof rec["why_it_matters"] === "string" ? rec["why_it_matters"].trim() : "",
+      tactical_advice:
+        typeof rec["tactical_advice"] === "string" ? rec["tactical_advice"].trim() : "",
+    });
+    if (picks.length >= 7) break;
+  }
+  return picks;
 }
 
 export type EmailPattern = "first.last" | "first" | "flast" | "firstlast" | "first_last" | "firstl";
@@ -1409,6 +1526,12 @@ export interface BrandBaselineProgress {
   mentions_found: number;
 }
 
+export interface AiBrandInsights {
+  positive_hypotheses: string[];
+  negative_hypotheses: string[];
+  generated_at: string;
+}
+
 export interface BrandListeningState {
   company_name: string | null;
   company_url: string | null;
@@ -1421,6 +1544,7 @@ export interface BrandListeningState {
   recommendations: string[];
   recommendations_generated_at: string | null;
   recommendations_mention_count: number;
+  ai_brand_insights: AiBrandInsights | null;
 }
 
 export const BRAND_BASELINE_48H_EXCEPTION_EMAIL = "boosted688@gmail.com";
@@ -1462,6 +1586,7 @@ export function emptyBrandListeningState(
     recommendations: [],
     recommendations_generated_at: null,
     recommendations_mention_count: 0,
+    ai_brand_insights: null,
   };
 }
 

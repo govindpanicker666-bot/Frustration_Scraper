@@ -30,7 +30,21 @@ export async function scrapeCore(supabase: DB, competitorId: string, platform: P
     const result = results[i];
     return result ? [{ platform: p, status: result.status, count: result.reviews.length }] : [];
   });
-  return { reviews: results.flatMap((r) => r.reviews.slice(0, 15)).slice(0, 60), sources };
+  const reviews: RawReview[] = [];
+  const maxPerSource = platform === "all" ? 10 : 60;
+  for (let round = 0; round < maxPerSource && reviews.length < 60; round++) {
+    let addedInRound = false;
+    for (const r of results) {
+      const item = r.reviews[round];
+      if (item) {
+        reviews.push(item);
+        addedInRound = true;
+        if (reviews.length >= 60) break;
+      }
+    }
+    if (!addedInRound) break;
+  }
+  return { reviews, sources };
 }
 
 export async function analyzeCore(supabase: DB, competitorId: string, reviews: RawReview[]) {

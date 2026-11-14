@@ -321,7 +321,7 @@ function Admin() {
           </SelectContent>
         </Select>
         <Select value={platform} onValueChange={setPlatform}>
-          <SelectTrigger className="md:w-48">
+          <SelectTrigger className="md:w-56">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
