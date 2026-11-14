@@ -22,9 +22,8 @@ export interface AIVisibilityResult {
 }
 
 const MODEL_NAME = "gemini-2.5-flash";
+const FALLBACK_MODEL_NAME = "gemini-3.1-flash-lite";
 const PROMPT_COUNT = 10;
-const GROUNDED_GEMINI_ENDPOINT =
-  `https://generativelanguage.googleapis.com/v1beta/models/${MODEL_NAME}:generateContent`;
 
 function cleanBrandList(names: string[]): string[] {
   return [...new Set(names.map((name) => name.trim()).filter(Boolean))].slice(0, 12);
@@ -76,6 +75,79 @@ function normalizeSentiment(value: unknown): Sentiment {
   const normalized = typeof value === "string" ? value.toLowerCase() : "neutral";
   if (normalized === "positive" || normalized === "negative") return normalized;
   return "neutral";
+}
+
+async function callGroundedGemini(prompt: string): Promise<{ responseText: string; modelName: string; citations: AIVisibilityResult["citations"] }> {
+  const keys = [process.env["GEMINI_API_KEY"], process.env["GEMINI_API_KEY_2"]]
+    .filter((key): key is string => Boolean(key?.trim()));
+  if (keys.length === 0) throw new Error("GEMINI_API_KEY is not configured on the server.");
+
+  let lastError = "Gemini request failed.";
+  // Follow the app's existing convention: rotate configured keys, then fall
+  // back to a second model if the primary model is unavailable.
+  for (const modelName of [MODEL_NAME, FALLBACK_MODEL_NAME]) {
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent`;
+    for (const key of keys) {
+      try {
+        const response = await fetch(endpoint, {
+          method: "POST",
+          headers: {
+            "Content-Type": "application/json",
+            "x-goog-api-key": key,
+          },
+          body: JSON.stringify({
+            contents: [{ role: "user", parts: [{ text: prompt }] }],
+            tools: [{ google_search: {} }],
+            generationConfig: { temperature: 0.2 },
+          }),
+          signal: AbortSignal.timeout(60_000),
+        });
+
+        if (!response.ok) {
+          const body = await response.text();
+          lastError = `Gemini API ${response.status} (${modelName}): ${body.slice(0, 240)}`;
+          continue;
+        }
+
+        const payload = (await response.json()) as {
+          candidates?: Array<{
+            content?: { parts?: Array<{ text?: string }> };
+            groundingMetadata?: {
+              groundingChunks?: Array<{ web?: { uri?: string; title?: string } }>;
+            };
+          }>;
+        };
+        const candidate = payload.candidates?.[0];
+        const responseText = candidate?.content?.parts?.map((part) => part.text ?? "").join("\\n").trim();
+        if (!responseText) {
+          lastError = `Gemini returned an empty response (${modelName}).`;
+          continue;
+        }
+
+        const grounded = (candidate?.groundingMetadata?.groundingChunks ?? []).flatMap((chunk) => {
+          const url = chunk.web?.uri;
+          if (!url) return [];
+          try {
+            const parsed = new URL(url);
+            return [{
+              title: chunk.web?.title?.trim() || parsed.hostname,
+              url,
+              domain: parsed.hostname.replace(/^www\\./, ""),
+            }];
+          } catch {
+            return [];
+          }
+        });
+        const citations = grounded.filter(
+          (item, index, all) => all.findIndex((x) => x.url === item.url) === index,
+        );
+        return { responseText, modelName, citations };
+      } catch (error) {
+        lastError = error instanceof Error ? error.message : String(error);
+      }
+    }
+  }
+  throw new Error(lastError);
 }
 
 async function callGroundedGemini(prompt: string): Promise<{ responseText: string; modelName: string; citations: AIVisibilityResult["citations"] }> {
