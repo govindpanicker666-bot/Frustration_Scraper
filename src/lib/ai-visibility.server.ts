@@ -124,7 +124,7 @@ async function executeBuyerPrompt(
   // Use the app's own DuckDuckGo/Bing search layer for source context.
   // Do not use Google Search grounding: grounded results and links are not
   // permitted to be collected/analyzed as a persistent visibility dataset.
-  const [{ webSearch }, { geminiJson, GEMINI_MODEL }] = await Promise.all([
+  const [{ webSearch }, { geminiJsonWithModel }] = await Promise.all([
     import("./search.server"),
     import("./ai.server"),
   ]);
@@ -144,7 +144,7 @@ async function executeBuyerPrompt(
     }
   });
 
-  const analysis = await geminiJson<{
+  const { data: analysis, model } = await geminiJsonWithModel<{
     answer?: string;
     cited_urls?: string[];
     brand_sentiment?: string;
@@ -187,7 +187,7 @@ Return exactly:
 
   return {
     responseText,
-    modelName: GEMINI_MODEL,
+    modelName: model,
     citations,
     rank: mention.mentioned ? mention.rank : null,
     sentiment: mention.mentioned ? normalizeSentiment(analysis.brand_sentiment) : "neutral",
