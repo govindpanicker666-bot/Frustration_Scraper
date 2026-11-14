@@ -249,7 +249,7 @@ export async function runAIVisibilityScan(
   const categoryContext = [
     profile?.company_url ? `Website: ${profile.company_url}` : "",
     ...competitorRows.map((item) => [item.category, item.description].filter(Boolean).join(" — ")),
-  ].filter(Boolean).join("\\n").slice(0, 2400);
+  ].filter(Boolean).join("\n").slice(0, 2400);
   const prompts = await generateBuyerPrompts(normalizedBrand, competitors, categoryContext);
 
   const rows: Database["public"]["Tables"]["ai_visibility_scans"]["Insert"][] = [];
@@ -302,7 +302,7 @@ export async function runAIVisibilityScan(
 
   return {
     brandName: normalizedBrand,
-    modelName: MODEL_NAME,
+    modelName: rows[0]?.model_name ?? MODEL_NAME,
     promptsRequested: PROMPT_COUNT,
     promptsCompleted: rows.length,
     visibilityScore,
