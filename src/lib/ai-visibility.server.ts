@@ -49,30 +49,6 @@ function buildPrompts(brandName: string, competitors: string[]): string[] {
   return templates.map((prompt) => `${prompt}\n\n${categoryHint} Give an impartial buyer-focused answer.`);
 }
 
-function extractJsonObject<T>(text: string): T {
-  const fenced = text.replace(/```(?:json)?/gi, "").replace(/```/g, "").trim();
-  const start = fenced.indexOf("{");
-  const end = fenced.lastIndexOf("}");
-  if (start < 0 || end <= start) throw new Error("Gemini returned an invalid structured response");
-  return JSON.parse(fenced.slice(start, end + 1)) as T;
-}
-
-function extractCitationUrls(text: string): Array<{ title: string; url: string; domain: string }> {
-  const urls = [...text.matchAll(/https?:\/\/[^\s)\]}>"']+/gi)]
-    .map((match) => match[0].replace(/[.,;:!?]+$/, ""))
-    .filter((url, index, all) => all.indexOf(url) === index)
-    .slice(0, 15);
-
-  return urls.flatMap((url) => {
-    try {
-      const parsed = new URL(url);
-      return [{ title: parsed.hostname, url, domain: parsed.hostname.replace(/^www\./, "") }];
-    } catch {
-      return [];
-    }
-  });
-}
-
 function findBrandMention(text: string, brandName: string, competitorNames: string[]) {
   const escaped = brandName.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
   const match = new RegExp(`(^|[^\\p{L}\\p{N}])(${escaped})(?=$|[^\\p{L}\\p{N}])`, "iu").exec(text);
@@ -80,7 +56,6 @@ function findBrandMention(text: string, brandName: string, competitorNames: stri
     return { mentioned: false, rank: null as number | null, context: "" };
   }
 
-  const before = text.slice(0, match.index);
   const brands = [brandName, ...competitorNames]
     .map((name) => ({ name, first: text.toLowerCase().indexOf(name.toLowerCase()) }))
     .filter((item) => item.first >= 0)
@@ -262,7 +237,7 @@ export async function runAIVisibilityScan(
   }
 
   const visibilityScore = Math.round(
-    rows.reduce((sum, row) => sum + row.visibility_score, 0) / prompts.length,
+    rows.reduce((sum, row) => sum + row.visibility_score, 0) / rows.length,
   );
 
   return {
