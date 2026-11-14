@@ -29,23 +29,58 @@ function cleanBrandList(names: string[]): string[] {
   return [...new Set(names.map((name) => name.trim()).filter(Boolean))].slice(0, 12);
 }
 
-function buildPrompts(brandName: string, competitors: string[]): string[] {
-  const categoryHint = competitors.length
-    ? `The competitive alternatives include ${competitors.join(", ")}.`
-    : "Consider the leading products in this market.";
-  const templates = [
-    `What are the best alternatives to ${brandName} for someone evaluating this category?`,
-    `What is the best tool for solving the problem that ${brandName} addresses?`,
-    `Which ${brandName} competitors should a buyer compare before choosing a solution?`,
-    `I am shortlisting software in the same category as ${brandName}. What would you recommend and why?`,
-    `What are the most reliable ${brandName} alternatives for a business buyer?`,
-    `Compare the leading solutions in the category that ${brandName} operates in.`,
-    `Which product offers the best value for money among tools like ${brandName}?`,
-    `What should a small business look for when choosing a ${brandName}-type solution?`,
-    `Which providers are best for an enterprise that needs the capabilities offered by ${brandName}?`,
-    `What are the main strengths and weaknesses of the leading ${brandName}-type products?`,
+function fallbackBuyerPrompts(categoryContext: string): string[] {
+  const category = categoryContext.trim() || "this software category";
+  return [
+    `What are the best ${category} tools for a small business?`,
+    `Which ${category} platforms are worth comparing for a growing company?`,
+    `What features should I look for when choosing a ${category} solution?`,
+    `Which ${category} software offers the best value for money?`,
+    `What are the most reliable ${category} providers for a business team?`,
+    `How do the leading ${category} solutions compare on ease of use and support?`,
+    `What are the main limitations to check before buying ${category} software?`,
+    `Which ${category} solution is best for a company with a limited budget?`,
+    `What should an enterprise consider before choosing a ${category} vendor?`,
+    `Which alternatives should a buyer shortlist when evaluating ${category} products?`,
   ];
-  return templates.map((prompt) => `${prompt}\n\n${categoryHint} Give an impartial buyer-focused answer.`);
+}
+
+async function generateBuyerPrompts(
+  brandName: string,
+  competitors: string[],
+  categoryContext: string,
+): Promise<string[]> {
+  const { geminiJson } = await import("./ai.server");
+  const prompt = `Generate exactly 10 realistic buyer-intent questions for an AI visibility benchmark.
+
+Brand being tracked: ${brandName}
+Market/category context: ${categoryContext || "Infer the category from the brand and competitor list."}
+Competitors for context: ${competitors.join(", ") || "No competitor list supplied."}
+
+Requirements:
+- Write questions that real buyers would ask before choosing a product.
+- Cover awareness, consideration, and decision intent.
+- Include best-tool recommendations, comparisons, features, pricing/value, use cases, reliability, and alternatives.
+- Keep questions neutral. Do not write questions designed to make ${brandName} appear in the answer.
+- Do not include any vendor name in at least 7 of the 10 questions. At most 3 questions may mention the tracked brand or a competitor.
+- Do not make up a product category if the context is unclear; use a clear category-level phrasing.
+- Return exactly { "prompts": ["question 1", "..."] } with 10 distinct strings and no extra fields.`;
+
+  try {
+    const generated = await geminiJson<{ prompts?: string[] }>(
+      "You are an independent B2B buyer-research analyst. Generate balanced, realistic purchase-research questions.",
+      prompt,
+      { timeoutMs: 30_000, thinkingLevel: "LOW" },
+    );
+    const prompts = Array.isArray(generated.prompts)
+      ? [...new Set(generated.prompts.map((item) => item.trim()).filter(Boolean))]
+      : [];
+    if (prompts.length >= PROMPT_COUNT) return prompts.slice(0, PROMPT_COUNT);
+  } catch (error) {
+    console.warn("[AIVisibility] Prompt generation fallback:", error);
+  }
+
+  return fallbackBuyerPrompts(categoryContext).slice(0, PROMPT_COUNT);
 }
 
 function findBrandMention(text: string, brandName: string, competitorNames: string[]) {
@@ -178,11 +213,6 @@ export async function runAIVisibilityScan(
   const normalizedBrand = brandName.trim();
   if (!normalizedBrand) throw new Error("Brand name is required.");
 
-  const competitors = cleanBrandList(competitorNames).filter(
-    (name) => name.toLowerCase() !== normalizedBrand.toLowerCase(),
-  );
-  const prompts = buildPrompts(normalizedBrand, competitors);
-
   // Validate ownership/context: the supplied brand must be the user's own brand profile.
   const { data: profile, error: profileError } = await supabase
     .from("profiles")
@@ -193,6 +223,24 @@ export async function runAIVisibilityScan(
   if (profile?.company_name && profile.company_name.trim().toLowerCase() !== normalizedBrand.toLowerCase()) {
     throw new Error("Brand name must match your saved company name in the Competitors profile.");
   }
+
+  const { data: storedCompetitors, error: competitorsError } = await supabase
+    .from("competitors")
+    .select("name,category,description")
+    .eq("user_id", userId)
+    .limit(30);
+  if (competitorsError) throw new Error(`Could not load your saved competitors: ${competitorsError.message}`);
+
+  const competitorRows = storedCompetitors ?? [];
+  const competitors = cleanBrandList([
+    ...competitorNames,
+    ...competitorRows.map((item) => item.name),
+  ]).filter((name) => name.toLowerCase() !== normalizedBrand.toLowerCase());
+  const categoryContext = [
+    profile?.company_url ? `Website: ${profile.company_url}` : "",
+    ...competitorRows.map((item) => [item.category, item.description].filter(Boolean).join(" — ")),
+  ].filter(Boolean).join("\\n").slice(0, 2400);
+  const prompts = await generateBuyerPrompts(normalizedBrand, competitors, categoryContext);
 
   const rows: Database["public"]["Tables"]["ai_visibility_scans"]["Insert"][] = [];
   const failures: string[] = [];
