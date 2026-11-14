@@ -165,11 +165,19 @@ async function callGroundedGemini(prompt: string): Promise<{ responseText: strin
           try {
             const parsed = new URL(url);
             const title = chunk.web?.title?.trim() || parsed.hostname;
-            const titleHost = title.replace(/^https?:\\/\\//i, "").split(/[\\/\\s]/)[0].toLowerCase();
-            const isGoogleRedirect = /(^|\\.)vertexaisearch\\.cloud\\.google\\.com$/i.test(parsed.hostname);
-            const domain = isGoogleRedirect && titleHost.includes(".")
-              ? titleHost.replace(/^www\\./, "")
-              : parsed.hostname.replace(/^www\\./, "");
+            const titleHost = title
+              .replace("https://", "")
+              .replace("http://", "")
+              .split("/")[0]
+              .split(" ")[0]
+              .toLowerCase();
+            const isGoogleRedirect =
+              parsed.hostname === "vertexaisearch.cloud.google.com" ||
+              parsed.hostname.endsWith(".vertexaisearch.cloud.google.com");
+            const rawDomain = isGoogleRedirect && titleHost.includes(".")
+              ? titleHost
+              : parsed.hostname;
+            const domain = rawDomain.startsWith("www.") ? rawDomain.slice(4) : rawDomain;
             return [{ title, url, domain }];
           } catch {
             return [];
