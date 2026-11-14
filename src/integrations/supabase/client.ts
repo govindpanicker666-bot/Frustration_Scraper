@@ -7,18 +7,35 @@ function isNewSupabaseApiKey(value: string): boolean {
   return value.startsWith("sb_publishable_") || value.startsWith("sb_secret_");
 }
 
+function pickEnvValue(
+  candidates: Array<string | undefined>,
+  rejectSecret = false,
+): string | undefined {
+  for (const raw of candidates) {
+    const val = raw?.trim();
+    if (!val || val.includes("placeholder")) continue;
+    if (rejectSecret && val.startsWith("sb_secret_")) continue;
+    return val;
+  }
+  return undefined;
+}
+
 // The public URL can be reachable only from the browser, so server requests go to the runtime URL of the same backend.
 function serverSupabaseUrl(publicUrl: string, supabaseKey: string): string | undefined {
   if (typeof window !== "undefined" || typeof process === "undefined") return undefined;
-  const serverUrl = (process.env["SUPABASE_URL"] || process.env["VITE_SUPABASE_URL"])?.replace(
-    /\/+$/,
-    "",
+  const serverUrl = pickEnvValue([
+    process.env["SUPABASE_URL"],
+    process.env["VITE_SUPABASE_URL"],
+  ])?.replace(/\/+$/, "");
+  const serverKey = pickEnvValue(
+    [
+      process.env["SUPABASE_PUBLISHABLE_KEY"],
+      process.env["VITE_SUPABASE_PUBLISHABLE_KEY"],
+      process.env["SUPABASE_ANON_KEY"],
+      process.env["VITE_SUPABASE_ANON_KEY"],
+    ],
+    true,
   );
-  const serverKey =
-    process.env["SUPABASE_ANON_KEY"] ||
-    process.env["VITE_SUPABASE_ANON_KEY"] ||
-    process.env["SUPABASE_PUBLISHABLE_KEY"] ||
-    process.env["VITE_SUPABASE_PUBLISHABLE_KEY"];
   if (!serverUrl || serverUrl === publicUrl || serverKey !== supabaseKey) return undefined;
   return serverUrl;
 }
@@ -64,19 +81,24 @@ function createSupabaseClient() {
     typeof window !== "undefined"
       ? (window as { __SUPABASE_ENV__?: { url?: string; anonKey?: string } }).__SUPABASE_ENV__
       : undefined;
-  const SUPABASE_URL =
-    import.meta.env["VITE_SUPABASE_URL"] ||
-    browserEnv?.url ||
-    env?.["VITE_SUPABASE_URL"] ||
-    env?.["SUPABASE_URL"];
-  const SUPABASE_ANON_KEY =
-    import.meta.env["VITE_SUPABASE_ANON_KEY"] ||
-    import.meta.env["VITE_SUPABASE_PUBLISHABLE_KEY"] ||
-    browserEnv?.anonKey ||
-    env?.["VITE_SUPABASE_ANON_KEY"] ||
-    env?.["SUPABASE_ANON_KEY"] ||
-    env?.["VITE_SUPABASE_PUBLISHABLE_KEY"] ||
-    env?.["SUPABASE_PUBLISHABLE_KEY"];
+  const SUPABASE_URL = pickEnvValue([
+    import.meta.env["VITE_SUPABASE_URL"],
+    browserEnv?.url,
+    env?.["SUPABASE_URL"],
+    env?.["VITE_SUPABASE_URL"],
+  ])?.replace(/\/+$/, "");
+  const SUPABASE_ANON_KEY = pickEnvValue(
+    [
+      import.meta.env["VITE_SUPABASE_PUBLISHABLE_KEY"],
+      import.meta.env["VITE_SUPABASE_ANON_KEY"],
+      browserEnv?.anonKey,
+      env?.["SUPABASE_PUBLISHABLE_KEY"],
+      env?.["VITE_SUPABASE_PUBLISHABLE_KEY"],
+      env?.["SUPABASE_ANON_KEY"],
+      env?.["VITE_SUPABASE_ANON_KEY"],
+    ],
+    true,
+  );
 
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     const missing = [
@@ -87,6 +109,11 @@ function createSupabaseClient() {
     console.error(`[Supabase] ${message}`);
     throw new Error(message);
   }
+
+  console.log("[Supabase] Initializing client", {
+    urlPrefix: SUPABASE_URL.slice(0, 10),
+    keyPrefix: SUPABASE_ANON_KEY.slice(0, 10),
+  });
 
   return createClient<Database>(SUPABASE_URL, SUPABASE_ANON_KEY, {
     global: {

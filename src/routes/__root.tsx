@@ -119,15 +119,31 @@ export const Route = createRootRouteWithContext<{ queryClient: QueryClient }>()(
   errorComponent: ErrorComponent,
 });
 
+function pickPublicValue(candidates: Array<string | undefined>, rejectSecret = false): string {
+  for (const raw of candidates) {
+    const val = raw?.trim();
+    if (!val || val.includes("placeholder")) continue;
+    if (rejectSecret && val.startsWith("sb_secret_")) continue;
+    return val;
+  }
+  return "";
+}
+
 function getPublicSupabaseEnvScript(): string {
   if (typeof process === "undefined") return "";
-  const url = process.env["SUPABASE_URL"] || process.env["VITE_SUPABASE_URL"] || "";
-  const anonKey =
-    process.env["SUPABASE_ANON_KEY"] ||
-    process.env["VITE_SUPABASE_ANON_KEY"] ||
-    process.env["SUPABASE_PUBLISHABLE_KEY"] ||
-    process.env["VITE_SUPABASE_PUBLISHABLE_KEY"] ||
-    "";
+  const url = pickPublicValue([
+    process.env["SUPABASE_URL"],
+    process.env["VITE_SUPABASE_URL"],
+  ]).replace(/\/+$/, "");
+  const anonKey = pickPublicValue(
+    [
+      process.env["SUPABASE_PUBLISHABLE_KEY"],
+      process.env["VITE_SUPABASE_PUBLISHABLE_KEY"],
+      process.env["SUPABASE_ANON_KEY"],
+      process.env["VITE_SUPABASE_ANON_KEY"],
+    ],
+    true,
+  );
   if (!url && !anonKey) return "";
   return `window.__SUPABASE_ENV__=${JSON.stringify({ url, anonKey }).replace(/</g, "\\u003c")}`;
 }

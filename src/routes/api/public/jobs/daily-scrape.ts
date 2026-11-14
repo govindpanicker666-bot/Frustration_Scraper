@@ -112,7 +112,7 @@ export const Route = createFileRoute("/api/public/jobs/daily-scrape")({
           ran.push({ user: st.user_id, competitor: next.id });
           if (pause) break; // shared AI key: stop this tick
         }
-        return Response.json({ ok: true, ran });
+        return Response.json({ ok: true }, { status: 200 });
       },
     },
   },

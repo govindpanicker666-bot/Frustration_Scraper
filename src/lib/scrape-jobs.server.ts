@@ -149,12 +149,15 @@ export async function requireAdminApiRequest(
   | { ok: true; userId: string; supabase: SupabaseClient<Database> }
   | { ok: false; response: Response }
 > {
-  const SUPABASE_URL = process.env["SUPABASE_URL"] || process.env["VITE_SUPABASE_URL"];
-  const SUPABASE_ANON_KEY =
-    process.env["SUPABASE_ANON_KEY"] ||
-    process.env["VITE_SUPABASE_ANON_KEY"] ||
+  const SUPABASE_URL = (process.env["SUPABASE_URL"] || process.env["VITE_SUPABASE_URL"])
+    ?.trim()
+    .replace(/\/+$/, "");
+  const SUPABASE_ANON_KEY = (
     process.env["SUPABASE_PUBLISHABLE_KEY"] ||
-    process.env["VITE_SUPABASE_PUBLISHABLE_KEY"];
+    process.env["VITE_SUPABASE_PUBLISHABLE_KEY"] ||
+    process.env["SUPABASE_ANON_KEY"] ||
+    process.env["VITE_SUPABASE_ANON_KEY"]
+  )?.trim();
   if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
     console.error("[AdminAuth] Missing Supabase configuration", {
       hasUrl: Boolean(SUPABASE_URL),

@@ -6,6 +6,14 @@ export default defineConfig({
     // nitro/vite builds from this
     server: { entry: "server" },
   },
+  nitro: {
+    preset: "node-server",
+    output: {
+      dir: "dist",
+      serverDir: "dist/server",
+      publicDir: "dist/client",
+    },
+  },
   vite: {
     server: {
       host: "0.0.0.0",
