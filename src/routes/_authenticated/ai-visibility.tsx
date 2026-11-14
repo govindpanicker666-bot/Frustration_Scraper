@@ -200,7 +200,7 @@ function AIVisibilityPage() {
           </p>
         </div>
         <Badge variant="outline" className="w-fit gap-1.5">
-          <Activity className="h-3 w-3" /> Gemini · Google Search grounding
+          <Activity className="h-3 w-3" /> Gemini · DDG/Bing research context
         </Badge>
       </div>
 
@@ -240,7 +240,7 @@ function AIVisibilityPage() {
           <div className="rounded-2xl bg-primary/10 p-4 text-primary"><Eye className="h-7 w-7" /></div>
           <h2 className="text-lg font-semibold">No visibility data yet</h2>
           <p className="max-w-md text-sm text-muted-foreground">
-            Run your first scan to test ten realistic buyer prompts against Gemini with Google Search grounding.
+            Run your first scan to test ten buyer prompts against Gemini using web search results from the app.
           </p>
         </section>
       ) : (
@@ -336,7 +336,7 @@ function AIVisibilityPage() {
           <section className="glass overflow-hidden">
             <div className="border-b p-5">
               <h2 className="font-semibold">Cited sources</h2>
-              <p className="mt-1 text-xs text-muted-foreground">URLs returned in Gemini Search grounding metadata.</p>
+              <p className="mt-1 text-xs text-muted-foreground">Search references selected by Gemini from the app's web search results.</p>
             </div>
             {uniqueCitations.length ? (
               <div className="divide-y">
