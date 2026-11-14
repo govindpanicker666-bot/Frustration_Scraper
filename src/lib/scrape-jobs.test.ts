@@ -1,6 +1,12 @@
 import { afterEach, describe, expect, it } from "vitest";
+import type { SupabaseClient } from "@supabase/supabase-js";
+import type { Database } from "@/integrations/supabase/types";
 import { authenticateCronRequest } from "@/integrations/supabase/cron-auth";
-import { createIdleJobState } from "./scrape-jobs.server";
+import {
+  cancelManualScrapeJob,
+  createIdleJobState,
+  getManualScrapeStatus,
+} from "./scrape-jobs.server";
 
 describe("authenticateCronRequest", () => {
   const originalCronSecret = process.env["CRON_SECRET"];
@@ -83,5 +89,81 @@ describe("createIdleJobState", () => {
     expect(state.current_competitor_index).toBe(0);
     expect(state.competitor_ids).toEqual([]);
     expect(state.stats.saved).toBe(0);
+  });
+});
+
+function makeSettingsMockDb(initialProgress: Record<string, unknown> | null) {
+  let progress = initialProgress;
+  const db = {
+    from: (table: string) => {
+      if (table !== "user_scrape_settings") throw new Error(`Unexpected table ${table}`);
+      return {
+        select: () => ({
+          eq: () => ({
+            maybeSingle: async () => ({ data: progress ? { progress } : null, error: null }),
+          }),
+        }),
+        upsert: async (payload: { progress?: Record<string, unknown> }) => {
+          progress = payload.progress ?? null;
+          return { error: null };
+        },
+      };
+    },
+  } as unknown as SupabaseClient<Database>;
+
+  return { db, getProgress: () => progress };
+}
+
+describe("manual scrape cancellation and stale recovery", () => {
+  it("cancels a running manual scrape job immediately and marks it done", async () => {
+    const runningState = {
+      ...createIdleJobState(),
+      job_id: "job-cancel-1",
+      job_status: "running",
+      step: "analyzing",
+      competitor_ids: ["c1", "c2"],
+      competitor_names: ["Comp 1", "Comp 2"],
+      total_competitors: 2,
+      current_competitor_index: 0,
+      current_competitor_name: "Comp 1",
+    };
+    const { db } = makeSettingsMockDb({
+      job_status: "running",
+      current_competitor_index: 0,
+      manual_job: runningState,
+    });
+
+    const cancelled = await cancelManualScrapeJob("user-cancel-1", db);
+    expect(cancelled.job_status).toBe("completed");
+    expect(cancelled.step).toBe("done");
+    expect(cancelled.current_competitor_name).toBeNull();
+    expect(cancelled.errors).toContain("Stopped by admin.");
+  });
+
+  it("recovers a stale running job that exceeded step timeout on last competitor", async () => {
+    const tenMinutesAgo = new Date(Date.now() - 10 * 60_000).toISOString();
+    const staleState = {
+      ...createIdleJobState(),
+      job_id: "job-stale-1",
+      job_status: "running",
+      step: "analyzing",
+      competitor_ids: ["c1"],
+      competitor_names: ["StuckComp"],
+      total_competitors: 1,
+      current_competitor_index: 0,
+      current_competitor_name: "StuckComp",
+      started_at: tenMinutesAgo,
+      updated_at: tenMinutesAgo,
+    };
+    const { db } = makeSettingsMockDb({
+      job_status: "running",
+      current_competitor_index: 0,
+      manual_job: staleState,
+    });
+
+    const recovered = await getManualScrapeStatus("user-stale-1", db);
+    expect(recovered.job_status).toBe("completed");
+    expect(recovered.step).toBe("done");
+    expect(recovered.errors.some((e) => e.includes("StuckComp: Step timed out"))).toBe(true);
   });
 });

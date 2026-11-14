@@ -8,7 +8,12 @@ const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const isUsableKey = (k: string | undefined): k is string =>
   !!k && k.trim().length > 0 && k.trim() !== "MY_GEMINI_API_KEY";
 
-async function callOnce(key: string, model: string, body: unknown) {
+export interface GeminiCallOptions {
+  timeoutMs?: number;
+  thinkingLevel?: "LOW" | "MEDIUM" | "HIGH";
+}
+
+async function callOnce(key: string, model: string, body: unknown, timeoutMs: number) {
   try {
     return await fetch(
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
@@ -20,6 +25,7 @@ async function callOnce(key: string, model: string, body: unknown) {
           "x-goog-api-key": key,
         },
         body: JSON.stringify(body),
+        signal: AbortSignal.timeout(timeoutMs),
       },
     );
   } catch (err) {
@@ -27,25 +33,52 @@ async function callOnce(key: string, model: string, body: unknown) {
   }
 }
 
-async function callGemini(system: string, user: string): Promise<string> {
+async function callGemini(
+  system: string,
+  user: string,
+  options: GeminiCallOptions = {},
+): Promise<string> {
   const keys = [process.env["GEMINI_API_KEY"], process.env["GEMINI_API_KEY_2"]].filter(isUsableKey);
   if (!keys.length) throw new Error("GEMINI_API_KEY is not set");
-  const body: Record<string, unknown> = {
-    systemInstruction: { parts: [{ text: system + "\nRespond ONLY with valid JSON, no prose." }] },
-    contents: [{ role: "user", parts: [{ text: user }] }],
-  };
-  body["generationConfig"] = { responseMimeType: "application/json" };
+
+  const timeoutMs = options.timeoutMs ?? 45_000;
 
   let lastErr = "";
   for (let attempt = 0; attempt < 2; attempt++) {
     for (const key of keys) {
       for (const model of MODELS) {
-        const res = await callOnce(key, model, body);
+        const generationConfig: Record<string, unknown> = {
+          responseMimeType: "application/json",
+        };
+        if (options.thinkingLevel && model === "gemini-4-hydrogen") {
+          generationConfig["thinkingConfig"] = { thinkingLevel: options.thinkingLevel };
+        }
+        const body: Record<string, unknown> = {
+          systemInstruction: {
+            parts: [{ text: system + "\nRespond ONLY with valid JSON, no prose." }],
+          },
+          contents: [{ role: "user", parts: [{ text: user }] }],
+          generationConfig,
+        };
+
+        const res = await callOnce(key, model, body, timeoutMs);
         if (res.ok) {
           const json = (await res.json()) as {
-            candidates?: { content?: { parts?: { text?: string }[] } }[];
+            candidates?: {
+              finishReason?: string;
+              content?: { parts?: { text?: string }[] };
+            }[];
+            promptFeedback?: { blockReason?: string };
           };
-          return json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+          const text =
+            json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
+          if (text.trim().length > 0) return text;
+          const reason =
+            json.candidates?.[0]?.finishReason ??
+            json.promptFeedback?.blockReason ??
+            "EMPTY_RESPONSE";
+          lastErr = `Gemini empty response (${model}): ${reason}`;
+          continue;
         }
         const errBody = await res.text();
         lastErr = `Gemini error ${res.status} (${model}): ${errBody.slice(0, 300)}`;
@@ -53,20 +86,27 @@ async function callGemini(system: string, user: string): Promise<string> {
         continue; // 404, 400, 429 (busy/quota), 503 (overloaded), 5xx -> fallback to next model
       }
     }
-    await sleep(2000);
+    if (attempt === 0) await sleep(1500);
   }
-  throw new Error(lastErr);
+  throw new Error(lastErr || "Gemini request failed");
 }
 
 function parseJson<T>(text: string): T {
   const cleaned = text.replace(/```(?:json)?/g, "").trim();
   const start = cleaned.search(/[[{]/);
   const end = Math.max(cleaned.lastIndexOf("}"), cleaned.lastIndexOf("]"));
-  return JSON.parse(start >= 0 ? cleaned.slice(start, end + 1) : cleaned) as T;
+  if (start < 0 || end < start) {
+    throw new Error(`Invalid JSON from Gemini: ${cleaned.slice(0, 120)}`);
+  }
+  return JSON.parse(cleaned.slice(start, end + 1)) as T;
 }
 
-export async function geminiJson<T>(system: string, user: string): Promise<T> {
-  return parseJson<T>(await callGemini(system, user));
+export async function geminiJson<T>(
+  system: string,
+  user: string,
+  options?: GeminiCallOptions,
+): Promise<T> {
+  return parseJson<T>(await callGemini(system, user, options));
 }
 
 /** Raw JSON text (caller parses). */

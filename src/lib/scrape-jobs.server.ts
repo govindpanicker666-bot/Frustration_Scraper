@@ -56,9 +56,13 @@ interface ProgressEnvelope {
 
 const globalLoops = globalThis as unknown as {
   __churnhoundManualLoops?: Map<string, Promise<void>>;
+  __churnhoundCancelledJobs?: Set<string>;
   __churnhoundUserClients?: Map<string, SupabaseClient<Database>>;
   __churnhoundBootResumed?: boolean;
 };
+
+const STEP_TIMEOUT_MS = 120_000;
+const STALE_JOB_MS = 4 * 60_000;
 
 function getActiveLoops(): Map<string, Promise<void>> {
   if (!globalLoops.__churnhoundManualLoops) {
@@ -67,11 +71,45 @@ function getActiveLoops(): Map<string, Promise<void>> {
   return globalLoops.__churnhoundManualLoops;
 }
 
+function getCancelledJobs(): Set<string> {
+  if (!globalLoops.__churnhoundCancelledJobs) {
+    globalLoops.__churnhoundCancelledJobs = new Set();
+  }
+  return globalLoops.__churnhoundCancelledJobs;
+}
+
 function getUserClients(): Map<string, SupabaseClient<Database>> {
   if (!globalLoops.__churnhoundUserClients) {
     globalLoops.__churnhoundUserClients = new Map();
   }
   return globalLoops.__churnhoundUserClients;
+}
+
+async function withStepTimeout<T>(
+  promise: Promise<T>,
+  label: string,
+  ms = STEP_TIMEOUT_MS,
+): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      promise,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(
+          () => reject(new Error(`${label} timed out after ${Math.round(ms / 1000)}s`)),
+          ms,
+        );
+      }),
+    ]);
+  } finally {
+    if (timer) clearTimeout(timer);
+  }
+}
+
+function isStateStale(state: ManualScrapeJobState): boolean {
+  const ts = Date.parse(state.updated_at || state.started_at || "");
+  if (!Number.isFinite(ts)) return false;
+  return Date.now() - ts > STALE_JOB_MS;
 }
 
 async function resolveDbClient(
@@ -283,9 +321,11 @@ async function persistJobState(
 
 function launchBackgroundLoop(userId: string, initialState: ManualScrapeJobState): void {
   const activeLoops = getActiveLoops();
+  const cancelledJobs = getCancelledJobs();
   if (activeLoops.has(userId)) return;
 
-  const loopPromise = (async () => {
+  const loopHolder: { promise?: Promise<void> } = {};
+  loopHolder.promise = (async () => {
     const state: ManualScrapeJobState = {
       ...initialState,
       stats: { ...initialState.stats },
@@ -304,6 +344,8 @@ function launchBackgroundLoop(userId: string, initialState: ManualScrapeJobState
         idx < state.competitor_ids.length;
         idx++
       ) {
+        if (cancelledJobs.has(state.job_id)) break;
+
         const compId = state.competitor_ids[idx];
         const compName = state.competitor_names[idx] ?? compId ?? "Competitor";
         if (!compId) continue;
@@ -315,7 +357,13 @@ function launchBackgroundLoop(userId: string, initialState: ManualScrapeJobState
 
         try {
           const db = await resolveDbClient(userId);
-          const s = await scrapeCore(db, compId, state.platform);
+          const s = await withStepTimeout(
+            scrapeCore(db, compId, state.platform),
+            `${compName} fetch`,
+            STEP_TIMEOUT_MS,
+          );
+          if (cancelledJobs.has(state.job_id)) break;
+
           state.stats.found += s.reviews.length;
           for (const x of s.sources) {
             const prev = srcMap.get(x.platform);
@@ -329,36 +377,58 @@ function launchBackgroundLoop(userId: string, initialState: ManualScrapeJobState
           state.step = "analyzing";
           await persistJobState(userId, state);
 
-          const freshDb = await resolveDbClient(userId);
-          const a = await analyzeCore(freshDb, compId, s.reviews);
-          state.stats.relevant += a.relevant;
-          state.stats.analyzed += a.analyzed;
-          state.stats.saved += a.saved;
-          state.stats.emails += a.emails;
-          state.stats.linkedin += a.linkedin;
-          state.stats.social += a.social;
-          state.stats.discarded += a.discarded;
+          if (s.reviews.length > 0) {
+            const freshDb = await resolveDbClient(userId);
+            const a = await withStepTimeout(
+              analyzeCore(freshDb, compId, s.reviews),
+              `${compName} analysis`,
+              STEP_TIMEOUT_MS,
+            );
+            if (cancelledJobs.has(state.job_id)) break;
+
+            state.stats.relevant += a.relevant;
+            state.stats.analyzed += a.analyzed;
+            state.stats.saved += a.saved;
+            state.stats.emails += a.emails;
+            state.stats.linkedin += a.linkedin;
+            state.stats.social += a.social;
+            state.stats.discarded += a.discarded;
+          }
         } catch (err) {
           const msg = err instanceof Error ? err.message : String(err);
           console.error("scrape-all competitor error", compId, msg);
           state.errors.push(`${compName}: ${msg}`);
         }
 
+        if (cancelledJobs.has(state.job_id)) break;
+
         state.current_competitor_index = idx + 1;
         await persistJobState(userId, state);
+      }
+
+      if (cancelledJobs.has(state.job_id)) {
+        return;
       }
 
       try {
         const db = await resolveDbClient(userId);
         const { runBrandListeningForUser } = await import("./brand-listening.server");
-        await runBrandListeningForUser(db, userId, state.platform, {
-          brand_listening_date: new Date().toISOString().slice(0, 10),
-        });
+        await withStepTimeout(
+          runBrandListeningForUser(db, userId, state.platform, {
+            brand_listening_date: new Date().toISOString().slice(0, 10),
+          }),
+          "Brand listening scan",
+          STEP_TIMEOUT_MS,
+        );
       } catch (brandErr) {
         console.warn(
           "[BrandListening] background scan skipped:",
           brandErr instanceof Error ? brandErr.message : brandErr,
         );
+      }
+
+      if (cancelledJobs.has(state.job_id)) {
+        return;
       }
 
       state.job_status = "completed";
@@ -367,6 +437,7 @@ function launchBackgroundLoop(userId: string, initialState: ManualScrapeJobState
       state.finished_at = new Date().toISOString();
       await persistJobState(userId, state);
     } catch (err) {
+      if (cancelledJobs.has(state.job_id)) return;
       const msg = err instanceof Error ? err.message : String(err);
       console.error("scrape-all background loop error", msg);
       state.errors.push(msg);
@@ -376,11 +447,14 @@ function launchBackgroundLoop(userId: string, initialState: ManualScrapeJobState
       state.finished_at = new Date().toISOString();
       await persistJobState(userId, state);
     } finally {
-      activeLoops.delete(userId);
+      if (loopHolder.promise && activeLoops.get(userId) === loopHolder.promise) {
+        activeLoops.delete(userId);
+      }
+      cancelledJobs.delete(state.job_id);
     }
   })();
 
-  activeLoops.set(userId, loopPromise);
+  activeLoops.set(userId, loopHolder.promise);
 }
 
 export async function startManualScrapeJob(
@@ -395,14 +469,18 @@ export async function startManualScrapeJob(
   const existing = normalizeJobState(existingEnvelope);
 
   if (existing && existing.job_status === "running") {
-    if (
+    if (isStateStale(existing)) {
+      if (existing.job_id) getCancelledJobs().add(existing.job_id);
+      activeLoops.delete(userId);
+    } else if (
       !activeLoops.has(userId) &&
       existing.current_competitor_index < existing.competitor_ids.length
     ) {
       launchBackgroundLoop(userId, existing);
       return { started: false, resumed: true, status: existing };
+    } else {
+      return { started: false, resumed: false, status: existing };
     }
-    return { started: false, resumed: false, status: existing };
   }
 
   const { data: rows, error: compError } = await db
@@ -457,6 +535,35 @@ export async function getManualScrapeStatus(
   const state = normalizeJobState(envelope);
   if (!state) return createIdleJobState();
 
+  // Recover automatically if a running loop went stale on a hung external request.
+  if (state.job_status === "running" && isStateStale(state)) {
+    if (state.job_id) getCancelledJobs().add(state.job_id);
+    activeLoops.delete(userId);
+    const stalledName = state.current_competitor_name ?? "Competitor";
+    const recovered: ManualScrapeJobState = {
+      ...state,
+      errors: [
+        ...state.errors,
+        `${stalledName}: Step timed out while waiting on external services.`,
+      ],
+      current_competitor_index: state.current_competitor_index + 1,
+    };
+    if (recovered.current_competitor_index < recovered.competitor_ids.length) {
+      await persistJobState(userId, recovered, db);
+      launchBackgroundLoop(userId, recovered);
+      return recovered;
+    }
+    const completed: ManualScrapeJobState = {
+      ...recovered,
+      job_status: "completed",
+      step: "done",
+      current_competitor_name: null,
+      finished_at: new Date().toISOString(),
+    };
+    await persistJobState(userId, completed, db);
+    return completed;
+  }
+
   // Crash-resilience: if DB says running but this process has no active loop, resume from saved index.
   if (state.job_status === "running" && !activeLoops.has(userId)) {
     if (state.current_competitor_index < state.competitor_ids.length) {
@@ -475,6 +582,38 @@ export async function getManualScrapeStatus(
   }
 
   return state;
+}
+
+export async function cancelManualScrapeJob(
+  userId: string,
+  explicitClient?: SupabaseClient<Database>,
+): Promise<ManualScrapeJobState> {
+  const db = await resolveDbClient(userId, explicitClient);
+  const envelope = await readUserEnvelope(userId, db);
+  const state = normalizeJobState(envelope);
+  if (!state) return createIdleJobState();
+
+  if (state.job_id) {
+    getCancelledJobs().add(state.job_id);
+  }
+  getActiveLoops().delete(userId);
+
+  if (state.job_status !== "running") {
+    return state;
+  }
+
+  const cancelled: ManualScrapeJobState = {
+    ...state,
+    job_status: "completed",
+    step: "done",
+    current_competitor_name: null,
+    finished_at: new Date().toISOString(),
+    errors: state.errors.includes("Stopped by admin.")
+      ? state.errors
+      : [...state.errors, "Stopped by admin."],
+  };
+  await persistJobState(userId, cancelled, db);
+  return cancelled;
 }
 
 export async function resumeInterruptedManualJobs(): Promise<void> {

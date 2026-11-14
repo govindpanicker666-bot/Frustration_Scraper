@@ -9,6 +9,7 @@ import {
   FileText,
   Loader2,
   Play,
+  Square,
   Trash2,
   UserSearch,
 } from "lucide-react";
@@ -99,6 +100,7 @@ function Admin() {
   const [cid, setCid] = useState("");
   const [platform, setPlatform] = useState<string>("all");
   const [starting, setStarting] = useState(false);
+  const [cancelling, setCancelling] = useState(false);
   const [jobState, setJobState] = useState<ManualScrapeJobStatus | null>(null);
   const [dangerTarget, setDangerTarget] = useState<"leads" | "competitors" | null>(null);
   const [dangerBusy, setDangerBusy] = useState(false);
@@ -267,6 +269,39 @@ function Admin() {
     }
   }
 
+  async function cancelJob() {
+    setCancelling(true);
+    try {
+      const token = await getBearerToken();
+      if (!token) {
+        toast.error("Session expired — please sign in again.");
+        return;
+      }
+      const res = await fetch("/api/admin/scrape-cancel", {
+        method: "POST",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const payload = (await res.json()) as {
+        ok?: boolean;
+        status?: ManualScrapeJobStatus;
+        error?: string;
+      };
+      if (!res.ok || !payload.ok || !payload.status) {
+        throw new Error(payload.error || `Failed to stop job (HTTP ${res.status})`);
+      }
+      prevJobStatusRef.current = payload.status.job_status;
+      setJobState(payload.status);
+      toast.info("Background scrape stopped.");
+    } catch (e) {
+      toast.error(e instanceof Error ? e.message : "Failed to stop job");
+    } finally {
+      setCancelling(false);
+    }
+  }
+
   const busy = starting || jobState?.job_status === "running";
   const step: Step = starting ? "fetching" : (jobState?.step ?? "idle");
   const progress =
@@ -337,6 +372,12 @@ function Admin() {
           {busy ? <Loader2 className="animate-spin" /> : <Play />}
           {busy ? "Running in Background…" : "Trigger Scrape"}
         </Button>
+        {jobState?.job_status === "running" && (
+          <Button variant="outline" onClick={cancelJob} disabled={cancelling}>
+            {cancelling ? <Loader2 className="animate-spin" /> : <Square className="h-3.5 w-3.5" />}
+            Stop
+          </Button>
+        )}
       </div>
       {step !== "idle" && (
         <div className="glass space-y-3 p-5">
@@ -365,6 +406,18 @@ function Admin() {
               </div>
             );
           })}
+          {jobState && jobState.errors.length > 0 && (
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300">
+              <div className="font-semibold">
+                Analysis / scrape errors ({jobState.errors.length}):
+              </div>
+              <div className="mt-1 space-y-0.5">
+                {jobState.errors.slice(-3).map((err, i) => (
+                  <div key={i}>{err}</div>
+                ))}
+              </div>
+            </div>
+          )}
         </div>
       )}
       {showResults && (

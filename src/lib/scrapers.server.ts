@@ -15,6 +15,7 @@ export interface CompetitorCtx {
 }
 export interface ScrapePlatformOptions {
   apply48HourFilter?: boolean;
+  intent?: "complaints" | "mentions";
 }
 export type SourceStatus = "ok" | "blocked" | "no_match" | "no_key";
 export interface SourceResult {
@@ -766,86 +767,151 @@ function parseSnippetDate(snippet: string): string {
 function jirosearchSearchSpec(
   query: string,
   platform: Platform,
-): { searchQuery: string; hostRe: RegExp } {
+  options: {
+    domain?: string | null | undefined;
+    intent?: "complaints" | "mentions" | undefined;
+  } = {},
+): { primaryQuery: string; fallbackQuery: string | null; hostRe: RegExp; postUrlRe: RegExp } {
   const q = exactQuery(query);
+  const intent = options.intent ?? "complaints";
+  const complaintTerms =
+    '(frustrated OR switching OR alternative OR cancel OR disappointed OR worst OR problem OR "price increase" OR "stopped using")';
+  const mentionTerms = "(review OR feedback OR pricing OR support OR product OR experience)";
+
+  let siteExpr = `${platform}`;
+  let hostRe = /^https?:/i;
+  let postUrlRe = /^https?:\/\//i;
+
   switch (platform) {
     case "linkedin":
-      return {
-        searchQuery: `(site:linkedin.com/posts OR site:linkedin.com/pulse) ${q}`,
-        hostRe: /linkedin\.com/i,
-      };
+      siteExpr =
+        "(site:linkedin.com/posts OR site:linkedin.com/feed/update OR site:linkedin.com/pulse)";
+      hostRe = /linkedin\.com/i;
+      postUrlRe = /linkedin\.com\/(?:posts\/|feed\/update\/|pulse\/)/i;
+      break;
     case "x":
-      return {
-        searchQuery: `(site:x.com OR site:twitter.com) ${q}`,
-        hostRe: /(?:x|twitter)\.com/i,
-      };
+      siteExpr = "(site:x.com OR site:twitter.com)";
+      hostRe = /(?:x|twitter)\.com/i;
+      postUrlRe = /(?:x|twitter)\.com\/[^/]+\/status\/\d+/i;
+      break;
     case "youtube":
-      return {
-        searchQuery: `site:youtube.com ${q}`,
-        hostRe: /(?:youtube\.com|youtu\.be)/i,
-      };
+      siteExpr = "(site:youtube.com/watch OR site:youtu.be OR site:youtube.com/shorts)";
+      hostRe = /(?:youtube\.com|youtu\.be)/i;
+      postUrlRe = /(?:youtube\.com\/(?:watch\?v=|shorts\/)|youtu\.be\/)/i;
+      break;
     case "instagram":
-      return {
-        searchQuery: `site:instagram.com ${q}`,
-        hostRe: /instagram\.com/i,
-      };
+      siteExpr = "(site:instagram.com/p OR site:instagram.com/reel)";
+      hostRe = /instagram\.com/i;
+      postUrlRe = /instagram\.com\/(?:p|reel|tv)\//i;
+      break;
     case "tiktok":
-      return {
-        searchQuery: `site:tiktok.com ${q}`,
-        hostRe: /tiktok\.com/i,
-      };
+      siteExpr = "site:tiktok.com";
+      hostRe = /tiktok\.com/i;
+      postUrlRe = /tiktok\.com\/@[^/]+\/video\//i;
+      break;
     case "facebook":
-      return {
-        searchQuery: `site:facebook.com ${q}`,
-        hostRe: /(?:facebook\.com|fb\.watch)/i,
-      };
+      siteExpr =
+        "(site:facebook.com/groups OR site:facebook.com/*/posts OR site:facebook.com/permalink.php)";
+      hostRe = /(?:facebook\.com|fb\.watch)/i;
+      postUrlRe =
+        /facebook\.com\/(?:groups\/[^/]+\/posts\/|[^/]+\/posts\/|permalink\.php|share\/p\/)/i;
+      break;
     case "telegram":
-      return {
-        searchQuery: `site:t.me ${q}`,
-        hostRe: /t\.me/i,
-      };
+      siteExpr = "site:t.me";
+      hostRe = /t\.me/i;
+      postUrlRe = /t\.me\/(?:s\/)?[^/]+\/\d+/i;
+      break;
     case "pinterest":
-      return {
-        searchQuery: `site:pinterest.com ${q}`,
-        hostRe: /pinterest\./i,
-      };
+      siteExpr = "site:pinterest.com/pin";
+      hostRe = /pinterest\./i;
+      postUrlRe = /pinterest\.[^/]+\/pin\//i;
+      break;
     case "threads":
-      return {
-        searchQuery: `site:threads.net ${q}`,
-        hostRe: /threads\.net/i,
-      };
-    default:
-      return {
-        searchQuery: `${platform} ${q}`,
-        hostRe: /^https?:/i,
-      };
+      siteExpr = "site:threads.net";
+      hostRe = /threads\.net/i;
+      postUrlRe = /threads\.net\/@[^/]+\/post\//i;
+      break;
+  }
+
+  if (intent === "mentions") {
+    return {
+      primaryQuery: `${siteExpr} ${q}`,
+      fallbackQuery: null,
+      hostRe,
+      postUrlRe,
+    };
+  }
+
+  return {
+    primaryQuery: `${siteExpr} ${q} ${complaintTerms}`,
+    fallbackQuery: `${siteExpr} ${q} ${mentionTerms}`,
+    hostRe,
+    postUrlRe,
+  };
+}
+
+function cleanSocialUrl(rawUrl: string, platform: Platform): string {
+  const noHash = rawUrl.split("#")[0] ?? rawUrl;
+  if (platform === "youtube" || platform === "facebook") {
+    try {
+      const u = new URL(noHash);
+      if (platform === "youtube" && u.pathname === "/watch") {
+        const v = u.searchParams.get("v");
+        return v ? `${u.origin}/watch?v=${v}` : noHash;
+      }
+      if (platform === "facebook" && u.pathname.endsWith("/permalink.php")) {
+        const storyId = u.searchParams.get("story_fbid");
+        const pageId = u.searchParams.get("id");
+        if (storyId && pageId)
+          return `${u.origin}/permalink.php?story_fbid=${storyId}&id=${pageId}`;
+      }
+    } catch {
+      /* fall back to stripping query below */
+    }
+  }
+  return noHash.split("?")[0] ?? noHash;
+}
+
+let trueScrapeActive = 0;
+const trueScrapeQueue: Array<() => void> = [];
+
+async function withTrueScrapeSlot<T>(fn: () => Promise<T>): Promise<T> {
+  if (trueScrapeActive >= 2) {
+    await new Promise<void>((resolve) => trueScrapeQueue.push(resolve));
+  }
+  trueScrapeActive++;
+  try {
+    return await fn();
+  } finally {
+    await new Promise((r) => setTimeout(r, 200));
+    trueScrapeActive--;
+    trueScrapeQueue.shift()?.();
   }
 }
 
-async function scrapeJirosearchFallback(
-  query: string,
-  platforms: Platform[],
-): Promise<RawReview[]> {
+async function runFallbackSearchQuery(
+  searchQuery: string,
+  postUrlRe: RegExp,
+  hostRe: RegExp,
+  hasTrueScrape: boolean,
+): Promise<Array<{ url: string; title: string; text: string; publishedAt: string | null }>> {
   const { execFile } = await import("node:child_process");
   const path = await import("node:path");
   const { promisify } = await import("node:util");
-  const { linkedinAuthorFromPost } = await import("./pipeline");
   const execFileAsync = promisify(execFile);
   const cliPath = path.resolve(process.cwd(), "node_modules/truescrape/dist/index.js");
-  const hasTrueScrape = Boolean(process.env["TRUESCRAPE_API_KEY"]?.trim());
-  const out: RawReview[] = [];
-  const seenUrls = new Set<string>();
 
-  for (const platform of platforms) {
-    const { searchQuery, hostRe } = jirosearchSearchSpec(query, platform);
-    let hits: Array<{ url: string; title: string; text: string; publishedAt: string | null }> = [];
+  let rawHits: Array<{ url: string; title: string; text: string; publishedAt: string | null }> = [];
 
-    if (hasTrueScrape) {
+  if (hasTrueScrape) {
+    for (let attempt = 0; attempt < 2 && rawHits.length === 0; attempt++) {
       try {
-        const { stdout } = await execFileAsync(
-          process.execPath,
-          [cliPath, "google", "search", "--query", searchQuery, "--envelope", "--quiet"],
-          { env: process.env, timeout: 25_000, maxBuffer: 2 * 1024 * 1024 },
+        const { stdout } = await withTrueScrapeSlot(() =>
+          execFileAsync(
+            process.execPath,
+            [cliPath, "google", "search", "--query", searchQuery, "--envelope", "--quiet"],
+            { env: process.env, timeout: 25_000, maxBuffer: 2 * 1024 * 1024 },
+          ),
         );
         const parsed = JSON.parse(stdout) as {
           data?: {
@@ -859,7 +925,7 @@ async function scrapeJirosearchFallback(
         };
         for (const item of parsed.data?.items ?? []) {
           if (typeof item.url === "string" && hostRe.test(item.url)) {
-            hits.push({
+            rawHits.push({
               url: item.url.split("#")[0]!,
               title: stripHtml(item.title ?? ""),
               text: stripHtml(item.text ?? ""),
@@ -867,30 +933,70 @@ async function scrapeJirosearchFallback(
             });
           }
         }
+        if (rawHits.length === 0 && attempt === 0) {
+          await new Promise((r) => setTimeout(r, 500));
+        }
       } catch {
-        /* fall back to webSearch below */
+        if (attempt === 0) {
+          await new Promise((r) => setTimeout(r, 500));
+        }
+      }
+    }
+  }
+
+  if (rawHits.length === 0) {
+    try {
+      const { webSearch } = await import("./search.server");
+      const webHits = await webSearch(searchQuery, { recent: true });
+      rawHits = webHits
+        .filter((h) => hostRe.test(h.url))
+        .map((h) => ({
+          url: h.url.split("#")[0]!,
+          title: stripHtml(h.title),
+          text: stripHtml(h.snippet),
+          publishedAt: null,
+        }));
+    } catch {
+      /* ignore webSearch error */
+    }
+  }
+
+  return rawHits.filter((h) => postUrlRe.test(h.url));
+}
+
+async function scrapeJirosearchFallback(
+  query: string,
+  platforms: Platform[],
+  options: {
+    domain?: string | null | undefined;
+    intent?: "complaints" | "mentions" | undefined;
+  } = {},
+): Promise<RawReview[]> {
+  const { linkedinAuthorFromPost } = await import("./pipeline");
+  const hasTrueScrape = Boolean(process.env["TRUESCRAPE_API_KEY"]?.trim());
+  const out: RawReview[] = [];
+  const seenUrls = new Set<string>();
+
+  for (const platform of platforms) {
+    const { primaryQuery, fallbackQuery, hostRe, postUrlRe } = jirosearchSearchSpec(
+      query,
+      platform,
+      options,
+    );
+    const hits = await runFallbackSearchQuery(primaryQuery, postUrlRe, hostRe, hasTrueScrape);
+    if (hits.length < 3 && fallbackQuery) {
+      const extra = await runFallbackSearchQuery(fallbackQuery, postUrlRe, hostRe, hasTrueScrape);
+      const existing = new Set(hits.map((h) => h.url));
+      for (const item of extra) {
+        if (!existing.has(item.url)) {
+          hits.push(item);
+          existing.add(item.url);
+        }
       }
     }
 
-    if (hits.length === 0) {
-      try {
-        const { webSearch } = await import("./search.server");
-        const webHits = await webSearch(searchQuery, { recent: true });
-        hits = webHits
-          .filter((h) => hostRe.test(h.url))
-          .map((h) => ({
-            url: h.url.split("#")[0]!,
-            title: stripHtml(h.title),
-            text: stripHtml(h.snippet),
-            publishedAt: null,
-          }));
-      } catch {
-        /* ignore webSearch error */
-      }
-    }
-
-    for (const h of hits.slice(0, 15)) {
-      const cleanUrl = h.url.split("?")[0] ?? h.url;
+    for (const h of hits.slice(0, 20)) {
+      const cleanUrl = cleanSocialUrl(h.url, platform);
       if (!/^https?:\/\//i.test(cleanUrl) || seenUrls.has(cleanUrl)) continue;
       seenUrls.add(cleanUrl);
 
@@ -946,7 +1052,14 @@ async function scrapeJirosearchFallback(
   return out;
 }
 
-export async function scrapeJirosearch(query: string, platforms: string[]): Promise<RawReview[]> {
+export async function scrapeJirosearch(
+  query: string,
+  platforms: string[],
+  options: {
+    domain?: string | null | undefined;
+    intent?: "complaints" | "mentions" | undefined;
+  } = {},
+): Promise<RawReview[]> {
   const apiKey = process.env["JIROSEARCH_API_KEY"]?.trim();
   const hasTrueScrape = Boolean(process.env["TRUESCRAPE_API_KEY"]?.trim());
 
@@ -959,7 +1072,7 @@ export async function scrapeJirosearch(query: string, platforms: string[]): Prom
 
   if (!apiKey) {
     if (!hasTrueScrape) throw new Error("no_key");
-    return scrapeJirosearchFallback(query.trim(), normalizedPlatforms);
+    return scrapeJirosearchFallback(query.trim(), normalizedPlatforms, options);
   }
 
   // TODO: Switch to self-hosted Jirosearch URL before commercial launch
@@ -983,20 +1096,20 @@ export async function scrapeJirosearch(query: string, platforms: string[]): Prom
     });
   } catch (err) {
     if (hasTrueScrape) {
-      return scrapeJirosearchFallback(query.trim(), normalizedPlatforms);
+      return scrapeJirosearchFallback(query.trim(), normalizedPlatforms, options);
     }
     throw err;
   }
 
   if (res.status === 401 || res.status === 403 || res.status === 429 || res.status === 503) {
     if (hasTrueScrape) {
-      return scrapeJirosearchFallback(query.trim(), normalizedPlatforms);
+      return scrapeJirosearchFallback(query.trim(), normalizedPlatforms, options);
     }
     throw new Blocked(`jirosearch ${res.status}`);
   }
   if (!res.ok) {
     if (hasTrueScrape) {
-      return scrapeJirosearchFallback(query.trim(), normalizedPlatforms);
+      return scrapeJirosearchFallback(query.trim(), normalizedPlatforms, options);
     }
     throw new Blocked(`jirosearch ${res.status}`);
   }
@@ -1113,29 +1226,29 @@ export async function scrapeJirosearch(query: string, platforms: string[]): Prom
   return out;
 }
 
-async function linkedin(c: CompetitorCtx) {
-  return scrapeJirosearch(c.name, ["linkedin"]);
+async function linkedin(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
+  return scrapeJirosearch(c.name, ["linkedin"], { domain: c.domain, intent: opts.intent });
 }
-async function x(c: CompetitorCtx) {
-  return scrapeJirosearch(c.name, ["x"]);
+async function x(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
+  return scrapeJirosearch(c.name, ["x"], { domain: c.domain, intent: opts.intent });
 }
-async function youtube(c: CompetitorCtx) {
-  return scrapeJirosearch(c.name, ["youtube"]);
+async function youtube(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
+  return scrapeJirosearch(c.name, ["youtube"], { domain: c.domain, intent: opts.intent });
 }
-async function instagram(c: CompetitorCtx) {
-  return scrapeJirosearch(c.name, ["instagram"]);
+async function instagram(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
+  return scrapeJirosearch(c.name, ["instagram"], { domain: c.domain, intent: opts.intent });
 }
-async function tiktok(c: CompetitorCtx) {
-  return scrapeJirosearch(c.name, ["tiktok"]);
+async function tiktok(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
+  return scrapeJirosearch(c.name, ["tiktok"], { domain: c.domain, intent: opts.intent });
 }
-async function facebook(c: CompetitorCtx) {
-  return scrapeJirosearch(c.name, ["facebook"]);
+async function facebook(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
+  return scrapeJirosearch(c.name, ["facebook"], { domain: c.domain, intent: opts.intent });
 }
-async function telegram(c: CompetitorCtx) {
-  return scrapeJirosearch(c.name, ["telegram"]);
+async function telegram(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
+  return scrapeJirosearch(c.name, ["telegram"], { domain: c.domain, intent: opts.intent });
 }
-async function pinterest(c: CompetitorCtx) {
-  return scrapeJirosearch(c.name, ["pinterest"]);
+async function pinterest(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
+  return scrapeJirosearch(c.name, ["pinterest"], { domain: c.domain, intent: opts.intent });
 }
 
 // ---------- Newer free sources ----------
@@ -1367,7 +1480,7 @@ async function threads(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   } catch {
     /* threads-scraper unavailable or blocked; fall back to Jirosearch */
   }
-  return scrapeJirosearch(c.name, ["threads"]);
+  return scrapeJirosearch(c.name, ["threads"], { domain: c.domain, intent: opts.intent });
 }
 
 const SOURCES: Record<
@@ -1422,12 +1535,9 @@ export async function scrapePlatform(
       (r) =>
         r.text &&
         r.source_url &&
-        (platform === "threads"
-          ? !Number.isNaN(new Date(r.published_at).getTime()) &&
-            Boolean(r.reviewer_name && r.reviewer_name !== "[deleted]")
-          : JIROSEARCH_PLATFORM_SET.has(platform)
-            ? !Number.isNaN(new Date(r.published_at).getTime()) && r.reviewer_name !== "[deleted]"
-            : keepReview(r, undefined, { skipRecencyCheck: !apply48HourFilter })),
+        (JIROSEARCH_PLATFORM_SET.has(platform)
+          ? !Number.isNaN(new Date(r.published_at).getTime()) && r.reviewer_name !== "[deleted]"
+          : keepReview(r, undefined, { skipRecencyCheck: !apply48HourFilter })),
     );
     return { status: "ok", reviews };
   } catch (e) {

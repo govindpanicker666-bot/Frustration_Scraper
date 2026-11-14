@@ -1698,3 +1698,103 @@ export function summarizeBrandMentions(mentions: BrandMention[]) {
     topNegative,
   };
 }
+
+export interface ScoredReviewItem {
+  index: number;
+  relevant: boolean;
+  score: number;
+  sentiment: "negative" | "neutral" | "positive";
+  negative_quote: string;
+  complaint: string;
+  pitch: string;
+  job_title: string | null;
+  company: string | null;
+  is_person: boolean;
+}
+
+/**
+ * Normalizes Gemini review-scoring JSON regardless of whether the model returns
+ * `{ results: [...] }`, `[...]`, `{ items: [...] }`, or stringified index/score/boolean fields.
+ */
+export function extractScoredReviews(rawOutput: unknown, batchLength: number): ScoredReviewItem[] {
+  const list = Array.isArray(rawOutput)
+    ? rawOutput
+    : rawOutput && typeof rawOutput === "object"
+      ? (() => {
+          const obj = rawOutput as Record<string, unknown>;
+          for (const key of ["results", "items", "posts", "reviews", "data"]) {
+            if (Array.isArray(obj[key])) return obj[key] as unknown[];
+          }
+          return [];
+        })()
+      : [];
+
+  const seen = new Set<number>();
+  const out: ScoredReviewItem[] = [];
+
+  for (let pos = 0; pos < list.length; pos++) {
+    const entry = list[pos];
+    if (!entry || typeof entry !== "object") continue;
+    const rec = entry as Record<string, unknown>;
+
+    const rawIdx = rec["index"];
+    const idx =
+      typeof rawIdx === "number"
+        ? rawIdx
+        : typeof rawIdx === "string" && rawIdx.trim() !== ""
+          ? Number(rawIdx.replace(/[^\d-]/g, ""))
+          : list.length === batchLength
+            ? pos
+            : Number.NaN;
+
+    if (!Number.isInteger(idx) || idx < 0 || idx >= batchLength || seen.has(idx)) continue;
+    seen.add(idx);
+
+    const rawRel = rec["relevant"];
+    const relevant =
+      typeof rawRel === "boolean"
+        ? rawRel
+        : typeof rawRel === "string"
+          ? rawRel.trim().toLowerCase() === "true"
+          : false;
+
+    const rawSent =
+      typeof rec["sentiment"] === "string" ? rec["sentiment"].trim().toLowerCase() : "";
+    const sentiment: "negative" | "neutral" | "positive" =
+      rawSent === "negative" || rawSent === "positive" || rawSent === "neutral"
+        ? rawSent
+        : "neutral";
+
+    const rawScore = Number(rec["score"]);
+    const score = Number.isFinite(rawScore) ? Math.max(0, Math.min(10, rawScore)) : 0;
+
+    const rawIsPerson = rec["is_person"];
+    const is_person =
+      typeof rawIsPerson === "boolean"
+        ? rawIsPerson
+        : typeof rawIsPerson === "string"
+          ? rawIsPerson.trim().toLowerCase() !== "false"
+          : true;
+
+    const cleanStr = (v: unknown) => (typeof v === "string" ? v.trim() : "");
+    const cleanOptStr = (v: unknown) => {
+      const s = cleanStr(v);
+      return s && s.toLowerCase() !== "null" ? s : null;
+    };
+
+    out.push({
+      index: idx,
+      relevant,
+      score,
+      sentiment,
+      negative_quote: cleanStr(rec["negative_quote"]),
+      complaint: cleanStr(rec["complaint"]),
+      pitch: cleanStr(rec["pitch"]),
+      job_title: cleanOptStr(rec["job_title"]),
+      company: cleanOptStr(rec["company"]),
+      is_person,
+    });
+  }
+
+  return out;
+}

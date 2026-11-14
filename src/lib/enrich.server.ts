@@ -59,7 +59,7 @@ async function hasMx(domain: string): Promise<boolean> {
   try {
     const r = await fetch(
       `https://cloudflare-dns.com/dns-query?name=${encodeURIComponent(domain)}&type=MX`,
-      { headers: { Accept: "application/dns-json" } },
+      { headers: { Accept: "application/dns-json" }, signal: AbortSignal.timeout(5000) },
     );
     const j = (await r.json()) as { Answer?: { type: number }[] };
     return (j.Answer ?? []).some((a) => a.type === 15);

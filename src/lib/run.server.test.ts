@@ -132,4 +132,135 @@ describe("negative-only lead analysis", () => {
       linkedin_url: null,
     });
   });
+
+  it("chunks >20 reviews cleanly and handles direct array / string-typed AI responses", async () => {
+    mocks.geminiJson.mockReset();
+    mocks.findContact.mockResolvedValue({
+      email: null,
+      emailStatus: null,
+      linkedin: null,
+      jobTitle: null,
+      company: null,
+      companyDomain: null,
+      name: "User",
+    });
+
+    // First chunk returns 20 items wrapped as direct array with stringified index/relevant/score;
+    // second chunk returns 5 items where item 2 (global index 22) is negative.
+    mocks.geminiJson
+      .mockResolvedValueOnce(
+        Array.from({ length: 20 }, (_, i) => ({
+          index: String(i),
+          relevant: i === 0 ? "true" : false,
+          score: "0",
+          sentiment: "neutral",
+          negative_quote: "",
+          complaint: "",
+          pitch: "",
+          job_title: null,
+          company: null,
+          is_person: true,
+        })),
+      )
+      .mockResolvedValueOnce({
+        results: Array.from({ length: 5 }, (_, i) => ({
+          index: i,
+          relevant: i === 2,
+          score: i === 2 ? 8 : 0,
+          sentiment: i === 2 ? "negative" : "neutral",
+          negative_quote: i === 2 ? "pricing doubled overnight" : "",
+          complaint: i === 2 ? "Sudden price hike" : "",
+          pitch: i === 2 ? "Switch to predictable pricing." : "",
+          job_title: null,
+          company: null,
+          is_person: true,
+        })),
+      });
+
+    let upsertedRows: Record<string, unknown>[] = [];
+    const client = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            single: async () => ({
+              data: {
+                id: "c",
+                user_id: "u",
+                name: "HubSpot",
+                url: "https://hubspot.com",
+                domain: "hubspot.com",
+                keywords: [],
+              },
+            }),
+            then: (cb: (v: { data: unknown[]; error: null }) => void) =>
+              cb({ data: [], error: null }),
+          }),
+        }),
+        upsert: (rows: Record<string, unknown>[]) => {
+          upsertedRows = rows;
+          return {
+            select: async () => ({ data: rows.map((_, i) => ({ id: String(i) })), error: null }),
+          };
+        },
+      }),
+    } as unknown as SupabaseClient<Database>;
+
+    const reviews = Array.from({ length: 25 }, (_, i) => ({
+      platform: "linkedin" as const,
+      reviewer_name: `User ${i}`,
+      reviewer_profile_url: null,
+      source_url: `https://www.linkedin.com/posts/user-${i}_hubspot-activity-${i}`,
+      text:
+        i === 22
+          ? "HubSpot pricing doubled overnight and our team is looking for alternatives."
+          : `Discussion post #${i} mentioning HubSpot.`,
+      published_at: new Date().toISOString(),
+    }));
+
+    const result = await analyzeCore(client, "c", reviews);
+    expect(mocks.geminiJson).toHaveBeenCalledTimes(2);
+    expect(result.analyzed).toBe(25);
+    expect(result.relevant).toBe(2);
+    expect(result.saved).toBe(1);
+    expect(upsertedRows[0]?.["source_url"]).toBe(
+      "https://www.linkedin.com/posts/user-22_hubspot-activity-22",
+    );
+  });
+
+  it("surfaces clear AI_CONFIG diagnostic when GEMINI_API_KEY is missing", async () => {
+    mocks.geminiJson.mockReset();
+    mocks.geminiJson.mockRejectedValue(new Error("GEMINI_API_KEY is not set"));
+
+    const client = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            single: async () => ({
+              data: {
+                id: "c",
+                user_id: "u",
+                name: "HubSpot",
+                url: "https://hubspot.com",
+                domain: "hubspot.com",
+                keywords: [],
+              },
+            }),
+          }),
+        }),
+      }),
+    } as unknown as SupabaseClient<Database>;
+
+    await expect(
+      analyzeCore(client, "c", [
+        {
+          platform: "x",
+          reviewer_name: "@user1",
+          reviewer_profile_url: null,
+          source_url: "https://x.com/user1/status/1",
+          text: "HubSpot is frustrating.",
+          published_at: new Date().toISOString(),
+        },
+      ]),
+    ).rejects.toThrow(/AI_CONFIG: GEMINI_API_KEY is not set/);
+  });
 });

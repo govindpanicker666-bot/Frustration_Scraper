@@ -602,17 +602,40 @@ export async function runBrandListeningForUser(
   const BATCH_SIZE = 5;
   let completedPlatforms = 0;
 
+  const SOCIAL_SEARCH_PLATFORMS = new Set<Platform>([
+    "instagram",
+    "linkedin",
+    "x",
+    "youtube",
+    "tiktok",
+    "facebook",
+    "telegram",
+    "pinterest",
+    "threads",
+  ]);
+
   try {
     for (let i = 0; i < platforms.length; i += BATCH_SIZE) {
       const batch = platforms.slice(i, i + BATCH_SIZE);
       const results = await Promise.all(
-        batch.map((p) => scrapePlatform(scrapeCtx, p, { apply48HourFilter })),
+        batch.map((p) =>
+          scrapePlatform(
+            scrapeCtx,
+            p,
+            SOCIAL_SEARCH_PLATFORMS.has(p)
+              ? { apply48HourFilter, intent: "mentions" }
+              : { apply48HourFilter },
+          ),
+        ),
       );
 
-      for (const res of results) {
-        const filtered = apply48HourFilter
-          ? res.reviews.filter((r) => isRecent(r.published_at)).slice(0, 15)
-          : res.reviews;
+      for (const [idx, res] of results.entries()) {
+        const targetPlatform = batch[idx];
+        const skipRecent = Boolean(targetPlatform && SOCIAL_SEARCH_PLATFORMS.has(targetPlatform));
+        const filtered =
+          apply48HourFilter && !skipRecent
+            ? res.reviews.filter((r) => isRecent(r.published_at)).slice(0, 15)
+            : res.reviews;
         for (const review of filtered) {
           const key = review.source_url.trim().toLowerCase().replace(/\/$/, "");
           if (!key || seenUrls.has(key)) continue;
