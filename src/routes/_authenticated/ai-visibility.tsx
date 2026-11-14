@@ -1,7 +1,7 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQuery, useQueryClient } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
   ArrowDownRight,
@@ -98,11 +98,20 @@ function AIVisibilityPage() {
     queryKey: ["ai_visibility_scans"],
     queryFn: () => fetchScans(),
   });
-  const scans = (scanQuery.data ?? []) as ScanRow[];
+  const scans = (scanQuery.data?.scans ?? []) as ScanRow[];
+  const savedBrandName = scanQuery.data?.brandName ?? "";
+  const savedCompetitorNames = scanQuery.data?.competitorNames ?? [];
+
+  useEffect(() => {
+    if (!brandName && savedBrandName) setBrandName(savedBrandName);
+    if (!competitorNames && savedCompetitorNames.length) {
+      setCompetitorNames(savedCompetitorNames.join(", "));
+    }
+  }, [brandName, competitorNames, savedBrandName, savedCompetitorNames]);
+
   const latest = scans[0];
   const latestRun = useMemo(() => {
     if (!latest) return [] as ScanRow[];
-    const timestamp = new Date(latest.created_at).getTime();
     const key = latest.brand_name;
     return scans.filter(
       (row) =>
@@ -142,18 +151,20 @@ function AIVisibilityPage() {
   }));
 
   async function handleScan() {
-    if (!brandName.trim()) {
-      toast.error("Enter your brand name first.");
+    const selectedBrand = brandName.trim() || savedBrandName.trim();
+    if (!selectedBrand) {
+      toast.error("Enter your brand name or save it in your company profile first.");
       return;
     }
     setRunning(true);
     try {
-      const competitors = competitorNames
-        .split(",")
+      const competitors = (competitorNames.trim()
+        ? competitorNames.split(",")
+        : savedCompetitorNames)
         .map((name) => name.trim())
         .filter(Boolean);
       const result = await executeScan({
-        data: { brand_name: brandName.trim(), competitor_names: competitors },
+        data: { brand_name: selectedBrand, competitor_names: competitors },
       });
       toast.success(`Scan complete: ${result.promptsCompleted}/10 prompts analyzed.`);
       setBrandName(result.brandName);
