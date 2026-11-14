@@ -10,8 +10,8 @@ const scanSchema = z.object({
 export const getAIVisibilityScansFn = createServerFn({ method: "GET" })
   .middleware([requireAppSupabaseAuth])
   .handler(async ({ context }) => {
-    const { getAIVisibilityScans } = await import("./ai-visibility.server");
-    return getAIVisibilityScans(context.supabase, context.userId);
+    const { getAIVisibilityDashboard } = await import("./ai-visibility.server");
+    return getAIVisibilityDashboard(context.supabase, context.userId);
   });
 
 export const runAIVisibilityScanFn = createServerFn({ method: "POST" })
