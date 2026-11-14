@@ -24,7 +24,7 @@ export function BlogShell({ children }: { children: ReactNode }) {
       </header>
       <main className="mx-auto max-w-5xl px-4 py-10">{children}</main>
       <footer className="border-t py-8 text-center text-xs text-muted-foreground">
-        © {new Date().getFullYear()} Churnhound
+        © <span suppressHydrationWarning>{new Date().getUTCFullYear()}</span> Churnhound
       </footer>
     </div>
   );
@@ -32,5 +32,10 @@ export function BlogShell({ children }: { children: ReactNode }) {
 
 export const fmtDate = (d: string | null | undefined) =>
   d
-    ? new Date(d).toLocaleDateString("en-US", { year: "numeric", month: "short", day: "numeric" })
+    ? new Date(d).toLocaleDateString("en-US", {
+        timeZone: "UTC",
+        year: "numeric",
+        month: "short",
+        day: "numeric",
+      })
     : "";

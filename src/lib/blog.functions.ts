@@ -3,6 +3,7 @@ import { requireSupabaseAuth } from "@/integrations/supabase/auth-middleware";
 import { createClient } from "@supabase/supabase-js";
 import type { Database } from "@/integrations/supabase/types";
 import type { SupabaseClient } from "@supabase/supabase-js";
+import { SUPABASE_ANON_KEY, SUPABASE_URL } from "@/integrations/supabase/constants";
 
 export type BlogPost = {
   id: string;
@@ -27,13 +28,8 @@ export type BlogPost = {
 };
 
 function publicClient() {
-  const url = (process.env["SUPABASE_URL"] || process.env["VITE_SUPABASE_URL"])!
-    .trim()
-    .replace(/\/+$/, "");
-  const key = (process.env["SUPABASE_PUBLISHABLE_KEY"] ||
-    process.env["VITE_SUPABASE_PUBLISHABLE_KEY"] ||
-    process.env["SUPABASE_ANON_KEY"] ||
-    process.env["VITE_SUPABASE_ANON_KEY"])!.trim();
+  const url = SUPABASE_URL.trim().replace(/\/+$/, "");
+  const key = SUPABASE_ANON_KEY.trim();
   return createClient<Database>(url, key, {
     auth: { persistSession: false, autoRefreshToken: false, storage: undefined },
     global: {

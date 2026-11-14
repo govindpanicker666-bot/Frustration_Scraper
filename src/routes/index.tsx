@@ -1,5 +1,4 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { motion } from "framer-motion";
 import { Flame, Radar, Sparkles, Target } from "lucide-react";
 import { Button } from "@/components/ui/button";
 
@@ -61,12 +60,7 @@ function Landing() {
           </Button>
         </div>
       </nav>
-      <motion.section
-        initial={{ opacity: 0, y: 20 }}
-        animate={{ opacity: 1, y: 0 }}
-        transition={{ duration: 0.6 }}
-        className="py-24 text-center"
-      >
+      <section className="py-24 text-center animate-in fade-in slide-in-from-bottom-4 duration-500 fill-mode-both">
         <p className="mb-4 text-sm uppercase tracking-[0.25em] text-primary">
           Frustration-led growth
         </p>
@@ -83,20 +77,18 @@ function Landing() {
             <Link to="/auth">Start finding leads</Link>
           </Button>
         </div>
-      </motion.section>
+      </section>
       <section className="grid gap-4 pb-20 sm:grid-cols-2 lg:grid-cols-4">
         {features.map((f, i) => (
-          <motion.div
+          <div
             key={f.title}
-            initial={{ opacity: 0, y: 16 }}
-            animate={{ opacity: 1, y: 0 }}
-            transition={{ delay: 0.2 + i * 0.08 }}
-            className="glass p-6"
+            style={{ animationDelay: `${200 + i * 80}ms` }}
+            className="glass p-6 animate-in fade-in slide-in-from-bottom-4 duration-500 fill-mode-both"
           >
             <f.icon className="mb-4 h-6 w-6 text-primary" />
             <h3 className="font-bold">{f.title}</h3>
             <p className="mt-2 text-sm text-muted-foreground">{f.body}</p>
-          </motion.div>
+          </div>
         ))}
       </section>
     </main>

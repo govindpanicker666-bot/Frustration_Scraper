@@ -48,8 +48,10 @@ function Onboarding() {
       });
       if (r.error) toast.error(r.error);
       setList(r.competitors.map((c) => ({ ...c, on: true })));
-    } catch {
-      toast.error("Could not reach the AI. Try again.");
+    } catch (err) {
+      console.error("detectCompetitors", err);
+      const msg = err instanceof Error ? err.message.trim() : "";
+      toast.error(msg && !msg.startsWith("<") ? msg : "Could not reach the AI. Try again.");
     } finally {
       setLoading(false);
     }

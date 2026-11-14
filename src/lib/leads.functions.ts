@@ -195,13 +195,16 @@ export const updateScrapeSettings = createServerFn({ method: "POST" })
   .middleware([requireSupabaseAuth])
   .inputValidator((d: unknown) => settingsSchema.parse(d))
   .handler(async ({ data, context }) => {
-    const { error } = await context.supabase.from("user_scrape_settings").upsert({
-      user_id: context.userId,
-      ...data,
-      ...(data.enabled ? { pause_reason: null } : {}),
-      updated_at: new Date().toISOString(),
-    });
-    if (error) throw new Error("Could not save settings");
+    const { error } = await context.supabase.from("user_scrape_settings").upsert(
+      {
+        user_id: context.userId,
+        ...data,
+        ...(data.enabled ? { pause_reason: null } : {}),
+        updated_at: new Date().toISOString(),
+      },
+      { onConflict: "user_id" },
+    );
+    if (error) throw new Error(error.message || "Could not save settings");
     return { ok: true };
   });
 

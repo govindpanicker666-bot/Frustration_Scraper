@@ -1,10 +1,12 @@
 // All AI calls go directly to Google Gemini using the project's own keys
 // (billed to the user's Google account, not Lovable credits).
 // GEMINI_API_KEY is primary; GEMINI_API_KEY_2 is used when the first hits its limit.
-export const GEMINI_MODEL = "gemini-3.5-flash-lite" as const;
-export const FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash-lite"] as const;
+export const GEMINI_MODEL = "gemini-4-hydrogen" as const;
+export const FALLBACK_MODELS = ["gemini-3.1-flash-lite"] as const;
 const MODELS = [GEMINI_MODEL, ...FALLBACK_MODELS];
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
+const isUsableKey = (k: string | undefined): k is string =>
+  !!k && k.trim().length > 0 && k.trim() !== "MY_GEMINI_API_KEY";
 
 async function callOnce(key: string, model: string, body: unknown) {
   try {
@@ -12,7 +14,11 @@ async function callOnce(key: string, model: string, body: unknown) {
       `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
       {
         method: "POST",
-        headers: { "Content-Type": "application/json", "x-goog-api-key": key },
+        headers: {
+          "Content-Type": "application/json",
+          "User-Agent": "aistudio-build",
+          "x-goog-api-key": key,
+        },
         body: JSON.stringify(body),
       },
     );
@@ -22,9 +28,7 @@ async function callOnce(key: string, model: string, body: unknown) {
 }
 
 async function callGemini(system: string, user: string): Promise<string> {
-  const keys = [process.env["GEMINI_API_KEY"], process.env["GEMINI_API_KEY_2"]].filter(
-    (k): k is string => !!k,
-  );
+  const keys = [process.env["GEMINI_API_KEY"], process.env["GEMINI_API_KEY_2"]].filter(isUsableKey);
   if (!keys.length) throw new Error("GEMINI_API_KEY is not set");
   const body: Record<string, unknown> = {
     systemInstruction: { parts: [{ text: system + "\nRespond ONLY with valid JSON, no prose." }] },
@@ -43,8 +47,9 @@ async function callGemini(system: string, user: string): Promise<string> {
           };
           return json.candidates?.[0]?.content?.parts?.map((p) => p.text ?? "").join("") ?? "";
         }
-        lastErr = `Gemini error ${res.status} (${model}): ${(await res.text()).slice(0, 300)}`;
-        if (res.status === 401 || res.status === 403) break; // Invalid/forbidden key -> next key
+        const errBody = await res.text();
+        lastErr = `Gemini error ${res.status} (${model}): ${errBody.slice(0, 300)}`;
+        if (res.status === 401 || res.status === 403 || errBody.includes("API_KEY_INVALID")) break; // Invalid/forbidden key -> next key
         continue; // 404, 400, 429 (busy/quota), 503 (overloaded), 5xx -> fallback to next model
       }
     }

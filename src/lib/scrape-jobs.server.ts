@@ -2,6 +2,7 @@
 // Wraps existing scrapeCore / analyzeCore without altering core scraping logic.
 import { createClient, type SupabaseClient } from "@supabase/supabase-js";
 import type { Database, Json } from "@/integrations/supabase/types";
+import { SUPABASE_ANON_KEY, SUPABASE_URL } from "@/integrations/supabase/constants";
 import type { Platform } from "./pipeline";
 
 export type ManualJobStatus = "idle" | "running" | "completed";
@@ -149,25 +150,8 @@ export async function requireAdminApiRequest(
   | { ok: true; userId: string; supabase: SupabaseClient<Database> }
   | { ok: false; response: Response }
 > {
-  const SUPABASE_URL = (process.env["SUPABASE_URL"] || process.env["VITE_SUPABASE_URL"])
-    ?.trim()
-    .replace(/\/+$/, "");
-  const SUPABASE_ANON_KEY = (
-    process.env["SUPABASE_PUBLISHABLE_KEY"] ||
-    process.env["VITE_SUPABASE_PUBLISHABLE_KEY"] ||
-    process.env["SUPABASE_ANON_KEY"] ||
-    process.env["VITE_SUPABASE_ANON_KEY"]
-  )?.trim();
-  if (!SUPABASE_URL || !SUPABASE_ANON_KEY) {
-    console.error("[AdminAuth] Missing Supabase configuration", {
-      hasUrl: Boolean(SUPABASE_URL),
-      hasAnonKey: Boolean(SUPABASE_ANON_KEY),
-    });
-    return {
-      ok: false,
-      response: Response.json({ error: "Missing Supabase configuration" }, { status: 500 }),
-    };
-  }
+  const supabaseUrl = SUPABASE_URL.trim().replace(/\/+$/, "");
+  const supabaseAnonKey = SUPABASE_ANON_KEY.trim();
 
   const authHeader = request.headers.get("authorization") ?? "";
   if (!authHeader.startsWith("Bearer ")) {
@@ -180,9 +164,9 @@ export async function requireAdminApiRequest(
     return { ok: false, response: Response.json({ error: "Invalid token" }, { status: 401 }) };
   }
 
-  const supabase = createClient<Database>(SUPABASE_URL, SUPABASE_ANON_KEY, {
+  const supabase = createClient<Database>(supabaseUrl, supabaseAnonKey, {
     global: {
-      fetch: createAuthCheckFetch(SUPABASE_ANON_KEY),
+      fetch: createAuthCheckFetch(supabaseAnonKey),
       headers: { Authorization: `Bearer ${token}` },
     },
     auth: { storage: undefined, persistSession: false, autoRefreshToken: false },

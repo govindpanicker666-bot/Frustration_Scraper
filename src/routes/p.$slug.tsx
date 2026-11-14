@@ -60,7 +60,7 @@ function PublicPage() {
         ))}
       </main>
       <footer className="border-t py-8 text-center text-xs text-muted-foreground">
-        © {new Date().getFullYear()} Churnhound
+        © <span suppressHydrationWarning>{new Date().getUTCFullYear()}</span> Churnhound
       </footer>
     </div>
   );

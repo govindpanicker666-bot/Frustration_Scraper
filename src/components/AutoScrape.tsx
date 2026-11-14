@@ -1,8 +1,9 @@
-import { useQuery } from "@tanstack/react-query";
-import { useServerFn } from "@tanstack/react-start";
+import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
+import { useEffect, useState } from "react";
 import { toast } from "sonner";
-import { getScrapeSettings, updateScrapeSettings } from "@/lib/leads.functions";
+import { supabase } from "@/integrations/supabase/client";
 import { formatStatValue } from "@/lib/pipeline";
+import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
   Select,
@@ -12,33 +13,93 @@ import {
   SelectValue,
 } from "@/components/ui/select";
 
+interface ScrapeProgress {
+  date?: string;
+  competitors?: number;
+  found?: number;
+  saved?: number;
+}
+
 export function AutoScrape() {
-  const get = useServerFn(getScrapeSettings);
-  const save = useServerFn(updateScrapeSettings);
+  const qc = useQueryClient();
   const q = useQuery({
     queryKey: ["scrape_settings"],
-    queryFn: () => get(),
     staleTime: 0,
     refetchOnMount: "always",
+    queryFn: async () => {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) return null;
+      const { data, error } = await supabase
+        .from("user_scrape_settings")
+        .select("enabled,run_hour,last_run_at,progress,pause_reason")
+        .eq("user_id", user.id)
+        .maybeSingle();
+      if (error) throw error;
+      const today = new Date().toISOString().slice(0, 10);
+      const p = (data?.progress ?? null) as ScrapeProgress | null;
+      return {
+        enabled: data?.enabled ?? false,
+        run_hour: data?.run_hour ?? 6,
+        last_run_at: data?.last_run_at ?? null,
+        pause_reason: data?.pause_reason ?? null,
+        last_result:
+          p?.date === today
+            ? {
+                competitors: p.competitors ?? 0,
+                found: p.found ?? 0,
+                saved: p.saved ?? 0,
+              }
+            : null,
+      };
+    },
   });
+
   const st = q.data;
-  async function update(patch: { enabled?: boolean; run_hour?: number }) {
+  const [runHour, setRunHour] = useState<number>(6);
+  const [enabled, setEnabled] = useState<boolean>(false);
+
+  useEffect(() => {
     if (!st) return;
-    try {
-      await save({
-        data: { enabled: patch.enabled ?? st.enabled, run_hour: patch.run_hour ?? st.run_hour },
-      });
-      await q.refetch();
+    setRunHour(st.run_hour);
+    setEnabled(st.enabled);
+  }, [st]);
+
+  const mutation = useMutation({
+    mutationFn: async (patch: { enabled: boolean; run_hour: number }) => {
+      const {
+        data: { user },
+        error: authError,
+      } = await supabase.auth.getUser();
+      if (authError || !user) throw new Error("Please sign in again.");
+      const { error } = await supabase.from("user_scrape_settings").upsert(
+        {
+          user_id: user.id,
+          enabled: patch.enabled,
+          run_hour: patch.run_hour,
+          ...(patch.enabled ? { pause_reason: null } : {}),
+          updated_at: new Date().toISOString(),
+        },
+        { onConflict: "user_id" },
+      );
+      if (error) throw error;
+    },
+    onSuccess: async () => {
+      await qc.invalidateQueries({ queryKey: ["scrape_settings"] });
       toast.success("Saved");
-    } catch {
-      toast.error("Could not save");
-    }
-  }
+    },
+    onError: (err) => {
+      toast.error(err instanceof Error ? err.message : "Could not save");
+    },
+  });
+
   const local = (h: number) => {
     const d = new Date();
     d.setUTCHours(h, 0, 0, 0);
     return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
   };
+
   return (
     <div className="glass space-y-3 p-5">
       <div className="flex flex-wrap items-center gap-4">
@@ -49,9 +110,9 @@ export function AutoScrape() {
           </div>
         </div>
         <Select
-          value={String(st?.run_hour ?? 6)}
-          onValueChange={(v) => update({ run_hour: Number(v) })}
-          disabled={!st}
+          value={String(runHour)}
+          onValueChange={(v) => setRunHour(Number(v))}
+          disabled={q.isLoading || mutation.isPending}
         >
           <SelectTrigger className="w-40">
             <SelectValue />
@@ -66,10 +127,21 @@ export function AutoScrape() {
         </Select>
         <Switch
           aria-label="Automatic daily scrape"
-          checked={!!st?.enabled}
-          disabled={!st}
-          onCheckedChange={(v) => update({ enabled: v })}
+          checked={enabled}
+          disabled={q.isLoading || mutation.isPending}
+          onCheckedChange={(v) => {
+            setEnabled(v);
+            mutation.mutate({ enabled: v, run_hour: runHour });
+          }}
         />
+        <Button
+          size="sm"
+          variant="outline"
+          disabled={q.isLoading || mutation.isPending}
+          onClick={() => mutation.mutate({ enabled, run_hour: runHour })}
+        >
+          {mutation.isPending ? "Saving…" : "Save"}
+        </Button>
       </div>
       {st && (
         <p className="text-sm text-muted-foreground">
