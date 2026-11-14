@@ -312,3 +312,19 @@ export async function getAIVisibilityScans(supabase: DB, userId: string) {
   if (error) throw new Error(error.message);
   return data ?? [];
 }
+export async function getAIVisibilityDashboard(supabase: DB, userId: string) {
+  const [scans, profileResult, competitorResult] = await Promise.all([
+    getAIVisibilityScans(supabase, userId),
+    supabase.from("profiles").select("company_name").eq("id", userId).maybeSingle(),
+    supabase.from("competitors").select("name").eq("user_id", userId).order("name").limit(30),
+  ]);
+
+  if (profileResult.error) throw new Error(profileResult.error.message);
+  if (competitorResult.error) throw new Error(competitorResult.error.message);
+
+  return {
+    scans,
+    brandName: profileResult.data?.company_name ?? "",
+    competitorNames: (competitorResult.data ?? []).map((row) => row.name),
+  };
+}
