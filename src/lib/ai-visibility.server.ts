@@ -26,7 +26,7 @@ const FALLBACK_MODEL_NAME = "gemini-3.1-flash-lite";
 const PROMPT_COUNT = 10;
 
 function cleanBrandList(names: string[]): string[] {
-  return [...new Set(names.map((name) => name.trim()).filter(Boolean))].slice(0, 12);
+  return [...new Set(names.map((name) => name.trim()).filter(Boolean))].slice(0, 20);
 }
 
 function fallbackBuyerPrompts(categoryContext: string): string[] {
@@ -238,7 +238,7 @@ export async function runAIVisibilityScan(
     .from("competitors")
     .select("name,category,description")
     .eq("user_id", userId)
-    .limit(30);
+    .limit(20);
   if (competitorsError) throw new Error(`Could not load your saved competitors: ${competitorsError.message}`);
 
   const competitorRows = storedCompetitors ?? [];
