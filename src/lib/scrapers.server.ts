@@ -1228,7 +1228,10 @@ async function scrapeJirosearchFallback(
         profileUrl = inferProfileUrl(cleanUrl, platform);
       }
 
-      const publishedAt = normalizePublishedDate(h.publishedAt) || parseSnippetDate(h.title + ". " + h.text);
+      const publishedAt =
+        normalizePublishedDate(h.publishedAt) ||
+        parseSnippetDate(h.title + ". " + h.text) ||
+        (options.apply48HourFilter === false ? new Date().toISOString() : "");
 
       out.push({
         platform,
