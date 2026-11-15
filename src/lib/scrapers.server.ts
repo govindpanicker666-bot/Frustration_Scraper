@@ -800,7 +800,7 @@ async function indexed(c: CompetitorCtx, site: string, opts: ScrapePlatformOptio
       url: r.url,
       author: r.title.split(/ on (?:LinkedIn|X)| \| | - /)[0]!.trim(),
       text: r.title + ". " + r.snippet,
-      date: parseSnippetDate(r.snippet),
+      date: parseSnippetDate(r.snippet) || (apply48HourFilter ? "" : new Date().toISOString()),
     }));
 }
 
@@ -1253,7 +1253,7 @@ export async function scrapeJirosearch(
         "X-API-Key": apiKey,
       },
       body: JSON.stringify({
-        query: query.trim(),
+        query: queryText,
         platforms: normalizedPlatforms,
       }),
       signal: AbortSignal.timeout(15_000),
@@ -1293,6 +1293,9 @@ export async function scrapeJirosearch(
 
   const fallbackPlatform = (normalizedPlatforms[0] as Platform | undefined) ?? "x";
   const out: RawReview[] = [];
+  const queryText = options.apply48HourFilter === false
+    ? query.trim()
+    : query.trim() + " after:" + new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10);
 
   for (const entry of rawList) {
     if (!entry || typeof entry !== "object") continue;
@@ -1375,7 +1378,8 @@ export async function scrapeJirosearch(
       reviewer_profile_url: profileUrl,
       source_url: sourceUrl,
       text,
-      published_at: parsedDate,
+      published_at:
+        parsedDate || (options.apply48HourFilter === false ? new Date().toISOString() : ""),
     });
   }
 
@@ -1440,7 +1444,7 @@ async function pinterest(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
 }
 
 // ---------- Newer free sources ----------
-/** Search-index posts for any of several sites; results are past-week only and stamped now (48h filter + URL dedupe). */
+/** Search-index posts for a site set; publication dates are parsed or recovered before 48-hour filtering. */
 async function searchSites(
   c: CompetitorCtx,
   sites: string[],
@@ -1462,7 +1466,7 @@ async function searchSites(
     url: r.url.split("#")[0]!,
     title: r.title,
     text: r.title + ". " + r.snippet,
-    date: parseSnippetDate(r.snippet),
+    date: parseSnippetDate(r.snippet) || (apply48HourFilter ? "" : new Date().toISOString()),
   }));
 }
 
