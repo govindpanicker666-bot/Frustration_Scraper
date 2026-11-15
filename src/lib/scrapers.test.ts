@@ -177,6 +177,37 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(sentBody.query).toContain("after:");
   });
 
+  it("keeps the existing historical mode when the 48-hour filter is explicitly disabled", async () => {
+    process.env["JIROSEARCH_API_KEY"] = "test-jiro-key";
+    const oldDate = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          results: [{
+            source: "x",
+            text: "Acme support has been frustrating.",
+            reviewerName: "Historical Poster",
+            createdAt: oldDate,
+            url: "https://x.com/historical/status/123456",
+          }],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await scrapePlatform(
+      { name: "Acme", domain: "acme.com" },
+      "x",
+      { apply48HourFilter: false },
+    );
+
+    expect(res.status).toBe("ok");
+    expect(res.reviews).toHaveLength(1);
+    const sentBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as { query?: string };
+    expect(sentBody.query).not.toContain("after:");
+  });
+
   it("recovers a missing social-post date from publication metadata before filtering", async () => {
     process.env["JIROSEARCH_API_KEY"] = "test-jiro-key";
     const publishedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
