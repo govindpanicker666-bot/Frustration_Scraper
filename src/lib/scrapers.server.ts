@@ -1,5 +1,6 @@
 import {
   exactQuery,
+  isRecent,
   keepReview,
   slugify,
   stripHtml,
@@ -1766,12 +1767,14 @@ export async function scrapePlatform(
     const all = await SOURCES[platform](c, opts);
     // Recover missing timestamps from URL IDs or the post page before applying the strict age gate.
     const prepared = apply48HourFilter ? await recoverMissingPublishedDates(all) : all;
-    const reviews = prepared.filter(
-      (r) =>
-        r.text &&
-        r.source_url &&
-        keepReview(r, undefined, { skipRecencyCheck: !apply48HourFilter }),
-    );
+    const reviews = prepared.filter((r) => {
+      if (!r.text || !r.source_url) return false;
+      if (apply48HourFilter && !isRecent(r.published_at)) return false;
+
+      // Keep Jirosearch's existing author-name tolerance; only change its date filtering.
+      if (JIROSEARCH_PLATFORM_SET.has(platform)) return r.reviewer_name !== "[deleted]";
+      return keepReview(r, undefined, { skipRecencyCheck: true });
+    });
     return { status: "ok", reviews };
   } catch (e) {
     console.warn("source", platform, e instanceof Error ? e.message : e);
