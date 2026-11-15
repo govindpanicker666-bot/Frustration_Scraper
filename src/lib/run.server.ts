@@ -8,6 +8,7 @@ import {
   extractScoredReviews,
   isFullName,
   isNegativeAssessment,
+  isReviewSite,
   PLATFORMS,
   type Platform,
   type RawReview,
@@ -205,14 +206,29 @@ ${list}`,
       batch.map(async (s) => {
         const r = batchReviews[s.index];
         if (!r) return null;
-        const ct = await findContactBounded(findContact, {
-          platform: r.platform,
-          name: r.reviewer_name,
-          profileUrl: r.reviewer_profile_url,
-          jobTitle: s.job_title,
-          company: s.company,
-          avoidDomain: compDomain,
-        });
+        // Anonymous review-site authors generally cannot be enriched. Save
+        // their source-linked complaint directly instead of waiting on a
+        // contact lookup that has no usable identity to search.
+        const canEnrichReviewAuthor =
+          !isReviewSite(r.platform) || isFullName(r.reviewer_name) || Boolean(r.reviewer_profile_url);
+        const ct: Contact = canEnrichReviewAuthor
+          ? await findContactBounded(findContact, {
+              platform: r.platform,
+              name: r.reviewer_name,
+              profileUrl: r.reviewer_profile_url,
+              jobTitle: s.job_title,
+              company: s.company,
+              avoidDomain: compDomain,
+            })
+          : {
+              email: null,
+              emailStatus: null,
+              linkedin: null,
+              jobTitle: s.job_title,
+              company: s.company,
+              companyDomain: null,
+              name: r.reviewer_name,
+            };
         return { s, r, ct };
       }),
     );
