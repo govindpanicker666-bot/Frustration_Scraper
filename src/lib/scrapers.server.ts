@@ -53,6 +53,187 @@ const iso = (v: unknown) => {
 };
 const since48 = () => Math.floor(Date.now() / 1000) - 48 * 3600;
 
+const MAX_DATE_LOOKUPS_PER_PLATFORM = 12;
+
+/** Parse dates from a search snippet without pretending an unknown date is current. */
+export function parseSnippetDate(snippet: string): string {
+  const text = stripHtml(snippet).replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const relative = text.match(/\b(\d{1,4})\s+(minutes?|hours?|days?|weeks?|months?|years?)\s+ago\b/i);
+  if (relative) {
+    const amount = Number(relative[1]);
+    const unit = relative[2]!.toLowerCase().replace(/s$/, "");
+    const unitMs =
+      unit === "minute" ? 60_000 :
+      unit === "hour" ? 3_600_000 :
+      unit === "day" ? 86_400_000 :
+      unit === "week" ? 7 * 86_400_000 :
+      unit === "month" ? 30 * 86_400_000 :
+      365 * 86_400_000;
+    // Search engines round relative day labels. Bias "2 days ago" slightly older
+    // so an uncertain date is not accidentally admitted past the 48-hour boundary.
+    const conservativeOffset = unit === "day" && amount >= 2 ? 12 * 3_600_000 : 0;
+    return new Date(Date.now() - amount * unitMs - conservativeOffset).toISOString();
+  }
+  if (/\bjust now\b|\bmoments ago\b|\b\d+\s+seconds? ago\b/i.test(text)) {
+    return new Date().toISOString();
+  }
+  if (/\byesterday\b/i.test(text)) {
+    return new Date(Date.now() - 24 * 3_600_000).toISOString();
+  }
+  const isoMatch = text.match(/\b20\d{2}-\d{1,2}-\d{1,2}(?:[T ][0-9:.Z+\-]+)?\b/);
+  if (isoMatch) {
+    const parsed = iso(isoMatch[0]);
+    if (parsed) return parsed;
+  }
+  const monthNames = "Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?";
+  const monthFirst = text.match(new RegExp("\\b(" + monthNames + ")\\s+(\\d{1,2})(?:,?\\s+(20\\d{2}))?\\b", "i"));
+  const dayFirst = text.match(new RegExp("\\b(\\d{1,2})\\s+(" + monthNames + ")(?:\\s+(20\\d{2}))?\\b", "i"));
+  const dateMatch = monthFirst ?? dayFirst;
+  if (dateMatch) {
+    const year = Number(dateMatch[3] ?? new Date().getUTCFullYear());
+    const dateText = monthFirst
+      ? dateMatch[1] + " " + dateMatch[2] + ", " + year
+      : dateMatch[2] + " " + dateMatch[1] + ", " + year;
+    const parsed = iso(dateText);
+    if (parsed) {
+      if (!dateMatch[3] && new Date(parsed).getTime() > Date.now() + 24 * 3_600_000) {
+        const priorYear = new Date(dateText);
+        priorYear.setFullYear(priorYear.getFullYear() - 1);
+        return priorYear.toISOString();
+      }
+      return parsed;
+    }
+  }
+  return "";
+}
+
+function normalizePublishedDate(value: unknown): string {
+  if (typeof value === "number") {
+    if (!Number.isFinite(value) || value <= 0) return "";
+    const date = new Date(value < 1e12 ? value * 1000 : value);
+    return Number.isNaN(date.getTime()) ? "" : date.toISOString();
+  }
+  if (typeof value !== "string" || !value.trim()) return "";
+  const trimmed = value.trim();
+  if (/^\d{10,13}$/.test(trimmed)) return normalizePublishedDate(Number(trimmed));
+  return iso(trimmed) || parseSnippetDate(trimmed);
+}
+
+function inferPublishedDateFromUrl(sourceUrl: string): string {
+  // X/Twitter Snowflake IDs encode the post creation timestamp.
+  const match = sourceUrl.match(/(?:x|twitter)\.com\/[^/?#]+\/status\/(\d+)/i);
+  if (match) {
+    try {
+      const milliseconds = Number((BigInt(match[1]!) >> 22n) + 1_288_834_657_657n);
+      const date = new Date(milliseconds);
+      if (Number.isFinite(milliseconds) && !Number.isNaN(date.getTime())) return date.toISOString();
+    } catch {
+      /* ignore malformed IDs */
+    }
+  }
+  return "";
+}
+
+function dateFromHtml(html: string): string {
+  const readAttribute = (tag: string, attribute: string) =>
+    tag.match(new RegExp("\\b" + attribute + "\\s*=\\s*[\\\"']([^\\\"']+)[\\\"']", "i"))?.[1] ?? "";
+  const publishedMetaNames = new Set([
+    "article:published_time", "og:published_time", "datepublished",
+    "date_published", "publishdate", "publish_date", "dc.date", "date",
+  ]);
+  for (const tag of html.match(/<(?:meta|time)\b[^>]*>/gi) ?? []) {
+    if (/^<time\b/i.test(tag)) {
+      const date = normalizePublishedDate(readAttribute(tag, "datetime"));
+      if (date) return date;
+      continue;
+    }
+    const name = (
+      readAttribute(tag, "property") ||
+      readAttribute(tag, "name") ||
+      readAttribute(tag, "itemprop")
+    ).toLowerCase();
+    if (!publishedMetaNames.has(name)) continue;
+    const date = normalizePublishedDate(readAttribute(tag, "content") || readAttribute(tag, "datetime"));
+    if (date) return date;
+  }
+  const visitJsonLd = (node: unknown): string => {
+    if (Array.isArray(node)) {
+      for (const child of node) {
+        const found = visitJsonLd(child);
+        if (found) return found;
+      }
+      return "";
+    }
+    if (!node || typeof node !== "object") return "";
+    const record = node as Record<string, unknown>;
+    for (const key of ["datePublished", "dateCreated", "uploadDate", "publishedAt", "published_at"]) {
+      const date = normalizePublishedDate(record[key]);
+      if (date) return date;
+    }
+    for (const child of Object.values(record)) {
+      const found = visitJsonLd(child);
+      if (found) return found;
+    }
+    return "";
+  };
+  for (const match of html.matchAll(/<script\b[^>]*type=["']application\/ld\+json["'][^>]*>([\s\S]*?)<\/script>/gi)) {
+    try {
+      const found = visitJsonLd(JSON.parse(match[1]!));
+      if (found) return found;
+    } catch {
+      /* skip malformed JSON-LD */
+    }
+  }
+  return "";
+}
+
+async function fetchPublishedDateFromUrl(sourceUrl: string): Promise<string> {
+  const inferred = inferPublishedDateFromUrl(sourceUrl);
+  if (inferred) return inferred;
+  try {
+    const url = new URL(sourceUrl);
+    const host = url.hostname.toLowerCase();
+    if (
+      !["http:", "https:"].includes(url.protocol) ||
+      host === "localhost" ||
+      host.endsWith(".local") ||
+      /^(127\.|10\.|192\.168\.)/.test(host) ||
+      /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+    ) return "";
+    const response = await fetch(url.toString(), {
+      headers: { "User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9" },
+      redirect: "follow",
+      signal: AbortSignal.timeout(5_000),
+    });
+    if (!response.ok) return "";
+    return dateFromHtml((await response.text()).slice(0, 1_500_000));
+  } catch {
+    return "";
+  }
+}
+
+async function recoverMissingPublishedDates(reviews: RawReview[]): Promise<RawReview[]> {
+  const normalized = reviews.map((review) => ({
+    ...review,
+    published_at: normalizePublishedDate(review.published_at),
+  }));
+  const missingIndexes = normalized
+    .map((review, index) => (!review.published_at ? index : -1))
+    .filter((index) => index >= 0)
+    .slice(0, MAX_DATE_LOOKUPS_PER_PLATFORM);
+  const recovered = await Promise.all(
+    missingIndexes.map(async (index) => ({
+      index,
+      date: await fetchPublishedDateFromUrl(normalized[index]!.source_url),
+    })),
+  );
+  for (const item of recovered) {
+    if (item.date) normalized[item.index]!.published_at = item.date;
+  }
+  return normalized;
+}
+
 // ---------- Hacker News ----------
 interface HnResp {
   hits: {
@@ -447,7 +628,6 @@ async function stackexchange(c: CompetitorCtx, opts: ScrapePlatformOptions = {})
     published_at: new Date(q.creation_date * 1000).toISOString(),
   }));
 }
-
 // ---------- Dev.to ----------
 async function devto(c: CompetitorCtx) {
   type A = {
@@ -606,23 +786,24 @@ const COMPLAINT_TERMS =
 async function indexed(c: CompetitorCtx, site: string, opts: ScrapePlatformOptions = {}) {
   const apply48HourFilter = opts.apply48HourFilter ?? true;
   const { webSearch } = await import("./search.server");
+  const afterClause = apply48HourFilter
+    ? " after:" + new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10)
+    : "";
   const query = apply48HourFilter
-    ? `site:${site} "${c.name}" ${COMPLAINT_TERMS}`
-    : `site:${site} "${c.name}"`;
+    ? "site:" + site + ' "' + c.name + '"' + afterClause + " " + COMPLAINT_TERMS
+    : "site:" + site + ' "' + c.name + '"';
   const res = await webSearch(query, { recent: apply48HourFilter });
-  // Search engines only return results from the past week when recent=true; we stamp them as now so the 48h filter keeps them,
-  // and URL de-duplication stops the same post being saved twice on later days.
-  const now = new Date().toISOString();
   const host = site.split("/")[0]!;
   return res
     .filter((r) => r.url.includes(host) || (host === "x.com" && r.url.includes("twitter.com")))
     .map((r) => ({
       url: r.url,
       author: r.title.split(/ on (?:LinkedIn|X)| \| | - /)[0]!.trim(),
-      text: `${r.title}. ${r.snippet}`,
-      date: now,
+      text: r.title + ". " + r.snippet,
+      date: parseSnippetDate(r.snippet),
     }));
 }
+
 async function googlereviews(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   const res = await indexed(c, "trustpilot.com/review", opts);
   return res
@@ -739,30 +920,6 @@ function inferProfileUrl(sourceUrl: string, platform: Platform): string | null {
   return null;
 }
 
-function parseSnippetDate(snippet: string): string {
-  const mRel = snippet.match(/^(\d+)\s+(minute|hour|day|week|month)s?\s+ago\b/i);
-  if (mRel) {
-    const n = Number(mRel[1]);
-    const unit = mRel[2]!.toLowerCase();
-    const mult =
-      unit === "minute"
-        ? 60_000
-        : unit === "hour"
-          ? 3_600_000
-          : unit === "day"
-            ? 86_400_000
-            : unit === "week"
-              ? 7 * 86_400_000
-              : 30 * 86_400_000;
-    return new Date(Date.now() - n * mult).toISOString();
-  }
-  const mAbs = snippet.match(/^([A-Z][a-z]{2}\s+\d{1,2},\s+\d{4})\b/);
-  if (mAbs) {
-    const parsed = iso(mAbs[1]);
-    if (parsed) return parsed;
-  }
-  return new Date().toISOString();
-}
 
 function jirosearchSearchSpec(
   query: string,
@@ -770,10 +927,14 @@ function jirosearchSearchSpec(
   options: {
     domain?: string | null | undefined;
     intent?: "complaints" | "mentions" | undefined;
+    apply48HourFilter?: boolean;
   } = {},
 ): { primaryQuery: string; fallbackQuery: string | null; hostRe: RegExp; postUrlRe: RegExp } {
   const q = exactQuery(query);
   const intent = options.intent ?? "complaints";
+  const recentClause = options.apply48HourFilter === false
+    ? ""
+    : " after:" + new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10);
   const complaintTerms =
     '(frustrated OR switching OR alternative OR cancel OR disappointed OR worst OR problem OR "price increase" OR "stopped using")';
   const mentionTerms = "(review OR feedback OR pricing OR support OR product OR experience)";
@@ -833,9 +994,11 @@ function jirosearchSearchSpec(
       break;
   }
 
+  const scopedQuery = `${siteExpr} ${q}${recentClause}`;
+
   if (intent === "mentions") {
     return {
-      primaryQuery: `${siteExpr} ${q}`,
+      primaryQuery: scopedQuery,
       fallbackQuery: null,
       hostRe,
       postUrlRe,
@@ -843,8 +1006,8 @@ function jirosearchSearchSpec(
   }
 
   return {
-    primaryQuery: `${siteExpr} ${q} ${complaintTerms}`,
-    fallbackQuery: `${siteExpr} ${q} ${mentionTerms}`,
+    primaryQuery: `${scopedQuery} ${complaintTerms}`,
+    fallbackQuery: `${scopedQuery} ${mentionTerms}`,
     hostRe,
     postUrlRe,
   };
@@ -897,8 +1060,7 @@ async function runFallbackSearchQuery(
 ): Promise<Array<{ url: string; title: string; text: string; publishedAt: string | null }>> {
   const { execFile } = await import("node:child_process");
   const path = await import("node:path");
-  const { promisify } = await import("node:util");
-  const execFileAsync = promisify(execFile);
+  const { promisify } = await import("node:util");  const execFileAsync = promisify(execFile);
   const cliPath = path.resolve(process.cwd(), "node_modules/truescrape/dist/index.js");
 
   let rawHits: Array<{ url: string; title: string; text: string; publishedAt: string | null }> = [];
@@ -970,6 +1132,7 @@ async function scrapeJirosearchFallback(
   options: {
     domain?: string | null | undefined;
     intent?: "complaints" | "mentions" | undefined;
+    apply48HourFilter?: boolean;
   } = {},
 ): Promise<RawReview[]> {
   const { linkedinAuthorFromPost } = await import("./pipeline");
@@ -1036,7 +1199,7 @@ async function scrapeJirosearchFallback(
         profileUrl = inferProfileUrl(cleanUrl, platform);
       }
 
-      const publishedAt = (h.publishedAt ? iso(h.publishedAt) : "") || parseSnippetDate(h.text);
+      const publishedAt = normalizePublishedDate(h.publishedAt) || parseSnippetDate(h.title + ". " + h.text);
 
       out.push({
         platform,
@@ -1058,6 +1221,7 @@ export async function scrapeJirosearch(
   options: {
     domain?: string | null | undefined;
     intent?: "complaints" | "mentions" | undefined;
+    apply48HourFilter?: boolean;
   } = {},
 ): Promise<RawReview[]> {
   const apiKey = process.env["JIROSEARCH_API_KEY"]?.trim();
@@ -1128,7 +1292,6 @@ export async function scrapeJirosearch(
       : [];
 
   const fallbackPlatform = (normalizedPlatforms[0] as Platform | undefined) ?? "x";
-  const nowIso = new Date().toISOString();
   const out: RawReview[] = [];
 
   for (const entry of rawList) {
@@ -1199,19 +1362,12 @@ export async function scrapeJirosearch(
         ? rawProfileUrl.trim()
         : null;
 
-    const rawDate =
-      item["reviewedAt"] ??
-      item["reviewed_at"] ??
-      item["publishedAt"] ??
-      item["published_at"] ??
-      item["createdAt"] ??
-      item["created_at"] ??
-      item["date"] ??
-      item["timestamp"];
-    const parsedDate =
-      typeof rawDate === "number"
-        ? new Date(rawDate < 1e12 ? rawDate * 1000 : rawDate).toISOString()
-        : iso(rawDate);
+    const rawDates = [
+      item["reviewedAt"], item["reviewed_at"], item["publishedAt"], item["published_at"],
+      item["createdAt"], item["created_at"], item["datePublished"], item["date_published"],
+      item["postedAt"], item["postDate"], item["date"], item["timestamp"],
+    ];
+    const parsedDate = rawDates.map(normalizePublishedDate).find(Boolean) ?? "";
 
     out.push({
       platform,
@@ -1219,7 +1375,7 @@ export async function scrapeJirosearch(
       reviewer_profile_url: profileUrl,
       source_url: sourceUrl,
       text,
-      published_at: parsedDate || nowIso,
+      published_at: parsedDate,
     });
   }
 
@@ -1227,28 +1383,60 @@ export async function scrapeJirosearch(
 }
 
 async function linkedin(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["linkedin"], { domain: c.domain, intent: opts.intent });
+  return scrapeJirosearch(c.name, ["linkedin"], {
+    domain: c.domain,
+    intent: opts.intent,
+    apply48HourFilter: opts.apply48HourFilter,
+  });
 }
 async function x(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["x"], { domain: c.domain, intent: opts.intent });
+  return scrapeJirosearch(c.name, ["x"], {
+    domain: c.domain,
+    intent: opts.intent,
+    apply48HourFilter: opts.apply48HourFilter,
+  });
 }
 async function youtube(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["youtube"], { domain: c.domain, intent: opts.intent });
+  return scrapeJirosearch(c.name, ["youtube"], {
+    domain: c.domain,
+    intent: opts.intent,
+    apply48HourFilter: opts.apply48HourFilter,
+  });
 }
 async function instagram(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["instagram"], { domain: c.domain, intent: opts.intent });
+  return scrapeJirosearch(c.name, ["instagram"], {
+    domain: c.domain,
+    intent: opts.intent,
+    apply48HourFilter: opts.apply48HourFilter,
+  });
 }
 async function tiktok(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["tiktok"], { domain: c.domain, intent: opts.intent });
+  return scrapeJirosearch(c.name, ["tiktok"], {
+    domain: c.domain,
+    intent: opts.intent,
+    apply48HourFilter: opts.apply48HourFilter,
+  });
 }
 async function facebook(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["facebook"], { domain: c.domain, intent: opts.intent });
+  return scrapeJirosearch(c.name, ["facebook"], {
+    domain: c.domain,
+    intent: opts.intent,
+    apply48HourFilter: opts.apply48HourFilter,
+  });
 }
 async function telegram(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["telegram"], { domain: c.domain, intent: opts.intent });
+  return scrapeJirosearch(c.name, ["telegram"], {
+    domain: c.domain,
+    intent: opts.intent,
+    apply48HourFilter: opts.apply48HourFilter,
+  });
 }
 async function pinterest(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["pinterest"], { domain: c.domain, intent: opts.intent });
+  return scrapeJirosearch(c.name, ["pinterest"], {
+    domain: c.domain,
+    intent: opts.intent,
+    apply48HourFilter: opts.apply48HourFilter,
+  });
 }
 
 // ---------- Newer free sources ----------
@@ -1263,16 +1451,21 @@ async function searchSites(
   const apply48HourFilter = opts.apply48HourFilter ?? true;
   const { webSearch } = await import("./search.server");
   const effectiveExtra = apply48HourFilter ? extra : "";
-  const q = `(${sites.map((s) => `site:${s}`).join(" OR ")}) "${c.name}" ${effectiveExtra}`.trim();
-  const now = new Date().toISOString();
-  const res = (await webSearch(q, { recent: apply48HourFilter })).filter((r) => urlRe.test(r.url));
+  const afterClause = apply48HourFilter
+    ? " after:" + new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10)
+    : "";
+  const q =
+    "(" + sites.map((s) => "site:" + s).join(" OR ") + ') "' + c.name + '"' +
+    afterClause + " " + effectiveExtra;
+  const res = (await webSearch(q.trim(), { recent: apply48HourFilter })).filter((r) => urlRe.test(r.url));
   return res.map((r) => ({
     url: r.url.split("#")[0]!,
     title: r.title,
-    text: `${r.title}. ${r.snippet}`,
-    date: now,
+    text: r.title + ". " + r.snippet,
+    date: parseSnippetDate(r.snippet),
   }));
 }
+
 async function alternativeto(c: CompetitorCtx) {
   const r = await get(`https://alternativeto.net/software/${slugify(c.name)}/about/`);
   if (r.status === 404) throw new NoMatch("not on alternativeto");
@@ -1347,8 +1540,7 @@ async function discourse(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
     } catch {
       /* not a discourse site */
     }
-  }
-  return out;
+  }  return out;
 }
 async function quora(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   const hits = await searchSites(c, ["quora.com"], /quora\.com\//, COMPLAINT_TERMS, opts);
@@ -1480,7 +1672,11 @@ async function threads(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   } catch {
     /* threads-scraper unavailable or blocked; fall back to Jirosearch */
   }
-  return scrapeJirosearch(c.name, ["threads"], { domain: c.domain, intent: opts.intent });
+  return scrapeJirosearch(c.name, ["threads"], {
+    domain: c.domain,
+    intent: opts.intent,
+    apply48HourFilter: opts.apply48HourFilter,
+  });
 }
 
 const SOURCES: Record<
@@ -1531,13 +1727,13 @@ export async function scrapePlatform(
   const apply48HourFilter = opts.apply48HourFilter ?? true;
   try {
     const all = await SOURCES[platform](c, opts);
-    const reviews = all.filter(
+    // Recover missing timestamps from URL IDs or the post page before applying the strict age gate.
+    const prepared = apply48HourFilter ? await recoverMissingPublishedDates(all) : all;
+    const reviews = prepared.filter(
       (r) =>
         r.text &&
         r.source_url &&
-        (JIROSEARCH_PLATFORM_SET.has(platform)
-          ? !Number.isNaN(new Date(r.published_at).getTime()) && r.reviewer_name !== "[deleted]"
-          : keepReview(r, undefined, { skipRecencyCheck: !apply48HourFilter })),
+        keepReview(r, undefined, { skipRecencyCheck: !apply48HourFilter }),
     );
     return { status: "ok", reviews };
   } catch (e) {
