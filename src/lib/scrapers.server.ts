@@ -53,7 +53,7 @@ const iso = (v: unknown) => {
 };
 const since48 = () => Math.floor(Date.now() / 1000) - 48 * 3600;
 
-const MAX_DATE_LOOKUPS_PER_PLATFORM = 12;
+const MAX_DATE_LOOKUPS_PER_PLATFORM = 20;
 
 /** Parse dates from a search snippet without pretending an unknown date is current. */
 export function parseSnippetDate(snippet: string): string {
@@ -1576,7 +1576,8 @@ async function discourse(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
     } catch {
       /* not a discourse site */
     }
-  }  return out;
+  }
+  return out;
 }
 async function quora(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   const hits = await searchSites(c, ["quora.com"], /quora\.com\//, COMPLAINT_TERMS, opts);
