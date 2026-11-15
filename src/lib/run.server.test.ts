@@ -1,11 +1,17 @@
 import { describe, it, expect, vi } from "vitest";
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "@/integrations/supabase/types";
-import { analyzeCore } from "./run.server";
+import { analyzeCore, scrapeCore } from "./run.server";
+import { PLATFORMS } from "./pipeline";
 
-const mocks = vi.hoisted(() => ({ geminiJson: vi.fn(), findContact: vi.fn() }));
+const mocks = vi.hoisted(() => ({
+  geminiJson: vi.fn(),
+  findContact: vi.fn(),
+  scrapePlatform: vi.fn(),
+}));
 vi.mock("./ai.server", () => ({ geminiJson: mocks.geminiJson }));
 vi.mock("./enrich.server", () => ({ findContact: mocks.findContact }));
+vi.mock("./scrapers.server", () => ({ scrapePlatform: mocks.scrapePlatform }));
 
 describe("negative-only lead analysis", () => {
   it("does not save a normal company mention even if AI assigns score 1", async () => {
@@ -225,6 +231,124 @@ describe("negative-only lead analysis", () => {
     expect(upsertedRows[0]?.["source_url"]).toBe(
       "https://www.linkedin.com/posts/user-22_hubspot-activity-22",
     );
+  });
+
+
+  it("analyzes and saves more than 60 negative reviews and more than 15 leads", async () => {
+    mocks.geminiJson.mockReset();
+    mocks.geminiJson.mockImplementation(async (_system: unknown, prompt: unknown) => {
+      const indices = [...String(prompt).matchAll(/^\[(\d+)\] \(/gm)].map((match) =>
+        Number(match[1]),
+      );
+      return {
+        results: indices.map((index) => ({
+          index,
+          relevant: true,
+          score: 6,
+          sentiment: "negative",
+          negative_quote: "painfully slow and keeps failing",
+          complaint: "slow support",
+          pitch: "Try a more reliable option.",
+          job_title: null,
+          company: null,
+          is_person: true,
+        })),
+      };
+    });
+    mocks.findContact.mockResolvedValue({
+      email: null,
+      emailStatus: null,
+      linkedin: null,
+      jobTitle: null,
+      company: null,
+      companyDomain: null,
+      name: "Verified User",
+    });
+
+    let upsertedRows: Record<string, unknown>[] = [];
+    const client = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            single: async () => ({
+              data: {
+                id: "c",
+                user_id: "u",
+                name: "HubSpot",
+                url: "https://hubspot.com",
+                domain: "hubspot.com",
+                keywords: [],
+              },
+            }),
+            then: (cb: (v: { data: unknown[]; error: null }) => void) =>
+              cb({ data: [], error: null }),
+          }),
+        }),
+        upsert: (rows: Record<string, unknown>[]) => {
+          upsertedRows = rows;
+          return {
+            select: async () => ({ data: rows.map((_, i) => ({ id: String(i) })), error: null }),
+          };
+        },
+      }),
+    } as unknown as SupabaseClient<Database>;
+
+    const reviews = Array.from({ length: 70 }, (_, i) => ({
+      platform: "g2" as const,
+      reviewer_name: "Verified User",
+      reviewer_profile_url: null,
+      source_url: `https://www.g2.com/products/hubspot/reviews/review-${i}`,
+      text: `HubSpot support is painfully slow and keeps failing for this customer ticket ${i}.`,
+      published_at: new Date().toISOString(),
+    }));
+
+    const result = await analyzeCore(client, "c", reviews);
+    expect(mocks.geminiJson).toHaveBeenCalledTimes(4);
+    expect(result.analyzed).toBe(70);
+    expect(result.relevant).toBe(70);
+    expect(result.saved).toBe(70);
+    expect(result.social).toBe(70);
+    expect(upsertedRows).toHaveLength(70);
+    expect(upsertedRows[0]).toMatchObject({
+      source_platform: "g2",
+      lead_type: "social_signal",
+      email: null,
+      linkedin_url: null,
+    });
+  });
+
+  it("does not truncate all-platform scraping at 60 total posts", async () => {
+    mocks.scrapePlatform.mockImplementation(async (_ctx: unknown, platform: string) => ({
+      status: "ok",
+      reviews: Array.from({ length: 2 }, (_, i) => ({
+        platform,
+        reviewer_name: `Reviewer ${i}`,
+        reviewer_profile_url: null,
+        source_url: `https://example.com/${platform}/${i}`,
+        text: `Complaint about product ${i}`,
+        published_at: new Date().toISOString(),
+      })),
+    }));
+    const client = {
+      from: () => ({
+        select: () => ({
+          eq: () => ({
+            single: async () => ({
+              data: {
+                id: "c",
+                name: "HubSpot",
+                url: "https://hubspot.com",
+                domain: "hubspot.com",
+              },
+            }),
+          }),
+        }),
+      }),
+    } as unknown as SupabaseClient<Database>;
+
+    const result = await scrapeCore(client, "c", "all");
+    expect(result.reviews).toHaveLength(PLATFORMS.length * 2);
+    expect(result.reviews.length).toBeGreaterThan(60);
   });
 
   it("surfaces clear AI_CONFIG diagnostic when GEMINI_API_KEY is missing", async () => {
