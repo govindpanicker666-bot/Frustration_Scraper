@@ -255,6 +255,7 @@ describe("negative-only lead analysis", () => {
         })),
       };
     });
+    mocks.findContact.mockClear();
     mocks.findContact.mockResolvedValue({
       email: null,
       emailStatus: null,
@@ -308,6 +309,7 @@ describe("negative-only lead analysis", () => {
     expect(result.relevant).toBe(70);
     expect(result.saved).toBe(70);
     expect(result.social).toBe(70);
+    expect(mocks.findContact).not.toHaveBeenCalled();
     expect(upsertedRows).toHaveLength(70);
     expect(upsertedRows[0]).toMatchObject({
       source_platform: "g2",
