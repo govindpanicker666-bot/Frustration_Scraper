@@ -188,31 +188,60 @@ function dateFromHtml(html: string): string {
   return "";
 }
 
+const DATE_LOOKUP_HOSTS = [
+  "x.com", "twitter.com", "linkedin.com", "youtube.com", "youtu.be", "instagram.com",
+  "tiktok.com", "facebook.com", "fb.watch", "t.me", "pinterest.com", "threads.net",
+  "bsky.app", "mastodon.social", "reddit.com", "news.ycombinator.com", "producthunt.com",
+  "trustpilot.com", "capterra.com", "g2.com", "apps.apple.com", "itunes.apple.com",
+  "play.google.com", "dev.to", "stackoverflow.com", "stackexchange.com", "complaintsboard.com",
+  "github.com", "lemmy.world", "medium.com", "alternativeto.net", "quora.com",
+  "sitejabber.com", "trustradius.com", "bbb.org", "canny.io", "featurebase.app",
+  "upvoty.com", "discourse.org",
+];
+
+function isAllowedDateLookupHost(hostname: string): boolean {
+  const host = hostname.toLowerCase().replace(/\.$/, "");
+  return DATE_LOOKUP_HOSTS.some((allowed) => host === allowed || host.endsWith("." + allowed));
+}
+
 async function fetchPublishedDateFromUrl(sourceUrl: string): Promise<string> {
   const inferred = inferPublishedDateFromUrl(sourceUrl);
   if (inferred) return inferred;
+
   try {
-    const url = new URL(sourceUrl);
-    const host = url.hostname.toLowerCase();
+    let url = new URL(sourceUrl);
     if (
       !["http:", "https:"].includes(url.protocol) ||
-      host === "localhost" ||
-      host.endsWith(".local") ||
-      /^(127\.|10\.|192\.168\.)/.test(host) ||
-      /^172\.(1[6-9]|2\d|3[01])\./.test(host)
+      (url.port !== "" && url.port !== "80" && url.port !== "443") ||
+      url.username ||
+      url.password ||
+      !isAllowedDateLookupHost(url.hostname)
     ) return "";
-    const response = await fetch(url.toString(), {
-      headers: { "User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9" },
-      redirect: "follow",
-      signal: AbortSignal.timeout(5_000),
-    });
-    if (!response.ok) return "";
-    return dateFromHtml((await response.text()).slice(0, 1_500_000));
+
+    // Follow only a small number of redirects and re-check every destination host.
+    for (let redirectCount = 0; redirectCount <= 2; redirectCount++) {
+      const response = await fetch(url.toString(), {
+        headers: { "User-Agent": BROWSER_UA, "Accept-Language": "en-US,en;q=0.9" },
+        redirect: "manual",
+        signal: AbortSignal.timeout(5_000),
+      });
+
+      if (response.status >= 300 && response.status < 400) {
+        const location = response.headers.get("location");
+        if (!location || redirectCount === 2) return "";
+        const nextUrl = new URL(location, url);
+        if (!isAllowedDateLookupHost(nextUrl.hostname)) return "";
+        url = nextUrl;
+        continue;
+      }
+      if (!response.ok) return "";
+      return dateFromHtml((await response.text()).slice(0, 1_500_000));
+    }
   } catch {
     return "";
   }
+  return "";
 }
-
 async function recoverMissingPublishedDates(reviews: RawReview[]): Promise<RawReview[]> {
   const normalized = reviews.map((review) => ({
     ...review,
@@ -1242,6 +1271,9 @@ export async function scrapeJirosearch(
   // TODO: Switch to self-hosted Jirosearch URL before commercial launch
   const endpoint =
     process.env["JIROSEARCH_API_URL"]?.trim() || "https://api.jirosearch.com/v1/search";
+  const queryText = options.apply48HourFilter === false
+    ? query.trim()
+    : query.trim() + " after:" + new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10);
   let res: Response;
   try {
     res = await fetch(endpoint, {
@@ -1293,9 +1325,6 @@ export async function scrapeJirosearch(
 
   const fallbackPlatform = (normalizedPlatforms[0] as Platform | undefined) ?? "x";
   const out: RawReview[] = [];
-  const queryText = options.apply48HourFilter === false
-    ? query.trim()
-    : query.trim() + " after:" + new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10);
 
   for (const entry of rawList) {
     if (!entry || typeof entry !== "object") continue;
