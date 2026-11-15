@@ -60,7 +60,9 @@ const MAX_DATE_LOOKUPS_PER_PLATFORM = 20;
 export function parseSnippetDate(snippet: string): string {
   const text = stripHtml(snippet).replace(/\s+/g, " ").trim();
   if (!text) return "";
-  const relative = text.match(/\b(\d{1,4})\s+(minutes?|hours?|days?|weeks?|months?|years?)\s+ago\b/i);
+  const relative =
+    text.match(/^\s*(?:(?:published|posted|created|uploaded|updated)\s*(?:on|at|:)?\s*)?(?:about\s+)?(\d{1,4})\s+(minutes?|hours?|days?|weeks?|months?|years?)\s+ago\b/i) ??
+    text.match(/[|·•–—]\s*(?:(?:published|posted|created|uploaded|updated)\s*(?:on|at|:)?\s*)?(?:about\s+)?(\d{1,4})\s+(minutes?|hours?|days?|weeks?|months?|years?)\s+ago\b/i);
   if (relative) {
     const amount = Number(relative[1]);
     const unit = relative[2]!.toLowerCase().replace(/s$/, "");
@@ -76,20 +78,24 @@ export function parseSnippetDate(snippet: string): string {
     const conservativeOffset = unit === "day" && amount >= 2 ? 12 * 3_600_000 : 0;
     return new Date(Date.now() - amount * unitMs - conservativeOffset).toISOString();
   }
-  if (/\bjust now\b|\bmoments ago\b|\b\d+\s+seconds? ago\b/i.test(text)) {
+  const datePrefix =
+    text.match(/^\s*(?:(?:published|posted|created|uploaded|updated)\s*(?:on|at|:)?\s*)?(just now|moments ago|yesterday|today|\d+\s+seconds? ago)\b/i)?.[1] ?? "";
+  if (/^(?:just now|moments ago|today|\d+\s+seconds? ago)$/i.test(datePrefix)) {
     return new Date().toISOString();
   }
-  if (/\byesterday\b/i.test(text)) {
+  if (/^yesterday$/i.test(datePrefix)) {
     return new Date(Date.now() - 24 * 3_600_000).toISOString();
   }
-  const isoMatch = text.match(/\b20\d{2}-\d{1,2}-\d{1,2}(?:[T ][0-9:.Z+\-]+)?\b/);
+  const dateLead =
+    text.match(/^\s*(?:(?:published|posted|created|uploaded|updated)\s*(?:on|at|:)?\s*)?((?:20\d{2}-\d{1,2}-\d{1,2}(?:[T ][0-9:.Z+\-]+)?)|(?:[A-Z][a-z]{2,8}\s+\d{1,2}(?:,?\s+20\d{2})?))/i)?.[1] ?? "";
+  const isoMatch = dateLead.match(/\b20\d{2}-\d{1,2}-\d{1,2}(?:[T ][0-9:.Z+\-]+)?\b/);
   if (isoMatch) {
     const parsed = iso(isoMatch[0]);
     if (parsed) return parsed;
   }
   const monthNames = "Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?";
-  const monthFirst = text.match(new RegExp("\\b(" + monthNames + ")\\s+(\\d{1,2})(?:,?\\s+(20\\d{2}))?\\b", "i"));
-  const dayFirst = text.match(new RegExp("\\b(\\d{1,2})\\s+(" + monthNames + ")(?:\\s+(20\\d{2}))?\\b", "i"));
+  const monthFirst = dateLead.match(new RegExp("^(" + monthNames + ")\\s+(\\d{1,2})(?:,?\\s+(20\\d{2}))?$", "i"));
+  const dayFirst = dateLead.match(new RegExp("^(\\d{1,2})\\s+(" + monthNames + ")(?:\\s+(20\\d{2}))?$", "i"));
   const dateMatch = monthFirst ?? dayFirst;
   if (dateMatch) {
     const year = Number(dateMatch[3] ?? new Date().getUTCFullYear());
