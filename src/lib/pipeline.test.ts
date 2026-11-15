@@ -35,18 +35,28 @@ describe("48 hour filter", () => {
   it("keeps 47h old", () => expect(isRecent("2026-11-09T13:00:00Z", now)).toBe(true));
   it("drops 49h old", () => expect(isRecent("2026-11-09T11:00:00Z", now)).toBe(false));
 });
-describe("gatekeeper: real first + last name on review sites", () => {
-  it("drops Anonymous", () =>
-    expect(keepReview({ ...base, platform: "g2", reviewer_name: "Anonymous" }, now)).toBe(false));
-  it("drops Verified User", () =>
-    expect(isRealName("Verified User in Computer Software")).toBe(false));
-  it("drops single first name", () =>
-    expect(keepReview({ ...base, platform: "trustpilot", reviewer_name: "Jane" }, now)).toBe(
-      false,
-    ));
-  it("drops initial-only surname", () => expect(isFullName("Jane D.")).toBe(false));
-  it("keeps Jane Doe", () =>
-    expect(keepReview({ ...base, platform: "g2", reviewer_name: "Jane Doe" }, now)).toBe(true));
+describe("review-site scraping eligibility", () => {
+  it("keeps anonymous review posts when a source URL is available", () =>
+    expect(
+      keepReview({ ...base, platform: "g2", reviewer_name: "Anonymous", source_url: "https://g2.com/reviews/1" }, now),
+    ).toBe(true));
+  it("keeps verified-user reviews even though the author is not a full name", () =>
+    expect(
+      keepReview({
+        ...base,
+        platform: "trustpilot",
+        reviewer_name: "Verified User in Computer Software",
+        source_url: "https://trustpilot.com/review/1",
+      }, now),
+    ).toBe(true));
+  it("still rejects review-site records without a source URL", () =>
+    expect(
+      keepReview({ ...base, platform: "g2", reviewer_name: "Jane Doe", source_url: "" }, now),
+    ).toBe(false));
+  it("keeps the existing full-name validation helper", () => {
+    expect(isFullName("Jane D.")).toBe(false);
+    expect(isFullName("Jane Doe")).toBe(true);
+  });
   it("keeps HN handle", () => expect(keepReview(base, now)).toBe(true));
 });
 describe("score threshold", () => {
@@ -82,6 +92,27 @@ describe("actual negative evidence", () => {
         "Video edited using Wondershare Filmora 13.",
       ),
     ).toBe(false));
+  it("matches the same quote despite punctuation and whitespace differences", () =>
+    expect(
+      isNegativeAssessment(
+        { score: 2, sentiment: "negative", negative_quote: "it's too slow!!!" },
+        "It's   too slow.",
+      ),
+    ).toBe(true));
+  it("tolerates a small wording difference when most quote terms appear in the source", () =>
+    expect(
+      isNegativeAssessment(
+        { score: 2, sentiment: "negative", negative_quote: "dashboard incredibly slow and clunky" },
+        "The dashboard is slow and clunky on mobile.",
+      ),
+    ).toBe(true));
+  it("uses a corroborated complaint phrase when Gemini's quote is not exact", () =>
+    expect(
+      isNegativeAssessment(
+        { score: 3, sentiment: "negative", negative_quote: "awful user experience", complaint: "slow mobile app" },
+        "The mobile app is painfully slow during checkout.",
+      ),
+    ).toBe(true));
 });
 describe("person and cross-post deduplication", () => {
   const lead = {
@@ -166,10 +197,10 @@ describe("final save filter", () => {
     expect(decideLead({ platform: "g2", email: null, linkedin: "l", threadUrl: "t" })).toBe(
       "linkedin",
     ));
-  it("review with nothing is discarded", () =>
+  it("review with only its source URL is retained as a Social Signal", () =>
     expect(
       decideLead({ platform: "trustpilot", email: null, linkedin: null, threadUrl: "t" }),
-    ).toBeNull());
+    ).toBe("social_signal"));
   it("social thread is a Social Signal", () =>
     expect(
       decideLead({ platform: "hackernews", email: null, linkedin: null, threadUrl: "t" }),
