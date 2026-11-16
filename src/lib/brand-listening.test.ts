@@ -3,6 +3,8 @@ import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database } from "@/integrations/supabase/types";
 import {
   generateAIBrandBaseline,
+  generateAIBrandBaselineForUser,
+  readBrandListeningState,
   readCompanyProfile,
   runBrandListeningForUser,
   saveCompanyProfileToDb,
@@ -24,14 +26,26 @@ vi.mock("./ai.server", () => ({
 function makeMockDb(opts: {
   email: string;
   hasCompleted: boolean;
+  companyName?: string | null;
+  companyUrl?: string | null;
   initialMentions?: Record<string, unknown>[];
+  initialProgress?: Record<string, unknown> | null;
   missingAiTable?: boolean;
 }) {
   const insertedBrandMentions: Record<string, unknown>[] = [...(opts.initialMentions ?? [])];
   const profileUpdates: Record<string, unknown>[] = [];
   const leadsTouched = vi.fn();
   let aiInsightsRow: Record<string, unknown> | null = null;
-  let currentProgress: Record<string, unknown> | null = null;
+  let currentProgress: Record<string, unknown> | null = opts.initialProgress ?? null;
+
+  let profileRow = {
+    email: opts.email,
+    company_name: (opts.companyName !== undefined ? opts.companyName : "Churnhound") as
+      string | null,
+    company_url: (opts.companyUrl !== undefined ? opts.companyUrl : "https://churnhound.io") as
+      string | null,
+    has_completed_brand_baseline: opts.hasCompleted,
+  };
 
   const db = {
     from: (table: string) => {
@@ -44,18 +58,14 @@ function makeMockDb(opts: {
           select: () => ({
             eq: () => ({
               maybeSingle: async () => ({
-                data: {
-                  email: opts.email,
-                  company_name: "Churnhound",
-                  company_url: "https://churnhound.io",
-                  has_completed_brand_baseline: opts.hasCompleted,
-                },
+                data: { ...profileRow },
                 error: null,
               }),
             }),
           }),
           update: (payload: Record<string, unknown>) => {
             profileUpdates.push(payload);
+            profileRow = { ...profileRow, ...payload };
             return {
               eq: () =>
                 Object.assign(Promise.resolve({ error: null }), {
@@ -65,6 +75,7 @@ function makeMockDb(opts: {
           },
           upsert: async (payload: Record<string, unknown>) => {
             profileUpdates.push(payload);
+            profileRow = { ...profileRow, ...payload };
             return { error: null };
           },
         };
@@ -91,6 +102,9 @@ function makeMockDb(opts: {
               }),
             }),
             upsert: async () => ({ error: err }),
+            delete: () => ({
+              eq: async () => ({ error: err }),
+            }),
           };
         }
         return {
@@ -103,6 +117,12 @@ function makeMockDb(opts: {
             aiInsightsRow = payload;
             return { error: null };
           },
+          delete: () => ({
+            eq: async () => {
+              aiInsightsRow = null;
+              return { error: null };
+            },
+          }),
         };
       }
       if (table === "user_scrape_settings") {
@@ -155,6 +175,12 @@ function makeMockDb(opts: {
             insertedBrandMentions.push(...rows);
             return { error: null };
           },
+          delete: () => ({
+            eq: async () => {
+              insertedBrandMentions.length = 0;
+              return { error: null };
+            },
+          }),
         };
       }
       throw new Error(`Unexpected table ${table}`);
@@ -370,6 +396,10 @@ describe("generateAIBrandBaseline", () => {
 });
 
 describe("saveCompanyProfileToDb & readCompanyProfile", () => {
+  beforeEach(() => {
+    vi.clearAllMocks();
+  });
+
   it("saves company_name and company_url and preserves brand name when detectCompetitors omits name", async () => {
     const { db, profileUpdates, getProgress } = makeMockDb({
       email: "founder@churnhound.io",
@@ -406,5 +436,140 @@ describe("saveCompanyProfileToDb & readCompanyProfile", () => {
     const loaded = await readCompanyProfile(db, "user-p1");
     expect(loaded.company_name).toBe("Churnhound");
     expect(loaded.company_url).toBe("https://churnhound.io");
+  });
+
+  it("clears previous brand mentions/insights and resets baseline flag when user switches to a new brand", async () => {
+    const { db, insertedBrandMentions, profileUpdates, getAiInsightsRow, getProgress } = makeMockDb(
+      {
+        email: "founder@churnhound.io",
+        hasCompleted: true,
+        initialMentions: [
+          {
+            platform: "reddit",
+            reviewer_name: "old_reviewer",
+            review_text: "Old brand mention",
+            sentiment_score: 5,
+            extracted_complaint: null,
+            post_url: "https://reddit.com/r/old/1",
+          },
+        ],
+      },
+    );
+
+    // Seed an existing AI insight row for the old brand
+    await db.from("ai_brand_insights").upsert({
+      user_id: "user-p2",
+      positive_hypotheses: ["Old P1"],
+      negative_hypotheses: ["Old N1"],
+      generated_at: "2026-01-01T00:00:00.000Z",
+    });
+
+    const switched = await saveCompanyProfileToDb(db, "user-p2", {
+      company_name: "AcmeNew",
+      company_url: "https://acmenew.io",
+      preserveEmptyName: false,
+    });
+
+    expect(switched).toEqual({
+      company_name: "AcmeNew",
+      company_url: "https://acmenew.io",
+    });
+    expect(insertedBrandMentions).toHaveLength(0);
+    expect(getAiInsightsRow()).toBeNull();
+    expect(profileUpdates.at(-1)).toMatchObject({
+      company_name: "AcmeNew",
+      company_url: "https://acmenew.io",
+      has_completed_brand_baseline: false,
+    });
+
+    const blob = getProgress()?.["brand_listening"] as Record<string, unknown> | undefined;
+    expect(blob?.["company_name"]).toBe("AcmeNew");
+    expect(blob?.["has_completed_brand_baseline"]).toBe(false);
+    expect(blob?.["mentions"]).toEqual([]);
+    expect(blob?.["ai_brand_insights"]).toBeNull();
+  });
+
+  it("purges legacy unlabelled Taplio mentions & AI insights when profiles already points to Hunter", async () => {
+    const { db, insertedBrandMentions, getAiInsightsRow, getProgress } = makeMockDb({
+      email: "govindpanicker666@gmail.com",
+      hasCompleted: true,
+      companyName: "Hunter",
+      companyUrl: "https://hunter.io",
+      initialMentions: [
+        {
+          platform: "reddit",
+          reviewer_name: "taplio_fan",
+          review_text: "Taplio scheduling is great for LinkedIn posts.",
+          sentiment_score: 7,
+          extracted_complaint: null,
+          post_url: "https://reddit.com/r/saas/taplio-1",
+        },
+      ],
+    });
+
+    await db.from("ai_brand_insights").upsert({
+      user_id: "user-legacy-1",
+      positive_hypotheses: ["Taplio is fast for LinkedIn carousels"],
+      negative_hypotheses: ["Taplio pricing is high"],
+      generated_at: "2026-01-01T00:00:00.000Z",
+    });
+
+    const state = await readBrandListeningState(db, "user-legacy-1");
+    expect(state.company_name).toBe("Hunter");
+    expect(state.company_url).toBe("https://hunter.io");
+    expect(state.mentions).toEqual([]);
+    expect(state.ai_brand_insights).toBeNull();
+    expect(state.has_completed_brand_baseline).toBe(false);
+    expect(insertedBrandMentions).toHaveLength(0);
+    expect(getAiInsightsRow()).toBeNull();
+
+    const blob = getProgress()?.["brand_listening"] as Record<string, unknown> | undefined;
+    expect(blob?.["mentions_brand_key"]).toBe("hunter|hunter.io");
+    expect(blob?.["insights_brand_key"]).toBeNull();
+  });
+
+  it("drops legacy unlabelled Taplio AI insights (0 mentions) and regenerates fresh insights for Hunter", async () => {
+    mocks.geminiJson.mockResolvedValue({
+      positive_hypotheses: [
+        "Hunter finds verified B2B emails quickly.",
+        "Teams love Hunter domain search accuracy.",
+        "Campaign outreach workflows feel simple.",
+      ],
+      negative_hypotheses: [
+        "Credit limits can feel tight on smaller plans.",
+        "Niche local businesses have fewer matches.",
+        "Users want deeper CRM sync options.",
+      ],
+    });
+
+    const { db, getAiInsightsRow, getProgress } = makeMockDb({
+      email: "govindpanicker666@gmail.com",
+      hasCompleted: true,
+      companyName: "Hunter",
+      companyUrl: "https://hunter.io",
+      initialMentions: [],
+    });
+
+    await db.from("ai_brand_insights").upsert({
+      user_id: "user-legacy-2",
+      positive_hypotheses: ["Taplio boosts LinkedIn reach"],
+      negative_hypotheses: ["Taplio feels expensive"],
+      generated_at: "2026-01-01T00:00:00.000Z",
+    });
+
+    const initialState = await readBrandListeningState(db, "user-legacy-2");
+    expect(initialState.company_name).toBe("Hunter");
+    expect(initialState.ai_brand_insights).toBeNull();
+    expect(getAiInsightsRow()).toBeNull();
+
+    const generated = await generateAIBrandBaselineForUser(db, "user-legacy-2");
+    expect(generated.insights?.positive_hypotheses[0]).toContain("Hunter");
+    expect(mocks.geminiJson).toHaveBeenCalledTimes(1);
+
+    const blob = getProgress()?.["brand_listening"] as Record<string, unknown> | undefined;
+    expect(blob?.["insights_brand_key"]).toBe("hunter|hunter.io");
+
+    const nextState = await readBrandListeningState(db, "user-legacy-2");
+    expect(nextState.ai_brand_insights?.positive_hypotheses[0]).toContain("Hunter");
   });
 });

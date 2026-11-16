@@ -2,17 +2,7 @@ import { createFileRoute, Link } from "@tanstack/react-router";
 import { useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
 import { useServerFn } from "@tanstack/react-start";
 import { useCallback, useEffect, useRef, useState } from "react";
-import {
-  AlertTriangle,
-  CheckCircle2,
-  Circle,
-  FileText,
-  Loader2,
-  Play,
-  Square,
-  Trash2,
-  UserSearch,
-} from "lucide-react";
+import { CheckCircle2, Circle, FileText, Loader2, Play, Square, UserSearch } from "lucide-react";
 import { toast } from "sonner";
 import { reenrichContacts } from "@/lib/leads.functions";
 import { AutoScrape } from "@/components/AutoScrape";
@@ -20,16 +10,6 @@ import { competitorsQuery } from "@/lib/queries";
 import { useCurrentUser } from "@/hooks/use-auth";
 import { supabase } from "@/integrations/supabase/client";
 import { formatStatValue, PLATFORMS, platformLabel } from "@/lib/pipeline";
-import {
-  AlertDialog,
-  AlertDialogAction,
-  AlertDialogCancel,
-  AlertDialogContent,
-  AlertDialogDescription,
-  AlertDialogFooter,
-  AlertDialogHeader,
-  AlertDialogTitle,
-} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import {
   Select,
@@ -102,8 +82,6 @@ function Admin() {
   const [starting, setStarting] = useState(false);
   const [cancelling, setCancelling] = useState(false);
   const [jobState, setJobState] = useState<ManualScrapeJobStatus | null>(null);
-  const [dangerTarget, setDangerTarget] = useState<"leads" | "competitors" | null>(null);
-  const [dangerBusy, setDangerBusy] = useState(false);
   const lastSavedRef = useRef(0);
   const prevJobStatusRef = useRef<"idle" | "running" | "completed" | null>(null);
 
@@ -407,7 +385,7 @@ function Admin() {
             );
           })}
           {jobState && jobState.errors.length > 0 && (
-            <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-300">
+            <div className="rounded-md border border-amber-500/30 bg-amber-500/10 p-3 text-xs text-amber-800 dark:text-amber-300">
               <div className="font-semibold">
                 Analysis / scrape errors ({jobState.errors.length}):
               </div>
@@ -422,13 +400,12 @@ function Admin() {
       )}
       {showResults && (
         <div className="space-y-4">
-          <div className="grid gap-4 sm:grid-cols-4">
+          <div className="grid gap-4 sm:grid-cols-3">
             {(
               [
                 ["Posts found", jobState.stats.found],
                 ["About this competitor", jobState.stats.relevant],
                 ["Leads saved", jobState.stats.saved],
-                ["Discarded (no contact)", jobState.stats.discarded],
               ] as const
             ).map(([l, v]) => (
               <div key={l} className="glass p-5">
@@ -467,7 +444,7 @@ function Admin() {
             </div>
           )}
           {jobState.errors.length > 0 && (
-            <div className="glass space-y-1 p-4 text-xs text-amber-400">
+            <div className="glass space-y-1 p-4 text-xs text-amber-800 dark:text-amber-400">
               <div className="font-semibold">Competitor errors ({jobState.errors.length}):</div>
               {jobState.errors.map((err, i) => (
                 <div key={i}>{err}</div>
@@ -476,110 +453,6 @@ function Admin() {
           )}
         </div>
       )}
-
-      <div className="glass space-y-4 border border-destructive/40 p-5">
-        <div className="flex items-center gap-2 text-destructive">
-          <AlertTriangle className="h-5 w-5" />
-          <h2 className="text-lg font-semibold">Danger Zone</h2>
-        </div>
-        <p className="text-sm text-muted-foreground">
-          Permanently clear scraped leads or tracked competitors. These actions cannot be undone.
-        </p>
-        <div className="flex flex-wrap gap-3">
-          <Button
-            variant="destructive"
-            onClick={() => setDangerTarget("leads")}
-            disabled={dangerBusy}
-          >
-            <Trash2 />
-            Delete All Leads
-          </Button>
-          <Button
-            variant="destructive"
-            onClick={() => setDangerTarget("competitors")}
-            disabled={dangerBusy}
-          >
-            <Trash2 />
-            Delete All Competitors
-          </Button>
-        </div>
-      </div>
-
-      <AlertDialog
-        open={dangerTarget !== null}
-        onOpenChange={(isOpen) => !isOpen && !dangerBusy && setDangerTarget(null)}
-      >
-        <AlertDialogContent>
-          <AlertDialogHeader>
-            <AlertDialogTitle>
-              {dangerTarget === "competitors"
-                ? "Delete all competitors and their leads?"
-                : "Delete all leads?"}
-            </AlertDialogTitle>
-            <AlertDialogDescription>
-              {dangerTarget === "competitors"
-                ? "This will permanently delete ALL competitors and cascade delete ALL associated leads from the database. You will need to re-add or re-detect competitors afterward."
-                : "This will permanently delete ALL leads in the database. Tracked competitors will remain untouched."}
-            </AlertDialogDescription>
-          </AlertDialogHeader>
-          <AlertDialogFooter>
-            <AlertDialogCancel disabled={dangerBusy}>Cancel</AlertDialogCancel>
-            <AlertDialogAction
-              disabled={dangerBusy}
-              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
-              onClick={async (e) => {
-                e.preventDefault();
-                if (!dangerTarget) return;
-                setDangerBusy(true);
-                try {
-                  const token = await getBearerToken();
-                  if (!token) {
-                    toast.error("Session expired — please sign in again.");
-                    return;
-                  }
-                  const endpoint =
-                    dangerTarget === "competitors" ? "/api/competitors" : "/api/leads";
-                  const res = await fetch(endpoint, {
-                    method: "DELETE",
-                    headers: {
-                      Accept: "application/json",
-                      Authorization: `Bearer ${token}`,
-                    },
-                  });
-                  const payload = (await res.json()) as { ok?: boolean; error?: string };
-                  if (!res.ok || !payload.ok) {
-                    throw new Error(payload.error || "Deletion failed");
-                  }
-                  if (dangerTarget === "competitors") {
-                    setCid("");
-                    toast.success("All competitors and associated leads deleted");
-                  } else {
-                    toast.success("All leads deleted");
-                  }
-                  setDangerTarget(null);
-                  await Promise.all([
-                    qc.invalidateQueries({ queryKey: ["leads"] }),
-                    qc.invalidateQueries({ queryKey: ["competitors"] }),
-                    qc.invalidateQueries({ queryKey: ["stats"] }),
-                    qc.invalidateQueries({ queryKey: ["competitor_news"] }),
-                  ]);
-                } catch (err) {
-                  toast.error(err instanceof Error ? err.message : "Deletion failed");
-                } finally {
-                  setDangerBusy(false);
-                }
-              }}
-            >
-              {dangerBusy ? <Loader2 className="animate-spin" /> : <Trash2 />}
-              {dangerBusy
-                ? "Deleting..."
-                : dangerTarget === "competitors"
-                  ? "Yes, Delete All Competitors"
-                  : "Yes, Delete All Leads"}
-            </AlertDialogAction>
-          </AlertDialogFooter>
-        </AlertDialogContent>
-      </AlertDialog>
     </div>
   );
 }

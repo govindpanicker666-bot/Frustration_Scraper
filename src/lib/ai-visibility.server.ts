@@ -1,5 +1,6 @@
 import type { SupabaseClient } from "@supabase/supabase-js";
 import type { Database, Json } from "@/integrations/supabase/types";
+import { GEMINI_MODEL } from "./ai.server";
 
 type DB = SupabaseClient<Database>;
 type Sentiment = "positive" | "neutral" | "negative";
@@ -133,12 +134,14 @@ async function executeBuyerPrompt(
     try {
       const parsed = new URL(source.url);
       if (parsed.protocol !== "https:" && parsed.protocol !== "http:") return [];
-      return [{
-        title: source.title.slice(0, 180),
-        url: source.url,
-        domain: parsed.hostname.replace(/^www\./, ""),
-        snippet: source.snippet.slice(0, 700),
-      }];
+      return [
+        {
+          title: source.title.slice(0, 180),
+          url: source.url,
+          domain: parsed.hostname.replace(/^www\./, ""),
+          snippet: source.snippet.slice(0, 700),
+        },
+      ];
     } catch {
       return [];
     }
@@ -210,7 +213,10 @@ export async function runAIVisibilityScan(
     .eq("id", userId)
     .maybeSingle();
   if (profileError) throw new Error(`Could not load your brand profile: ${profileError.message}`);
-  if (profile?.company_name && profile.company_name.trim().toLowerCase() !== normalizedBrand.toLowerCase()) {
+  if (
+    profile?.company_name &&
+    profile.company_name.trim().toLowerCase() !== normalizedBrand.toLowerCase()
+  ) {
     throw new Error("Brand name must match your saved company name in the Competitors profile.");
   }
 
@@ -219,17 +225,23 @@ export async function runAIVisibilityScan(
     .select("name,category,description")
     .eq("user_id", userId)
     .limit(20);
-  if (competitorsError) throw new Error(`Could not load your saved competitors: ${competitorsError.message}`);
+  if (competitorsError)
+    throw new Error(`Could not load your saved competitors: ${competitorsError.message}`);
 
   const competitorRows = storedCompetitors ?? [];
   const competitors = cleanBrandList([
-    ...competitorNames,
+    ...competitorNames.slice(0, 20),
     ...competitorRows.map((item) => item.name),
-  ]).filter((name) => name.toLowerCase() !== normalizedBrand.toLowerCase());
+  ])
+    .filter((name) => name.toLowerCase() !== normalizedBrand.toLowerCase())
+    .slice(0, 20);
   const categoryContext = [
     profile?.company_url ? `Website: ${profile.company_url}` : "",
     ...competitorRows.map((item) => [item.category, item.description].filter(Boolean).join(" — ")),
-  ].filter(Boolean).join("\n").slice(0, 2400);
+  ]
+    .filter(Boolean)
+    .join("\n")
+    .slice(0, 2400);
   const prompts = await generateBuyerPrompts(normalizedBrand, competitors, categoryContext);
 
   const rows: Database["public"]["Tables"]["ai_visibility_scans"]["Insert"][] = [];
@@ -241,9 +253,7 @@ export async function runAIVisibilityScan(
     const settled = await Promise.allSettled(
       batch.map(async (prompt) => {
         const execution = await executeBuyerPrompt(prompt, normalizedBrand, competitors);
-        const visibilityScore = execution.rank
-          ? Math.max(10, Math.round(100 / execution.rank))
-          : 0;
+        const visibilityScore = execution.rank ? Math.max(10, Math.round(100 / execution.rank)) : 0;
         return {
           user_id: userId,
           brand_name: normalizedBrand,
@@ -272,16 +282,18 @@ export async function runAIVisibilityScan(
     .insert(rows)
     .select("*");
   if (saveError) {
-    throw new Error(`Could not save AI visibility results. Apply the ai_visibility_scans migration first. ${saveError.message}`);
+    throw new Error(
+      `Could not save AI visibility results. Apply the ai_visibility_scans migration first. ${saveError.message}`,
+    );
   }
 
   const visibilityScore = Math.round(
-    rows.reduce((sum, row) => sum + row.visibility_score, 0) / rows.length,
+    rows.reduce((sum, row) => sum + (row.visibility_score ?? 0), 0) / rows.length,
   );
 
   return {
     brandName: normalizedBrand,
-    modelName: rows[0]?.model_name ?? MODEL_NAME,
+    modelName: rows[0]?.model_name ?? GEMINI_MODEL,
     promptsRequested: PROMPT_COUNT,
     promptsCompleted: rows.length,
     visibilityScore,
@@ -305,7 +317,7 @@ export async function getAIVisibilityDashboard(supabase: DB, userId: string) {
   const [scans, profileResult, competitorResult] = await Promise.all([
     getAIVisibilityScans(supabase, userId),
     supabase.from("profiles").select("company_name").eq("id", userId).maybeSingle(),
-    supabase.from("competitors").select("name").eq("user_id", userId).order("name").limit(30),
+    supabase.from("competitors").select("name").eq("user_id", userId).order("name").limit(20),
   ]);
 
   if (profileResult.error) throw new Error(profileResult.error.message);

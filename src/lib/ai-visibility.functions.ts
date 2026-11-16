@@ -4,7 +4,10 @@ import { requireAppSupabaseAuth } from "@/lib/supabase-auth";
 
 const scanSchema = z.object({
   brand_name: z.string().trim().min(1).max(120),
-  competitor_names: z.array(z.string().trim().min(1).max(120)).max(20).default([]),
+  competitor_names: z
+    .array(z.string().trim().min(1).max(120))
+    .default([])
+    .transform((items) => items.slice(0, 20)),
 });
 
 export const getAIVisibilityScansFn = createServerFn({ method: "GET" })

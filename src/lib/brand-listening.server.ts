@@ -29,6 +29,7 @@ interface BrandUserContext {
 
 const globalBrandState = globalThis as unknown as {
   __churnhoundBrandListeningLoops?: Map<string, Promise<void>>;
+  __churnhoundBrandEpochs?: Map<string, number>;
 };
 
 function getBrandLoops(): Map<string, Promise<void>> {
@@ -36,6 +37,20 @@ function getBrandLoops(): Map<string, Promise<void>> {
     globalBrandState.__churnhoundBrandListeningLoops = new Map();
   }
   return globalBrandState.__churnhoundBrandListeningLoops;
+}
+
+function getBrandEpochs(): Map<string, number> {
+  if (!globalBrandState.__churnhoundBrandEpochs) {
+    globalBrandState.__churnhoundBrandEpochs = new Map();
+  }
+  return globalBrandState.__churnhoundBrandEpochs;
+}
+
+function bumpBrandEpoch(userId: string): number {
+  const epochs = getBrandEpochs();
+  const next = (epochs.get(userId) ?? 0) + 1;
+  epochs.set(userId, next);
+  return next;
 }
 
 function isMissingSchemaError(
@@ -63,6 +78,88 @@ function parseProgressBrandBlob(progress: Json | null | undefined): Record<strin
   const raw = env["brand_listening"];
   if (!raw || typeof raw !== "object" || Array.isArray(raw)) return {};
   return raw as Record<string, unknown>;
+}
+
+export function buildBrandKey(
+  companyName: string | null | undefined,
+  companyUrl: string | null | undefined,
+): string {
+  const name = (companyName ?? "").trim().toLowerCase();
+  const dom = (domainOf(companyUrl) ?? "").trim().toLowerCase();
+  const fallbackUrl = dom ? "" : (companyUrl ?? "").trim().toLowerCase().replace(/\/+$/, "");
+  return `${name}|${dom || fallbackUrl}`;
+}
+
+export function mentionMatchesBrand(
+  mention: {
+    text?: string | null;
+    summary?: string | null;
+    source_url?: string | null;
+  },
+  companyName: string | null | undefined,
+  companyUrl: string | null | undefined,
+): boolean {
+  const name = (companyName ?? "").trim().toLowerCase();
+  const domain = (domainOf(companyUrl) ?? "").trim().toLowerCase();
+  const textCorpus = `${mention.text ?? ""} ${mention.summary ?? ""}`.trim().toLowerCase();
+  const urlCorpus = (mention.source_url ?? "").trim().toLowerCase();
+  const fullCorpus = `${textCorpus} ${urlCorpus}`.trim();
+
+  // Sparse fixture rows without review text should not be treated as a mismatch.
+  if (!textCorpus) return true;
+  if (domain && fullCorpus.includes(domain)) return true;
+  if (name && name.length >= 2 && fullCorpus.includes(name)) return true;
+  return false;
+}
+
+async function getAdminOrUserDb(fallbackDb: DB): Promise<DB> {
+  if (process.env["VITEST"] || process.env["NODE_ENV"] === "test") {
+    return fallbackDb;
+  }
+  const hasUrl = Boolean(process.env["SUPABASE_URL"] || process.env["VITE_SUPABASE_URL"]);
+  const hasKey = Boolean(process.env["SUPABASE_SERVICE_ROLE_KEY"]);
+  if (!hasUrl || !hasKey) {
+    return fallbackDb;
+  }
+  try {
+    const { supabaseAdmin } = await import("@/integrations/supabase/client.server");
+    return supabaseAdmin;
+  } catch {
+    return fallbackDb;
+  }
+}
+
+async function purgeBrandTables(
+  db: DB,
+  userId: string,
+  targets: { mentions?: boolean; insights?: boolean },
+) {
+  const writeDb = await getAdminOrUserDb(db);
+  const tasks: Promise<void>[] = [];
+
+  if (targets.mentions) {
+    tasks.push(
+      (async () => {
+        const { error } = await writeDb.from("brand_mentions").delete().eq("user_id", userId);
+        if (error && !isMissingSchemaError(error)) {
+          console.warn("[BrandListening] failed clearing old brand_mentions:", error.message);
+        }
+      })(),
+    );
+  }
+
+  if (targets.insights) {
+    tasks.push(
+      (async () => {
+        const { error } = await writeDb.from("ai_brand_insights").delete().eq("user_id", userId);
+        if (error && !isMissingSchemaError(error)) {
+          console.warn("[BrandListening] failed clearing old ai_brand_insights:", error.message);
+        }
+      })(),
+    );
+  }
+
+  await Promise.all(tasks);
 }
 
 async function resolveUserEmail(
@@ -115,12 +212,15 @@ async function loadBrandUserContext(
 
   if (!fullProfile.error) {
     const email = await resolveUserEmail(fullProfile.data?.email, userId, emailHint);
+    const pName = fullProfile.data?.company_name?.trim() || null;
+    const pUrl = fullProfile.data?.company_url?.trim() || null;
+    const hasProfileBrand = Boolean(pName || pUrl);
     return {
       ctx: {
         userId,
         email,
-        company_name: fullProfile.data?.company_name?.trim() || fallbackName,
-        company_url: fullProfile.data?.company_url?.trim() || fallbackUrl,
+        company_name: hasProfileBrand ? pName : fallbackName,
+        company_url: hasProfileBrand ? pUrl : fallbackUrl,
         has_completed_brand_baseline: Boolean(fullProfile.data?.has_completed_brand_baseline),
         supportsBaselineColumn: true,
       },
@@ -140,12 +240,15 @@ async function loadBrandUserContext(
     .maybeSingle();
 
   const email = await resolveUserEmail(basicProfile.data?.email, userId, emailHint);
+  const bName = basicProfile.data?.company_name?.trim() || null;
+  const bUrl = basicProfile.data?.company_url?.trim() || null;
+  const hasBasicBrand = Boolean(bName || bUrl);
   return {
     ctx: {
       userId,
       email,
-      company_name: basicProfile.data?.company_name?.trim() || fallbackName,
-      company_url: basicProfile.data?.company_url?.trim() || fallbackUrl,
+      company_name: hasBasicBrand ? bName : fallbackName,
+      company_url: hasBasicBrand ? bUrl : fallbackUrl,
       has_completed_brand_baseline: Boolean(blob["has_completed_brand_baseline"]),
       supportsBaselineColumn: false,
     },
@@ -170,14 +273,15 @@ async function readStoredMentions(
   if (!error) {
     const mentions: BrandMention[] = (data ?? []).map((row) => {
       const normalized = normalizeBrandSentiment(row.sentiment_score);
-      const summary = (row.extracted_complaint ?? "").trim() || row.review_text.slice(0, 140);
+      const reviewText = row.review_text ?? "";
+      const summary = (row.extracted_complaint ?? "").trim() || reviewText.slice(0, 140);
       return {
         id: row.id,
         platform: row.platform,
-        author: row.reviewer_name,
+        author: row.reviewer_name ?? null,
         author_url: null,
-        source_url: row.post_url,
-        text: row.review_text,
+        source_url: row.post_url ?? "",
+        text: reviewText,
         sentiment_score: normalized.score,
         sentiment: normalized.sentiment,
         summary,
@@ -299,9 +403,14 @@ async function saveMentionsToBrandTable(
   return { saved: rowsToInsert.length, supportsTable: true };
 }
 
-async function markBaselineCompleted(db: DB, ctx: BrandUserContext): Promise<void> {
+async function markBaselineCompleted(
+  db: DB,
+  ctx: BrandUserContext,
+  brandKey?: string,
+): Promise<void> {
+  const writeDb = await getAdminOrUserDb(db);
   if (ctx.supportsBaselineColumn) {
-    const { error } = await db
+    const { error } = await writeDb
       .from("profiles")
       .update({ has_completed_brand_baseline: true })
       .eq("id", ctx.userId);
@@ -311,6 +420,7 @@ async function markBaselineCompleted(db: DB, ctx: BrandUserContext): Promise<voi
   }
   await saveProgressMetadata(db, ctx.userId, {
     has_completed_brand_baseline: true,
+    ...(brandKey ? { mentions_brand_key: brandKey } : {}),
   });
 }
 
@@ -350,18 +460,27 @@ async function readAiBrandInsights(
   db: DB,
   userId: string,
   settingsProgress: Json | null,
-): Promise<AiBrandInsights | null> {
+  currentBrandKey: string,
+): Promise<{ insights: AiBrandInsights | null; hadStaleInsights: boolean }> {
+  const blob = parseProgressBrandBlob(settingsProgress);
+  const insightsBrandKey =
+    typeof blob["insights_brand_key"] === "string" ? blob["insights_brand_key"] : null;
+  const keyMatches = Boolean(
+    currentBrandKey && currentBrandKey !== "|" && insightsBrandKey === currentBrandKey,
+  );
+
   const { data, error } = await db
     .from("ai_brand_insights")
     .select("positive_hypotheses,negative_hypotheses,generated_at")
     .eq("user_id", userId)
     .maybeSingle();
 
+  let found: AiBrandInsights | null = null;
   if (!error && data) {
     const positive_hypotheses = parseHypothesesArray(data.positive_hypotheses);
     const negative_hypotheses = parseHypothesesArray(data.negative_hypotheses);
     if (positive_hypotheses.length > 0 || negative_hypotheses.length > 0) {
-      return {
+      found = {
         positive_hypotheses,
         negative_hypotheses,
         generated_at: data.generated_at,
@@ -371,8 +490,18 @@ async function readAiBrandInsights(
     console.warn("[BrandListening] readAiBrandInsights warning:", error.message);
   }
 
-  const blob = parseProgressBrandBlob(settingsProgress);
-  return parseAiBrandInsightsBlob(blob["ai_brand_insights"]);
+  if (!found) {
+    found = parseAiBrandInsightsBlob(blob["ai_brand_insights"]);
+  }
+
+  if (!keyMatches) {
+    return {
+      insights: null,
+      hadStaleInsights: Boolean(found || insightsBrandKey),
+    };
+  }
+
+  return { insights: found, hadStaleInsights: false };
 }
 
 async function loadCompetitorNamesForUser(db: DB, userId: string): Promise<string[]> {
@@ -389,25 +518,132 @@ async function loadCompetitorNamesForUser(db: DB, userId: string): Promise<strin
   }
 }
 
+async function detectAndPurgeStaleBrandState(
+  db: DB,
+  ctx: BrandUserContext,
+  settingsProgress: Json | null,
+  rawMentions: BrandMention[],
+): Promise<{
+  mentions: BrandMention[];
+  purgedMentionsOrBrand: boolean;
+  hasCompletedBaseline: boolean;
+}> {
+  const currentBrandKey = buildBrandKey(ctx.company_name, ctx.company_url);
+  const hasActiveBrand = currentBrandKey !== "|";
+  if (!hasActiveBrand) {
+    return {
+      mentions: rawMentions,
+      purgedMentionsOrBrand: false,
+      hasCompletedBaseline: ctx.has_completed_brand_baseline,
+    };
+  }
+
+  const blob = parseProgressBrandBlob(settingsProgress);
+  const mentionsBrandKey =
+    typeof blob["mentions_brand_key"] === "string" ? blob["mentions_brand_key"] : null;
+  const blobName = typeof blob["company_name"] === "string" ? blob["company_name"].trim() : "";
+  const blobUrl = typeof blob["company_url"] === "string" ? blob["company_url"].trim() : "";
+  const blobBrandKey = blobName || blobUrl ? buildBrandKey(blobName, blobUrl) : null;
+
+  const explicitBrandMismatch = Boolean(
+    (mentionsBrandKey && mentionsBrandKey !== currentBrandKey) ||
+    (blobBrandKey && blobBrandKey !== currentBrandKey),
+  );
+
+  let unlabelledMentionMismatch = false;
+  if (!explicitBrandMismatch && !mentionsBrandKey && rawMentions.length > 0) {
+    const nonMatchingCount = rawMentions.filter(
+      (m) => !mentionMatchesBrand(m, ctx.company_name, ctx.company_url),
+    ).length;
+    if (nonMatchingCount > 0) {
+      unlabelledMentionMismatch = true;
+    }
+  }
+
+  if (!explicitBrandMismatch && !unlabelledMentionMismatch) {
+    return {
+      mentions: rawMentions,
+      purgedMentionsOrBrand: false,
+      hasCompletedBaseline: ctx.has_completed_brand_baseline,
+    };
+  }
+
+  bumpBrandEpoch(ctx.userId);
+  getBrandLoops().delete(ctx.userId);
+
+  await purgeBrandTables(db, ctx.userId, { mentions: true, insights: true });
+  const writeDb = await getAdminOrUserDb(db);
+  if (ctx.supportsBaselineColumn) {
+    const { error } = await writeDb
+      .from("profiles")
+      .update({ has_completed_brand_baseline: false })
+      .eq("id", ctx.userId);
+    if (error && !isMissingSchemaError(error)) {
+      console.warn("[BrandListening] failed resetting baseline flag:", error.message);
+    }
+  }
+
+  await saveProgressMetadata(
+    db,
+    ctx.userId,
+    {
+      company_name: ctx.company_name,
+      company_url: ctx.company_url,
+      mentions_brand_key: currentBrandKey,
+      insights_brand_key: null,
+      has_completed_brand_baseline: false,
+      last_scraped_at: null,
+      baseline_running: false,
+      baseline_error: null,
+      baseline_progress: null,
+      mentions: [],
+      recommendations: [],
+      recommendations_generated_at: null,
+      recommendations_mention_count: 0,
+      ai_brand_insights: null,
+    },
+    { brand_listening_date: null },
+  );
+
+  return {
+    mentions: [],
+    purgedMentionsOrBrand: true,
+    hasCompletedBaseline: false,
+  };
+}
+
 export async function readBrandListeningState(
   db: DB,
   userId: string,
   emailHint?: string | null,
 ): Promise<BrandListeningState> {
   const { ctx, settingsProgress } = await loadBrandUserContext(db, userId, emailHint);
-  const { mentions } = await readStoredMentions(db, userId, settingsProgress);
-  const ai_brand_insights = await readAiBrandInsights(db, userId, settingsProgress);
-  const blob = parseProgressBrandBlob(settingsProgress);
-  const base = emptyBrandListeningState(
-    ctx.company_name,
-    ctx.company_url,
-    ctx.has_completed_brand_baseline,
-  );
+  const currentBrandKey = buildBrandKey(ctx.company_name, ctx.company_url);
+  const { mentions: rawMentions } = await readStoredMentions(db, userId, settingsProgress);
 
-  const activeLoopRunning = getBrandLoops().has(userId);
+  const staleCheck = await detectAndPurgeStaleBrandState(db, ctx, settingsProgress, rawMentions);
+  const mentions = staleCheck.mentions;
+  const hasCompletedBaseline = staleCheck.hasCompletedBaseline;
+
+  const { insights: ai_brand_insights, hadStaleInsights } = staleCheck.purgedMentionsOrBrand
+    ? { insights: null, hadStaleInsights: false }
+    : await readAiBrandInsights(db, userId, settingsProgress, currentBrandKey);
+
+  if (hadStaleInsights) {
+    await purgeBrandTables(db, userId, { insights: true });
+    await saveProgressMetadata(db, userId, {
+      ai_brand_insights: null,
+      insights_brand_key: null,
+    });
+  }
+
+  const blob = parseProgressBrandBlob(settingsProgress);
+  const base = emptyBrandListeningState(ctx.company_name, ctx.company_url, hasCompletedBaseline);
+
+  const activeLoopRunning = !staleCheck.purgedMentionsOrBrand && getBrandLoops().has(userId);
   const baseline_running = activeLoopRunning;
 
-  const rawProgress = blob["baseline_progress"];
+  const rawProgress = staleCheck.purgedMentionsOrBrand ? null : blob["baseline_progress"];
   const baseline_progress: BrandBaselineProgress | null =
     rawProgress && typeof rawProgress === "object" && !Array.isArray(rawProgress)
       ? {
@@ -421,37 +657,36 @@ export async function readBrandListeningState(
         }
       : null;
 
-  const recommendations = Array.isArray(blob["recommendations"])
-    ? blob["recommendations"].filter(
-        (r): r is string => typeof r === "string" && r.trim().length > 0,
-      )
-    : [];
+  const recommendations =
+    !staleCheck.purgedMentionsOrBrand && Array.isArray(blob["recommendations"])
+      ? blob["recommendations"].filter(
+          (r): r is string => typeof r === "string" && r.trim().length > 0,
+        )
+      : [];
 
   return {
     ...base,
-    company_name:
-      ctx.company_name ||
-      (typeof blob["company_name"] === "string" && blob["company_name"].trim()
-        ? blob["company_name"].trim()
-        : null),
-    company_url:
-      ctx.company_url ||
-      (typeof blob["company_url"] === "string" && blob["company_url"].trim()
-        ? blob["company_url"].trim()
-        : null),
-    last_scraped_at: typeof blob["last_scraped_at"] === "string" ? blob["last_scraped_at"] : null,
-    has_completed_brand_baseline: ctx.has_completed_brand_baseline,
+    company_name: ctx.company_name,
+    company_url: ctx.company_url,
+    last_scraped_at:
+      !staleCheck.purgedMentionsOrBrand && typeof blob["last_scraped_at"] === "string"
+        ? blob["last_scraped_at"]
+        : null,
+    has_completed_brand_baseline: hasCompletedBaseline,
     baseline_running,
-    baseline_error: typeof blob["baseline_error"] === "string" ? blob["baseline_error"] : null,
+    baseline_error:
+      !staleCheck.purgedMentionsOrBrand && typeof blob["baseline_error"] === "string"
+        ? blob["baseline_error"]
+        : null,
     baseline_progress,
     mentions,
     recommendations,
     recommendations_generated_at:
-      typeof blob["recommendations_generated_at"] === "string"
+      !staleCheck.purgedMentionsOrBrand && typeof blob["recommendations_generated_at"] === "string"
         ? blob["recommendations_generated_at"]
         : null,
     recommendations_mention_count:
-      typeof blob["recommendations_mention_count"] === "number"
+      !staleCheck.purgedMentionsOrBrand && typeof blob["recommendations_mention_count"] === "number"
         ? blob["recommendations_mention_count"]
         : 0,
     ai_brand_insights,
@@ -563,9 +798,22 @@ export async function runBrandListeningForUser(
   savedMentions: number;
   state: BrandListeningState;
 }> {
-  const { ctx, settingsProgress } = await loadBrandUserContext(db, userId, emailHint);
+  const { ctx: loadedCtx, settingsProgress } = await loadBrandUserContext(db, userId, emailHint);
+  const { mentions: existingMentions } = await readStoredMentions(db, userId, settingsProgress);
+  const staleCheck = await detectAndPurgeStaleBrandState(
+    db,
+    loadedCtx,
+    settingsProgress,
+    existingMentions,
+  );
+  const ctx: BrandUserContext = staleCheck.purgedMentionsOrBrand
+    ? { ...loadedCtx, has_completed_brand_baseline: false }
+    : loadedCtx;
+
   const brandDomain = domainOf(ctx.company_url);
   const brandName = (ctx.company_name || brandDomain || "").trim();
+  const startEpoch = getBrandEpochs().get(userId) ?? 0;
+  const expectedBrandIdentity = buildBrandKey(ctx.company_name, ctx.company_url);
 
   const apply48HourFilter = shouldApply48HourBrandFilter({
     has_completed_brand_baseline: ctx.has_completed_brand_baseline,
@@ -588,6 +836,9 @@ export async function runBrandListeningForUser(
   const scrapeCtx = { name: brandName, domain: brandDomain };
 
   await saveProgressMetadata(db, userId, {
+    company_name: ctx.company_name || brandName,
+    company_url: ctx.company_url,
+    mentions_brand_key: expectedBrandIdentity,
     baseline_running: true,
     baseline_error: null,
     baseline_progress: {
@@ -660,12 +911,28 @@ export async function runBrandListeningForUser(
     const scoredMentions =
       rawToScore.length > 0 ? await scoreOwnBrandReviews(brandName, brandDomain, rawToScore) : [];
 
+    // Abort persistence if the user switched brands while this scan was running.
+    const { ctx: latestCtx } = await loadBrandUserContext(db, userId, ctx.email);
+    const latestBrandIdentity = buildBrandKey(latestCtx.company_name, latestCtx.company_url);
+    const currentEpoch = getBrandEpochs().get(userId) ?? 0;
+    if (currentEpoch !== startEpoch || latestBrandIdentity !== expectedBrandIdentity) {
+      const freshState = await readBrandListeningState(db, userId, ctx.email);
+      return {
+        skipped: true,
+        apply48HourFilter,
+        foundRaw: 0,
+        savedMentions: 0,
+        state: freshState,
+      };
+    }
+
     const { saved, supportsTable } = await saveMentionsToBrandTable(db, userId, scoredMentions);
 
     const existingBlob = parseProgressBrandBlob(settingsProgress);
-    const prevMentions = Array.isArray(existingBlob["mentions"])
-      ? (existingBlob["mentions"] as BrandMention[])
-      : [];
+    const prevMentions =
+      !staleCheck.purgedMentionsOrBrand && Array.isArray(existingBlob["mentions"])
+        ? (existingBlob["mentions"] as BrandMention[])
+        : [];
 
     const fallbackMentions = supportsTable
       ? prevMentions
@@ -679,6 +946,7 @@ export async function runBrandListeningForUser(
       {
         company_name: ctx.company_name || brandName,
         company_url: ctx.company_url,
+        mentions_brand_key: expectedBrandIdentity,
         last_scraped_at: nowIso,
         baseline_running: false,
         baseline_error: null,
@@ -694,7 +962,7 @@ export async function runBrandListeningForUser(
 
     // Crucial: Only mark baseline complete after the scrape + AI scoring + save finish successfully.
     if (ctx.has_completed_brand_baseline === false) {
-      await markBaselineCompleted(db, ctx);
+      await markBaselineCompleted(db, ctx, expectedBrandIdentity);
     }
 
     let finalState = await readBrandListeningState(db, userId, ctx.email);
@@ -762,7 +1030,17 @@ export async function startBrandListeningScan(
     return { started: false, alreadyRunning: true, skipped: false, state };
   }
 
+  // Purge any leftover mentions/insights from a previous brand before starting scan.
+  const preState = await readBrandListeningState(db, userId, ctx.email);
+  const currentKey = buildBrandKey(
+    preState.company_name || brandName,
+    preState.company_url ?? ctx.company_url,
+  );
+
   await saveProgressMetadata(db, userId, {
+    company_name: preState.company_name || brandName,
+    company_url: preState.company_url ?? ctx.company_url,
+    mentions_brand_key: currentKey,
     baseline_running: true,
     baseline_error: null,
     baseline_progress: {
@@ -892,24 +1170,49 @@ export async function generateAIBrandBaseline(
   skippedReason?: string;
   error?: string;
 }> {
-  const { settingsProgress } = await loadBrandUserContext(db, userId);
+  const { ctx, settingsProgress } = await loadBrandUserContext(db, userId);
+  const effectiveBrandKey = buildBrandKey(
+    companyName || ctx.company_name,
+    companyUrl ?? ctx.company_url,
+  );
+
+  // Check if stored mentions belong to a different brand before counting them.
+  const { mentions: storedMentions } = await readStoredMentions(db, userId, settingsProgress);
+  const staleCheck = await detectAndPurgeStaleBrandState(
+    db,
+    {
+      ...ctx,
+      company_name: companyName || ctx.company_name,
+      company_url: companyUrl ?? ctx.company_url,
+    },
+    settingsProgress,
+    storedMentions,
+  );
 
   let mentionCount = 0;
-  const countRes = await db
-    .from("brand_mentions")
-    .select("id", { count: "exact", head: true })
-    .eq("user_id", userId);
+  if (!staleCheck.purgedMentionsOrBrand) {
+    const countRes = await db
+      .from("brand_mentions")
+      .select("id", { count: "exact", head: true })
+      .eq("user_id", userId);
 
-  if (!countRes.error) {
-    mentionCount = countRes.count ?? 0;
-  } else if (isMissingSchemaError(countRes.error)) {
-    const stored = await readStoredMentions(db, userId, settingsProgress);
-    mentionCount = stored.mentions.length;
-  } else {
-    throw new Error(`Failed to count brand_mentions: ${countRes.error.message}`);
+    if (!countRes.error) {
+      mentionCount = countRes.count ?? 0;
+    } else if (isMissingSchemaError(countRes.error)) {
+      mentionCount = staleCheck.mentions.length;
+    } else {
+      throw new Error(`Failed to count brand_mentions: ${countRes.error.message}`);
+    }
   }
 
-  const existing = await readAiBrandInsights(db, userId, settingsProgress);
+  const { insights: existing, hadStaleInsights } = staleCheck.purgedMentionsOrBrand
+    ? { insights: null, hadStaleInsights: false }
+    : await readAiBrandInsights(db, userId, settingsProgress, effectiveBrandKey);
+
+  if (hadStaleInsights) {
+    await purgeBrandTables(db, userId, { insights: true });
+  }
+
   if (mentionCount >= 3) {
     return {
       insights: existing,
@@ -969,7 +1272,8 @@ Return strictly this JSON format with 3 concise, realistic customer statements i
       generated_at: generatedAt,
     };
 
-    const { error: upsertErr } = await db.from("ai_brand_insights").upsert(
+    const writeDb = await getAdminOrUserDb(db);
+    const { error: upsertErr } = await writeDb.from("ai_brand_insights").upsert(
       {
         user_id: userId,
         positive_hypotheses,
@@ -984,6 +1288,9 @@ Return strictly this JSON format with 3 concise, realistic customer statements i
     }
 
     await saveProgressMetadata(db, userId, {
+      company_name: resolvedName || ctx.company_name,
+      company_url: resolvedUrl || ctx.company_url,
+      insights_brand_key: effectiveBrandKey,
       ai_brand_insights: insights,
     });
 
@@ -1036,30 +1343,67 @@ export async function saveCompanyProfileToDb(
     preserveEmptyName?: boolean | undefined;
   },
 ): Promise<{ company_name: string | null; company_url: string | null }> {
-  const { ctx } = await loadBrandUserContext(db, userId, input.emailHint);
+  const { ctx, settingsProgress } = await loadBrandUserContext(db, userId, input.emailHint);
   const nextNameRaw = input.company_name?.trim() ?? "";
   const nextUrlRaw = input.company_url?.trim() ?? "";
 
-  const resolvedName = nextNameRaw || (input.preserveEmptyName ? ctx.company_name : null) || null;
-  const resolvedUrl = nextUrlRaw || (input.preserveEmptyName ? ctx.company_url : null) || null;
+  const prevNameNorm = (ctx.company_name ?? "").trim().toLowerCase();
+  const prevDomainNorm = (domainOf(ctx.company_url) ?? "").toLowerCase();
+  const prevUrlNorm = (ctx.company_url ?? "").trim().toLowerCase();
 
-  const { data: updatedRows, error: updateErr } = await db
+  const resolvedUrl = nextUrlRaw || (input.preserveEmptyName ? ctx.company_url : null) || null;
+  const nextDomainNorm = (domainOf(resolvedUrl) ?? "").toLowerCase();
+  const nextUrlNorm = (resolvedUrl ?? "").trim().toLowerCase();
+
+  const urlOrDomainChanged = Boolean(
+    (prevDomainNorm || prevUrlNorm) &&
+    (nextDomainNorm && prevDomainNorm
+      ? nextDomainNorm !== prevDomainNorm
+      : nextUrlNorm !== prevUrlNorm),
+  );
+
+  // Only preserve a previously saved company name when the caller omitted it for the SAME website/domain.
+  const resolvedName =
+    nextNameRaw ||
+    (input.preserveEmptyName && !urlOrDomainChanged ? ctx.company_name : null) ||
+    null;
+  const nextNameNorm = (resolvedName ?? "").trim().toLowerCase();
+
+  const hadPrevBrand = Boolean(prevNameNorm || prevDomainNorm || prevUrlNorm);
+  const nameChanged = prevNameNorm !== nextNameNorm;
+  const brandChanged = hadPrevBrand && (urlOrDomainChanged || nameChanged);
+  const nextBrandKey = buildBrandKey(resolvedName, resolvedUrl);
+
+  const blob = parseProgressBrandBlob(settingsProgress);
+  const prevInsightsBrandKey =
+    typeof blob["insights_brand_key"] === "string" ? blob["insights_brand_key"] : null;
+  const insightsStale = prevInsightsBrandKey !== nextBrandKey;
+
+  const writeDb = await getAdminOrUserDb(db);
+
+  const profilePatch: {
+    company_name: string | null;
+    company_url: string | null;
+    has_completed_brand_baseline?: boolean;
+  } = {
+    company_name: resolvedName,
+    company_url: resolvedUrl,
+    ...(brandChanged && ctx.supportsBaselineColumn ? { has_completed_brand_baseline: false } : {}),
+  };
+
+  const { data: updatedRows, error: updateErr } = await writeDb
     .from("profiles")
-    .update({
-      company_name: resolvedName,
-      company_url: resolvedUrl,
-    })
+    .update(profilePatch)
     .eq("id", userId)
     .select("id");
 
   if (updateErr || !updatedRows?.length) {
     const email = ctx.email || `${userId}@users.local`;
-    const { error: upsertErr } = await db.from("profiles").upsert(
+    const { error: upsertErr } = await writeDb.from("profiles").upsert(
       {
         id: userId,
         email,
-        company_name: resolvedName,
-        company_url: resolvedUrl,
+        ...profilePatch,
       },
       { onConflict: "id" },
     );
@@ -1068,10 +1412,58 @@ export async function saveCompanyProfileToDb(
     }
   }
 
-  await saveProgressMetadata(db, userId, {
-    company_name: resolvedName,
-    company_url: resolvedUrl,
-  });
+  if (brandChanged) {
+    bumpBrandEpoch(userId);
+    getBrandLoops().delete(userId);
+    await purgeBrandTables(db, userId, { mentions: true, insights: true });
+  } else {
+    // Also clean up any legacy unlabelled rows from a prior brand switch before this fix.
+    const { mentions: existingMentions } = await readStoredMentions(db, userId, settingsProgress);
+    const staleResult = await detectAndPurgeStaleBrandState(
+      db,
+      {
+        ...ctx,
+        company_name: resolvedName,
+        company_url: resolvedUrl,
+      },
+      settingsProgress,
+      existingMentions,
+    );
+    if (!staleResult.purgedMentionsOrBrand && insightsStale) {
+      await purgeBrandTables(db, userId, { insights: true });
+    }
+  }
+
+  await saveProgressMetadata(
+    db,
+    userId,
+    {
+      company_name: resolvedName,
+      company_url: resolvedUrl,
+      ...(brandChanged
+        ? {
+            mentions_brand_key: nextBrandKey,
+            insights_brand_key: null,
+            has_completed_brand_baseline: false,
+            last_scraped_at: null,
+            baseline_running: false,
+            baseline_error: null,
+            baseline_progress: null,
+            mentions: [],
+            recommendations: [],
+            recommendations_generated_at: null,
+            recommendations_mention_count: 0,
+            ai_brand_insights: null,
+          }
+        : insightsStale
+          ? {
+              insights_brand_key: null,
+              ai_brand_insights: null,
+            }
+          : {}),
+    },
+    brandChanged ? { brand_listening_date: null } : {},
+  );
 
   return {
     company_name: resolvedName,

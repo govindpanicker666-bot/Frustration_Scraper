@@ -37,6 +37,8 @@ export function CompanyBrandCard() {
       await Promise.all([
         qc.invalidateQueries({ queryKey: ["company_profile"] }),
         qc.invalidateQueries({ queryKey: ["brand_listening"] }),
+        qc.invalidateQueries({ queryKey: ["ai_brand_insights"] }),
+        qc.invalidateQueries({ queryKey: ["brand_recommendations"] }),
       ]);
       toast.success("Company brand saved");
     },

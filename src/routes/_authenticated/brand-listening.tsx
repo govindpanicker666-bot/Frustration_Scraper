@@ -28,7 +28,6 @@ import { Badge } from "@/components/ui/badge";
 import { Button } from "@/components/ui/button";
 import { Progress } from "@/components/ui/progress";
 import { Skeleton } from "@/components/ui/skeleton";
-import { Tabs, TabsContent, TabsList, TabsTrigger } from "@/components/ui/tabs";
 import {
   generateAiBrandBaselineFn,
   getBrandHealthRecommendations,
@@ -75,14 +74,14 @@ function BrandListeningPage() {
   const scanBrand = useServerFn(scanOwnBrandMentions);
   const qc = useQueryClient();
   const [startingScan, setStartingScan] = useState(false);
-  const [activeTab, setActiveTab] = useState<"real" | "ai">("real");
-  const autoTriggeredRef = useRef(false);
+  const autoTriggeredBrandRef = useRef<string | null>(null);
   const prevRunningRef = useRef(false);
 
   const brandQuery = useQuery({
     queryKey: ["brand_listening"],
     queryFn: () => fetchBrandData(),
-    staleTime: 10_000,
+    staleTime: 0,
+    refetchOnMount: "always",
     refetchInterval: (query) => {
       const d = query.state.data;
       if (!d) return false;
@@ -102,6 +101,7 @@ function BrandListeningPage() {
   const mentions = useMemo(() => state?.mentions ?? [], [state?.mentions]);
   const summary = useMemo(() => summarizeBrandMentions(mentions), [mentions]);
   const hasBrandProfile = Boolean(state?.company_name || state?.company_url);
+  const brandKey = `${(state?.company_name ?? "").trim().toLowerCase()}|${(state?.company_url ?? "").trim().toLowerCase()}`;
   const isBaselinePending = Boolean(state && state.has_completed_brand_baseline === false);
   const isScanActive = Boolean(startingScan || state?.baseline_running);
 
@@ -135,9 +135,9 @@ function BrandListeningPage() {
       hasBrandProfile &&
       !state.baseline_running &&
       !state.baseline_error &&
-      !autoTriggeredRef.current
+      autoTriggeredBrandRef.current !== brandKey
     ) {
-      autoTriggeredRef.current = true;
+      autoTriggeredBrandRef.current = brandKey;
       void triggerBrandScan(true);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -146,6 +146,7 @@ function BrandListeningPage() {
     state?.baseline_running,
     state?.baseline_error,
     hasBrandProfile,
+    brandKey,
   ]);
 
   useEffect(() => {
@@ -155,6 +156,7 @@ function BrandListeningPage() {
 
     if (wasRunning && !isNowRunning && state && !state.baseline_error) {
       void qc.invalidateQueries({ queryKey: ["brand_recommendations"] });
+      void qc.invalidateQueries({ queryKey: ["ai_brand_insights"] });
     }
   }, [state?.baseline_running, state?.baseline_error, state, qc]);
 
@@ -281,186 +283,158 @@ function BrandListeningPage() {
             </div>
           )}
         </section>
+      ) : mentions.length === 0 ? (
+        <AiMarketAnalysisView
+          brandKey={brandKey}
+          hasBrandProfile={hasBrandProfile}
+          mentionCount={mentions.length}
+          initialInsights={state?.ai_brand_insights ?? null}
+        />
       ) : (
-        <Tabs
-          value={activeTab}
-          onValueChange={(v) => setActiveTab(v === "ai" ? "ai" : "real")}
-          className="space-y-6"
-        >
-          <TabsList>
-            <TabsTrigger value="real">Real Mentions</TabsTrigger>
-            <TabsTrigger value="ai">AI Market Analysis</TabsTrigger>
-          </TabsList>
+        <div className="space-y-6">
+          <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
+            <div className="glass p-5">
+              <div className="text-xs text-muted-foreground">Total Mentions</div>
+              <div className="mt-2 font-mono text-2xl font-semibold tabular-nums">
+                {formatStatValue(summary.total)}
+              </div>
+            </div>
+            <div className="glass p-5">
+              <div className="text-xs text-muted-foreground">Positive Share</div>
+              <div className="mt-2 font-mono text-2xl font-semibold text-emerald-600 tabular-nums dark:text-emerald-400">
+                {summary.positiveShare === null ? "-" : `${summary.positiveShare}%`}
+              </div>
+            </div>
+            <div className="glass p-5">
+              <div className="text-xs text-muted-foreground">Avg Sentiment (-10 to +10)</div>
+              <div className="mt-2 font-mono text-2xl font-semibold tabular-nums">
+                {formattedAvgScore}
+              </div>
+            </div>
+            <div className="glass p-5">
+              <div className="text-xs text-muted-foreground">Negative Alerts</div>
+              <div className="mt-2 font-mono text-2xl font-semibold text-red-600 tabular-nums dark:text-red-400">
+                {formatStatValue(summary.negative)}
+              </div>
+            </div>
+          </div>
 
-          <TabsContent value="real" className="space-y-6">
-            <div className="grid gap-4 sm:grid-cols-2 lg:grid-cols-4">
-              <div className="glass p-5">
-                <div className="text-xs text-muted-foreground">Total Mentions</div>
-                <div className="mt-2 font-mono text-2xl font-semibold tabular-nums">
-                  {formatStatValue(summary.total)}
+          <div className="grid gap-6 lg:grid-cols-2">
+            <div className="glass p-6">
+              <h2 className="mb-1 text-lg font-bold">Sentiment Breakdown</h2>
+              <p className="mb-4 text-sm text-muted-foreground">
+                Positive, neutral, and negative mentions scored from -10 to +10
+              </p>
+              <div className="grid items-center gap-4 sm:grid-cols-[1fr_180px]">
+                <div className="h-60">
+                  <ResponsiveContainer>
+                    <PieChart>
+                      <Pie
+                        data={summary.sentimentBreakdown.filter((s) => s.value > 0)}
+                        dataKey="value"
+                        nameKey="name"
+                        innerRadius={52}
+                        outerRadius={84}
+                        paddingAngle={2}
+                      >
+                        {summary.sentimentBreakdown
+                          .filter((s) => s.value > 0)
+                          .map((entry) => (
+                            <Cell key={entry.key} fill={entry.color} />
+                          ))}
+                      </Pie>
+                      <Tooltip
+                        contentStyle={{
+                          background: "var(--popover)",
+                          border: "1px solid var(--border)",
+                          borderRadius: 8,
+                        }}
+                      />
+                    </PieChart>
+                  </ResponsiveContainer>
                 </div>
-              </div>
-              <div className="glass p-5">
-                <div className="text-xs text-muted-foreground">Positive Share</div>
-                <div className="mt-2 font-mono text-2xl font-semibold text-emerald-600 tabular-nums dark:text-emerald-400">
-                  {summary.positiveShare === null ? "-" : `${summary.positiveShare}%`}
-                </div>
-              </div>
-              <div className="glass p-5">
-                <div className="text-xs text-muted-foreground">Avg Sentiment (-10 to +10)</div>
-                <div className="mt-2 font-mono text-2xl font-semibold tabular-nums">
-                  {formattedAvgScore}
-                </div>
-              </div>
-              <div className="glass p-5">
-                <div className="text-xs text-muted-foreground">Negative Alerts</div>
-                <div className="mt-2 font-mono text-2xl font-semibold text-red-600 tabular-nums dark:text-red-400">
-                  {formatStatValue(summary.negative)}
+                <div className="space-y-3 text-sm">
+                  {summary.sentimentBreakdown.map((item) => {
+                    const pct =
+                      summary.total > 0 ? Math.round((item.value / summary.total) * 100) : 0;
+                    return (
+                      <div key={item.key} className="flex items-center justify-between gap-3">
+                        <div className="flex items-center gap-2">
+                          <span
+                            className="h-2.5 w-2.5 shrink-0 rounded-sm"
+                            style={{ backgroundColor: item.color }}
+                          />
+                          <span>{item.name}</span>
+                        </div>
+                        <span className="font-mono text-xs text-muted-foreground tabular-nums">
+                          {item.value} ({pct}%)
+                        </span>
+                      </div>
+                    );
+                  })}
                 </div>
               </div>
             </div>
 
-            {summary.total === 0 ? (
-              <div className="glass flex flex-col items-center justify-center gap-3 p-10 text-center">
-                <p className="text-sm font-medium text-muted-foreground">
+            <div className="glass p-6">
+              <h2 className="mb-1 text-lg font-bold">Mention Volume by Platform</h2>
+              <p className="mb-4 text-sm text-muted-foreground">
+                Where customers are talking about your brand
+              </p>
+              {summary.byPlatform.length === 0 ? (
+                <p className="py-12 text-center text-sm text-muted-foreground">
                   Not enough public data to build a chart yet. Check back later.
                 </p>
-                <Button variant="outline" size="sm" onClick={() => setActiveTab("ai")}>
-                  <Sparkles className="h-4 w-4" />
-                  View AI Market Analysis
-                </Button>
-              </div>
-            ) : (
-              <div className="grid gap-6 lg:grid-cols-2">
-                <div className="glass p-6">
-                  <h2 className="mb-1 text-lg font-bold">Sentiment Breakdown</h2>
-                  <p className="mb-4 text-sm text-muted-foreground">
-                    Positive, neutral, and negative mentions scored from -10 to +10
-                  </p>
-                  <div className="grid items-center gap-4 sm:grid-cols-[1fr_180px]">
-                    <div className="h-60">
-                      <ResponsiveContainer>
-                        <PieChart>
-                          <Pie
-                            data={summary.sentimentBreakdown.filter((s) => s.value > 0)}
-                            dataKey="value"
-                            nameKey="name"
-                            innerRadius={52}
-                            outerRadius={84}
-                            paddingAngle={2}
-                          >
-                            {summary.sentimentBreakdown
-                              .filter((s) => s.value > 0)
-                              .map((entry) => (
-                                <Cell key={entry.key} fill={entry.color} />
-                              ))}
-                          </Pie>
-                          <Tooltip
-                            contentStyle={{
-                              background: "var(--popover)",
-                              border: "1px solid var(--border)",
-                              borderRadius: 8,
-                            }}
+              ) : (
+                <div className="h-60">
+                  <ResponsiveContainer>
+                    <BarChart data={summary.byPlatform}>
+                      <XAxis dataKey="name" stroke="var(--muted-foreground)" fontSize={12} />
+                      <YAxis allowDecimals={false} stroke="var(--muted-foreground)" fontSize={12} />
+                      <Tooltip
+                        cursor={{ fill: "var(--secondary)" }}
+                        contentStyle={{
+                          background: "var(--popover)",
+                          border: "1px solid var(--border)",
+                          borderRadius: 8,
+                        }}
+                      />
+                      <Bar dataKey="mentions" radius={[6, 6, 0, 0]}>
+                        {summary.byPlatform.map((_, i) => (
+                          <Cell
+                            key={i}
+                            fill={PLATFORM_BAR_COLORS[i % PLATFORM_BAR_COLORS.length]}
                           />
-                        </PieChart>
-                      </ResponsiveContainer>
-                    </div>
-                    <div className="space-y-3 text-sm">
-                      {summary.sentimentBreakdown.map((item) => {
-                        const pct =
-                          summary.total > 0 ? Math.round((item.value / summary.total) * 100) : 0;
-                        return (
-                          <div key={item.key} className="flex items-center justify-between gap-3">
-                            <div className="flex items-center gap-2">
-                              <span
-                                className="h-2.5 w-2.5 shrink-0 rounded-sm"
-                                style={{ backgroundColor: item.color }}
-                              />
-                              <span>{item.name}</span>
-                            </div>
-                            <span className="font-mono text-xs text-muted-foreground tabular-nums">
-                              {item.value} ({pct}%)
-                            </span>
-                          </div>
-                        );
-                      })}
-                    </div>
-                  </div>
+                        ))}
+                      </Bar>
+                    </BarChart>
+                  </ResponsiveContainer>
                 </div>
-
-                <div className="glass p-6">
-                  <h2 className="mb-1 text-lg font-bold">Mention Volume by Platform</h2>
-                  <p className="mb-4 text-sm text-muted-foreground">
-                    Where customers are talking about your brand
-                  </p>
-                  {summary.byPlatform.length === 0 ? (
-                    <p className="py-12 text-center text-sm text-muted-foreground">
-                      Not enough public data to build a chart yet. Check back later.
-                    </p>
-                  ) : (
-                    <div className="h-60">
-                      <ResponsiveContainer>
-                        <BarChart data={summary.byPlatform}>
-                          <XAxis dataKey="name" stroke="var(--muted-foreground)" fontSize={12} />
-                          <YAxis
-                            allowDecimals={false}
-                            stroke="var(--muted-foreground)"
-                            fontSize={12}
-                          />
-                          <Tooltip
-                            cursor={{ fill: "var(--secondary)" }}
-                            contentStyle={{
-                              background: "var(--popover)",
-                              border: "1px solid var(--border)",
-                              borderRadius: 8,
-                            }}
-                          />
-                          <Bar dataKey="mentions" radius={[6, 6, 0, 0]}>
-                            {summary.byPlatform.map((_, i) => (
-                              <Cell
-                                key={i}
-                                fill={PLATFORM_BAR_COLORS[i % PLATFORM_BAR_COLORS.length]}
-                              />
-                            ))}
-                          </Bar>
-                        </BarChart>
-                      </ResponsiveContainer>
-                    </div>
-                  )}
-                </div>
-              </div>
-            )}
-
-            <div className="grid gap-6 lg:grid-cols-2">
-              <FeedbackListCard
-                title="Top Positive Feedback"
-                tone="positive"
-                items={summary.topPositive.slice(0, 8)}
-                emptyText="No positive mentions (+2 to +10) captured yet."
-              />
-              <FeedbackListCard
-                title="Top Negative Feedback"
-                tone="negative"
-                items={summary.topNegative.slice(0, 8)}
-                emptyText="No negative mentions (-10 to -2) captured yet."
-              />
+              )}
             </div>
+          </div>
 
-            <BrandHealthRecommendations
-              hasMentions={mentions.length > 0}
-              mentionCount={mentions.length}
+          <div className="grid gap-6 lg:grid-cols-2">
+            <FeedbackListCard
+              title="Top Positive Feedback"
+              tone="positive"
+              items={summary.topPositive.slice(0, 8)}
+              emptyText="No positive mentions (+2 to +10) captured yet."
             />
-          </TabsContent>
+            <FeedbackListCard
+              title="Top Negative Feedback"
+              tone="negative"
+              items={summary.topNegative.slice(0, 8)}
+              emptyText="No negative mentions (-10 to -2) captured yet."
+            />
+          </div>
 
-          <TabsContent value="ai" className="space-y-6">
-            <AiMarketAnalysisTab
-              hasBrandProfile={hasBrandProfile}
-              mentionCount={mentions.length}
-              initialInsights={state?.ai_brand_insights ?? null}
-              isActive={activeTab === "ai"}
-            />
-          </TabsContent>
-        </Tabs>
+          <BrandHealthRecommendations
+            brandKey={brandKey}
+            hasMentions={mentions.length > 0}
+            mentionCount={mentions.length}
+          />
+        </div>
       )}
     </div>
   );
@@ -542,15 +516,17 @@ function FeedbackListCard({
 }
 
 function BrandHealthRecommendations({
+  brandKey,
   hasMentions,
   mentionCount,
 }: {
+  brandKey: string;
   hasMentions: boolean;
   mentionCount: number;
 }) {
   const gen = useServerFn(getBrandHealthRecommendations);
   const q = useQuery({
-    queryKey: ["brand_recommendations", mentionCount],
+    queryKey: ["brand_recommendations", brandKey, mentionCount],
     queryFn: () => gen({ data: { force: false } }),
     enabled: hasMentions,
     staleTime: Infinity,
@@ -563,7 +539,7 @@ function BrandHealthRecommendations({
     setForcing(true);
     try {
       const r = await gen({ data: { force: true } });
-      qc.setQueryData(["brand_recommendations", mentionCount], r);
+      qc.setQueryData(["brand_recommendations", brandKey, mentionCount], r);
       if (r.error) toast.error(r.error);
     } finally {
       setForcing(false);
@@ -620,23 +596,23 @@ function BrandHealthRecommendations({
   );
 }
 
-function AiMarketAnalysisTab({
+function AiMarketAnalysisView({
+  brandKey,
   hasBrandProfile,
   mentionCount,
   initialInsights,
-  isActive,
 }: {
+  brandKey: string;
   hasBrandProfile: boolean;
   mentionCount: number;
   initialInsights: AiBrandInsights | null;
-  isActive: boolean;
 }) {
   const genBaseline = useServerFn(generateAiBrandBaselineFn);
   const qc = useQueryClient();
   const [forcing, setForcing] = useState(false);
 
   const baselineQuery = useQuery({
-    queryKey: ["ai_brand_insights", mentionCount],
+    queryKey: ["ai_brand_insights", brandKey, mentionCount],
     queryFn: async () => {
       const res = await genBaseline({ data: { force: false } });
       if (res.insights) {
@@ -648,7 +624,7 @@ function AiMarketAnalysisTab({
       }
       return res;
     },
-    enabled: isActive && hasBrandProfile && mentionCount < 3 && !initialInsights,
+    enabled: hasBrandProfile && mentionCount === 0 && !initialInsights,
     staleTime: Infinity,
   });
 
@@ -660,7 +636,7 @@ function AiMarketAnalysisTab({
     setForcing(true);
     try {
       const res = await genBaseline({ data: { force: true } });
-      qc.setQueryData(["ai_brand_insights", mentionCount], res);
+      qc.setQueryData(["ai_brand_insights", brandKey, mentionCount], res);
       if (res.insights) {
         qc.setQueryData(["brand_listening"], (prev: unknown) =>
           prev && typeof prev === "object"
@@ -728,7 +704,7 @@ function AiMarketAnalysisTab({
         <div className="glass space-y-3 p-8 text-center">
           <p className="text-sm text-muted-foreground">
             {mentionCount >= 3
-              ? "Your brand already has 3 or more real public mentions. Check the Real Mentions tab for verified customer feedback."
+              ? "Your brand already has 3 or more real public mentions."
               : "No AI Market Analysis hypotheses generated yet."}
           </p>
           {mentionCount < 3 && (

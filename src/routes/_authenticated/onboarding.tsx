@@ -12,6 +12,16 @@ import {
   type DetectedCompetitor,
 } from "@/lib/leads.functions";
 import { competitorsQuery } from "@/lib/queries";
+import {
+  AlertDialog,
+  AlertDialogAction,
+  AlertDialogCancel,
+  AlertDialogContent,
+  AlertDialogDescription,
+  AlertDialogFooter,
+  AlertDialogHeader,
+  AlertDialogTitle,
+} from "@/components/ui/alert-dialog";
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
@@ -43,20 +53,25 @@ function Onboarding() {
   const [saving, setSaving] = useState(false);
   const [list, setList] = useState<(DetectedCompetitor & { on: boolean })[]>([]);
   const [manual, setManual] = useState("");
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
+  const [deletingAll, setDeletingAll] = useState(false);
 
   const profileQuery = useQuery({
     queryKey: ["company_profile"],
     queryFn: () => fetchProfile(),
-    staleTime: 30_000,
+    staleTime: 0,
+    refetchOnMount: "always",
   });
 
-  const prefilledRef = useRef(false);
+  const lastSyncedProfileRef = useRef<string | null>(null);
 
   useEffect(() => {
-    if (!profileQuery.data || prefilledRef.current) return;
-    prefilledRef.current = true;
-    setName((prev) => prev || profileQuery.data?.company_name || "");
-    setUrl((prev) => prev || profileQuery.data?.company_url || "");
+    if (!profileQuery.data) return;
+    const key = `${profileQuery.data.company_name ?? ""}|${profileQuery.data.company_url ?? ""}`;
+    if (lastSyncedProfileRef.current === key) return;
+    lastSyncedProfileRef.current = key;
+    setName(profileQuery.data.company_name ?? "");
+    setUrl(profileQuery.data.company_url ?? "");
   }, [profileQuery.data]);
 
   async function run(e: React.FormEvent) {
@@ -69,6 +84,8 @@ function Onboarding() {
       await Promise.all([
         qc.invalidateQueries({ queryKey: ["company_profile"] }),
         qc.invalidateQueries({ queryKey: ["brand_listening"] }),
+        qc.invalidateQueries({ queryKey: ["ai_brand_insights"] }),
+        qc.invalidateQueries({ queryKey: ["brand_recommendations"] }),
       ]);
       if (r.error) toast.error(r.error);
       setList(r.competitors.map((c) => ({ ...c, on: true })));
@@ -124,6 +141,43 @@ function Onboarding() {
   async function remove(id: string) {
     await supabase.from("competitors").delete().eq("id", id);
     qc.invalidateQueries({ queryKey: ["competitors"] });
+  }
+
+  async function confirmDeleteAllCompetitors() {
+    setDeletingAll(true);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) {
+        toast.error("Session expired — please sign in again.");
+        return;
+      }
+
+      const res = await fetch("/api/competitors", {
+        method: "DELETE",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const payload = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !payload.ok) {
+        throw new Error(payload.error || "Failed to delete competitors");
+      }
+
+      setConfirmDeleteAll(false);
+      toast.success("All competitors deleted");
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["competitors"] }),
+        qc.invalidateQueries({ queryKey: ["leads"] }),
+        qc.invalidateQueries({ queryKey: ["stats"] }),
+        qc.invalidateQueries({ queryKey: ["competitor_news"] }),
+      ]);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not delete competitors");
+    } finally {
+      setDeletingAll(false);
+    }
   }
 
   return (
@@ -219,7 +273,20 @@ function Onboarding() {
 
       {existing.length > 0 && (
         <div className="glass p-5">
-          <h2 className="mb-3 font-bold">Currently tracking ({existing.length})</h2>
+          <div className="mb-3 flex flex-wrap items-center justify-between gap-2">
+            <h2 className="font-bold">Currently tracking ({existing.length})</h2>
+            <Button
+              type="button"
+              variant="ghost"
+              size="sm"
+              disabled={deletingAll}
+              onClick={() => setConfirmDeleteAll(true)}
+              className="h-8 text-muted-foreground hover:text-destructive"
+            >
+              <Trash2 className="h-3.5 w-3.5" />
+              Delete All Competitors
+            </Button>
+          </div>
           <div className="flex flex-wrap gap-2">
             {existing.map((c) => (
               <span
@@ -235,6 +302,34 @@ function Onboarding() {
           </div>
         </div>
       )}
+
+      <AlertDialog
+        open={confirmDeleteAll}
+        onOpenChange={(isOpen) => !isOpen && !deletingAll && setConfirmDeleteAll(false)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will delete all tracked competitors and their associated leads.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingAll}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmDeleteAllCompetitors();
+              }}
+              disabled={deletingAll}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deletingAll ? <Loader2 className="animate-spin" /> : <Trash2 />}
+              {deletingAll ? "Deleting..." : "Delete All Competitors"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
     </div>
   );
 }

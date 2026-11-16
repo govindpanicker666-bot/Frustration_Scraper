@@ -4,8 +4,6 @@ import { useServerFn } from "@tanstack/react-start";
 import { useEffect, useMemo, useState } from "react";
 import {
   Activity,
-  ArrowDownRight,
-  ArrowUpRight,
   ExternalLink,
   Eye,
   LoaderCircle,
@@ -64,7 +62,15 @@ function ScoreGauge({ score }: { score: number }) {
   return (
     <div className="relative flex h-32 w-32 items-center justify-center">
       <svg viewBox="0 0 100 100" className="-rotate-90">
-        <circle cx="50" cy="50" r="42" fill="none" stroke="currentColor" strokeWidth="8" className="text-muted/60" />
+        <circle
+          cx="50"
+          cy="50"
+          r="42"
+          fill="none"
+          stroke="currentColor"
+          strokeWidth="8"
+          className="text-muted/60"
+        />
         <circle
           cx="50"
           cy="50"
@@ -80,7 +86,9 @@ function ScoreGauge({ score }: { score: number }) {
       </svg>
       <div className="absolute text-center">
         <div className="font-display text-3xl font-bold tabular-nums">{score}</div>
-        <div className="text-[10px] uppercase tracking-widest text-muted-foreground">out of 100</div>
+        <div className="text-[10px] uppercase tracking-widest text-muted-foreground">
+          out of 100
+        </div>
       </div>
     </div>
   );
@@ -98,14 +106,17 @@ function AIVisibilityPage() {
     queryKey: ["ai_visibility_scans"],
     queryFn: () => fetchScans(),
   });
-  const scans = (scanQuery.data?.scans ?? []) as ScanRow[];
+  const scans = useMemo(() => (scanQuery.data?.scans ?? []) as ScanRow[], [scanQuery.data?.scans]);
   const savedBrandName = scanQuery.data?.brandName ?? "";
-  const savedCompetitorNames = scanQuery.data?.competitorNames ?? [];
+  const savedCompetitorNames = useMemo(
+    () => scanQuery.data?.competitorNames ?? [],
+    [scanQuery.data?.competitorNames],
+  );
 
   useEffect(() => {
     if (!brandName && savedBrandName) setBrandName(savedBrandName);
     if (!competitorNames && savedCompetitorNames.length) {
-      setCompetitorNames(savedCompetitorNames.join(", "));
+      setCompetitorNames(savedCompetitorNames.slice(0, 20).join(", "));
     }
   }, [brandName, competitorNames, savedBrandName, savedCompetitorNames]);
 
@@ -113,11 +124,7 @@ function AIVisibilityPage() {
   const latestRun = useMemo(() => {
     if (!latest) return [] as ScanRow[];
     const key = latest.brand_name;
-    return scans.filter(
-      (row) =>
-        row.brand_name === key &&
-        row.created_at === latest.created_at,
-    );
+    return scans.filter((row) => row.brand_name === key && row.created_at === latest.created_at);
   }, [latest, scans]);
 
   const metrics = useMemo(() => {
@@ -133,7 +140,11 @@ function AIVisibilityPage() {
     const negative = mentionedRows.filter((row) => row.sentiment === "negative").length;
     const ranked = rows.filter((row) => row.rank_position !== null);
     const averageRank = ranked.length
-      ? Number((ranked.reduce((sum, row) => sum + (row.rank_position ?? 0), 0) / ranked.length).toFixed(1))
+      ? Number(
+          (ranked.reduce((sum, row) => sum + (row.rank_position ?? 0), 0) / ranked.length).toFixed(
+            1,
+          ),
+        )
       : null;
     return { total, mentioned, averageScore, positive, neutral, negative, averageRank };
   }, [latestRun]);
@@ -158,11 +169,12 @@ function AIVisibilityPage() {
     }
     setRunning(true);
     try {
-      const competitors = (competitorNames.trim()
-        ? competitorNames.split(",")
-        : savedCompetitorNames)
+      const competitors = (
+        competitorNames.trim() ? competitorNames.split(",") : savedCompetitorNames
+      )
         .map((name) => name.trim())
-        .filter(Boolean);
+        .filter(Boolean)
+        .slice(0, 20);
       const result = await executeScan({
         data: { brand_name: selectedBrand, competitor_names: competitors },
       });
@@ -194,7 +206,9 @@ function AIVisibilityPage() {
           <div className="mb-2 flex items-center gap-2 text-xs font-medium uppercase tracking-[0.18em] text-primary">
             <Radar className="h-4 w-4" /> AI search intelligence
           </div>
-          <h1 className="font-display text-2xl font-semibold tracking-tight">AI Visibility Tracker</h1>
+          <h1 className="font-display text-2xl font-semibold tracking-tight">
+            AI Visibility Tracker
+          </h1>
           <p className="mt-1 max-w-2xl text-sm text-muted-foreground">
             See whether AI assistants mention your brand when buyers compare solutions.
           </p>
@@ -206,7 +220,9 @@ function AIVisibilityPage() {
 
       <section className="glass grid gap-4 p-5 lg:grid-cols-[1.1fr_1fr_auto] lg:items-end">
         <div className="space-y-2">
-          <label className="text-sm font-medium" htmlFor="visibility-brand">Your brand</label>
+          <label className="text-sm font-medium" htmlFor="visibility-brand">
+            Your brand
+          </label>
           <Input
             id="visibility-brand"
             placeholder="e.g. Acme"
@@ -216,7 +232,9 @@ function AIVisibilityPage() {
           />
         </div>
         <div className="space-y-2">
-          <label className="text-sm font-medium" htmlFor="visibility-competitors">Competitors (comma separated)</label>
+          <label className="text-sm font-medium" htmlFor="visibility-competitors">
+            Competitors (comma separated, max 20)
+          </label>
           <Input
             id="visibility-competitors"
             placeholder="e.g. Competitor A, Competitor B"
@@ -226,21 +244,30 @@ function AIVisibilityPage() {
           />
         </div>
         <Button onClick={handleScan} disabled={running} className="min-w-32">
-          {running ? <LoaderCircle className="h-4 w-4 animate-spin" /> : <Sparkles className="h-4 w-4" />}
+          {running ? (
+            <LoaderCircle className="h-4 w-4 animate-spin" />
+          ) : (
+            <Sparkles className="h-4 w-4" />
+          )}
           {running ? "Scanning…" : "Run Scan"}
         </Button>
       </section>
 
       {scanQuery.isLoading ? (
         <div className="grid gap-4 md:grid-cols-2 xl:grid-cols-4">
-          {[1, 2, 3, 4].map((item) => <Skeleton key={item} className="h-36 rounded-xl" />)}
+          {[1, 2, 3, 4].map((item) => (
+            <Skeleton key={item} className="h-36 rounded-xl" />
+          ))}
         </div>
       ) : latestRun.length === 0 ? (
         <section className="glass flex flex-col items-center gap-3 px-6 py-16 text-center">
-          <div className="rounded-2xl bg-primary/10 p-4 text-primary"><Eye className="h-7 w-7" /></div>
+          <div className="rounded-2xl bg-primary/10 p-4 text-primary">
+            <Eye className="h-7 w-7" />
+          </div>
           <h2 className="text-lg font-semibold">No visibility data yet</h2>
           <p className="max-w-md text-sm text-muted-foreground">
-            Run your first scan to test ten buyer prompts against Gemini using web search results from the app.
+            Run your first scan to test ten buyer prompts against Gemini using web search results
+            from the app.
           </p>
         </section>
       ) : (
@@ -248,21 +275,43 @@ function AIVisibilityPage() {
           <section className="grid gap-4 sm:grid-cols-2 xl:grid-cols-4">
             <div className="glass flex items-center gap-4 p-5">
               <ScoreGauge score={metrics.averageScore} />
-              <div><p className="text-sm text-muted-foreground">Visibility score</p><p className="mt-1 text-xs text-muted-foreground">Average across prompts</p></div>
+              <div>
+                <p className="text-sm text-muted-foreground">Visibility score</p>
+                <p className="mt-1 text-xs text-muted-foreground">Average across prompts</p>
+              </div>
             </div>
             <div className="glass p-5">
-              <div className="flex items-center justify-between text-muted-foreground"><span className="text-sm">Mention rate</span><Target className="h-4 w-4" /></div>
-              <div className="mt-3 font-display text-3xl font-bold tabular-nums">{metrics.total ? Math.round((metrics.mentioned / metrics.total) * 100) : 0}%</div>
-              <p className="mt-1 text-xs text-muted-foreground">{metrics.mentioned} of {metrics.total} prompts mentioned your brand</p>
+              <div className="flex items-center justify-between text-muted-foreground">
+                <span className="text-sm">Mention rate</span>
+                <Target className="h-4 w-4" />
+              </div>
+              <div className="mt-3 font-display text-3xl font-bold tabular-nums">
+                {metrics.total ? Math.round((metrics.mentioned / metrics.total) * 100) : 0}%
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                {metrics.mentioned} of {metrics.total} prompts mentioned your brand
+              </p>
             </div>
             <div className="glass p-5">
-              <div className="flex items-center justify-between text-muted-foreground"><span className="text-sm">Average position</span><Trophy className="h-4 w-4" /></div>
-              <div className="mt-3 font-display text-3xl font-bold tabular-nums">{metrics.averageRank ?? "—"}</div>
-              <p className="mt-1 text-xs text-muted-foreground">First distinct brand mention order</p>
+              <div className="flex items-center justify-between text-muted-foreground">
+                <span className="text-sm">Average position</span>
+                <Trophy className="h-4 w-4" />
+              </div>
+              <div className="mt-3 font-display text-3xl font-bold tabular-nums">
+                {metrics.averageRank ?? "—"}
+              </div>
+              <p className="mt-1 text-xs text-muted-foreground">
+                First distinct brand mention order
+              </p>
             </div>
             <div className="glass p-5">
-              <div className="flex items-center justify-between text-muted-foreground"><span className="text-sm">Prompts analyzed</span><Search className="h-4 w-4" /></div>
-              <div className="mt-3 font-display text-3xl font-bold tabular-nums">{metrics.total}/10</div>
+              <div className="flex items-center justify-between text-muted-foreground">
+                <span className="text-sm">Prompts analyzed</span>
+                <Search className="h-4 w-4" />
+              </div>
+              <div className="mt-3 font-display text-3xl font-bold tabular-nums">
+                {metrics.total}/10
+              </div>
               <p className="mt-1 text-xs text-muted-foreground">Latest Gemini scan</p>
             </div>
           </section>
@@ -270,19 +319,34 @@ function AIVisibilityPage() {
           <section className="grid gap-5 lg:grid-cols-2">
             <div className="glass p-5">
               <h2 className="font-semibold">Sentiment breakdown</h2>
-              <p className="mb-4 mt-1 text-xs text-muted-foreground">Tone around your brand when mentioned</p>
+              <p className="mb-4 mt-1 text-xs text-muted-foreground">
+                Tone around your brand when mentioned
+              </p>
               {sentimentData.length ? (
                 <div className="h-64">
                   <ResponsiveContainer width="100%" height="100%">
                     <PieChart>
-                      <Pie data={sentimentData} dataKey="value" nameKey="name" innerRadius={62} outerRadius={92} paddingAngle={3}>
-                        {sentimentData.map((entry) => <Cell key={entry.name} fill={entry.fill} />)}
+                      <Pie
+                        data={sentimentData}
+                        dataKey="value"
+                        nameKey="name"
+                        innerRadius={62}
+                        outerRadius={92}
+                        paddingAngle={3}
+                      >
+                        {sentimentData.map((entry) => (
+                          <Cell key={entry.name} fill={entry.fill} />
+                        ))}
                       </Pie>
                       <Tooltip />
                     </PieChart>
                   </ResponsiveContainer>
                 </div>
-              ) : <p className="py-16 text-center text-sm text-muted-foreground">No mentions to classify.</p>}
+              ) : (
+                <p className="py-16 text-center text-sm text-muted-foreground">
+                  No mentions to classify.
+                </p>
+              )}
               <div className="flex justify-center gap-5 text-xs">
                 <span className="text-emerald-500">Positive {metrics.positive}</span>
                 <span className="text-muted-foreground">Neutral {metrics.neutral}</span>
@@ -291,7 +355,9 @@ function AIVisibilityPage() {
             </div>
             <div className="glass p-5">
               <h2 className="font-semibold">Visibility by buyer prompt</h2>
-              <p className="mb-4 mt-1 text-xs text-muted-foreground">Higher scores indicate an earlier brand mention</p>
+              <p className="mb-4 mt-1 text-xs text-muted-foreground">
+                Higher scores indicate an earlier brand mention
+              </p>
               <div className="h-64">
                 <ResponsiveContainer width="100%" height="100%">
                   <BarChart data={rankData} margin={{ top: 8, right: 8, left: -20, bottom: 0 }}>
@@ -299,7 +365,12 @@ function AIVisibilityPage() {
                     <XAxis dataKey="prompt" tickLine={false} axisLine={false} />
                     <YAxis domain={[0, 100]} tickLine={false} axisLine={false} />
                     <Tooltip />
-                    <Bar dataKey="score" name="Visibility score" radius={[5, 5, 0, 0]} fill="var(--chart-1)" />
+                    <Bar
+                      dataKey="score"
+                      name="Visibility score"
+                      radius={[5, 5, 0, 0]}
+                      fill="var(--chart-1)"
+                    />
                   </BarChart>
                 </ResponsiveContainer>
               </div>
@@ -309,11 +380,16 @@ function AIVisibilityPage() {
           <section className="glass overflow-hidden">
             <div className="border-b p-5">
               <h2 className="font-semibold">Buyer prompt results</h2>
-              <p className="mt-1 text-xs text-muted-foreground">The exact query, mention order, and sentiment recorded for each prompt.</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                The exact query, mention order, and sentiment recorded for each prompt.
+              </p>
             </div>
             <div className="divide-y">
               {latestRun.map((row, index) => (
-                <div key={row.id} className="grid gap-3 p-4 md:grid-cols-[1fr_auto_auto] md:items-center">
+                <div
+                  key={row.id}
+                  className="grid gap-3 p-4 md:grid-cols-[1fr_auto_auto] md:items-center"
+                >
                   <div className="min-w-0">
                     <p className="text-xs text-muted-foreground">Prompt {index + 1}</p>
                     <p className="mt-1 text-sm">{row.prompt_text}</p>
@@ -322,12 +398,22 @@ function AIVisibilityPage() {
                     <Badge variant={row.rank_position ? "default" : "outline"}>
                       {row.rank_position ? `Rank #${row.rank_position}` : "Not mentioned"}
                     </Badge>
-                    <Badge variant="outline" className={
-                      row.sentiment === "positive" ? "border-emerald-500/40 text-emerald-600" :
-                      row.sentiment === "negative" ? "border-rose-500/40 text-rose-600" : ""
-                    }>{row.sentiment}</Badge>
+                    <Badge
+                      variant="outline"
+                      className={
+                        row.sentiment === "positive"
+                          ? "border-emerald-500/40 text-emerald-600"
+                          : row.sentiment === "negative"
+                            ? "border-rose-500/40 text-rose-600"
+                            : ""
+                      }
+                    >
+                      {row.sentiment}
+                    </Badge>
                   </div>
-                  <div className="text-right font-mono text-lg font-semibold tabular-nums">{row.visibility_score}</div>
+                  <div className="text-right font-mono text-lg font-semibold tabular-nums">
+                    {row.visibility_score}
+                  </div>
                 </div>
               ))}
             </div>
@@ -336,21 +422,37 @@ function AIVisibilityPage() {
           <section className="glass overflow-hidden">
             <div className="border-b p-5">
               <h2 className="font-semibold">Cited sources</h2>
-              <p className="mt-1 text-xs text-muted-foreground">Search references selected by Gemini from the app's web search results.</p>
+              <p className="mt-1 text-xs text-muted-foreground">
+                Search references selected by Gemini from the app's web search results.
+              </p>
             </div>
             {uniqueCitations.length ? (
               <div className="divide-y">
-                {uniqueCitations.map((citation, index) => (
-                  <a key={citation.url} href={citation.url} target="_blank" rel="noreferrer" className="flex items-center justify-between gap-4 p-4 transition-colors hover:bg-muted/40">
+                {uniqueCitations.map((citation) => (
+                  <a
+                    key={citation.url}
+                    href={citation.url}
+                    target="_blank"
+                    rel="noreferrer"
+                    className="flex items-center justify-between gap-4 p-4 transition-colors hover:bg-muted/40"
+                  >
                     <div className="min-w-0">
-                      <p className="truncate text-sm font-medium">{citation.title || citation.domain}</p>
-                      <p className="truncate text-xs text-muted-foreground">{citation.domain} · {citation.prompt}</p>
+                      <p className="truncate text-sm font-medium">
+                        {citation.title || citation.domain}
+                      </p>
+                      <p className="truncate text-xs text-muted-foreground">
+                        {citation.domain} · {citation.prompt}
+                      </p>
                     </div>
                     <ExternalLink className="h-4 w-4 shrink-0 text-muted-foreground" />
                   </a>
                 ))}
               </div>
-            ) : <p className="p-8 text-center text-sm text-muted-foreground">No source citations were returned for this scan.</p>}
+            ) : (
+              <p className="p-8 text-center text-sm text-muted-foreground">
+                No source citations were returned for this scan.
+              </p>
+            )}
           </section>
         </>
       )}

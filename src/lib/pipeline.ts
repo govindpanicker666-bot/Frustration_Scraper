@@ -113,32 +113,54 @@ export function isFullName(name: string | null | undefined): boolean {
   return parts.length >= 2 && parts.filter((p) => p.replace(/\./g, "").length >= 2).length >= 2;
 }
 
-/** Step 1 gatekeeper. Review sites need a full name; social posts need a live handle. */
+/** Step 1 gatekeeper. Review-site posts remain useful evidence even when the reviewer is anonymous. */
 export function keepReview(
   r: RawReview,
   now: Date = new Date(),
   opts?: { skipRecencyCheck?: boolean },
 ): boolean {
   if (!opts?.skipRecencyCheck && !isRecent(r.published_at, now)) return false;
-  if (isReviewSite(r.platform)) return isFullName(r.reviewer_name);
+  if (isReviewSite(r.platform)) return Boolean(r.source_url);
   return !!r.reviewer_name && r.reviewer_name !== "[deleted]";
 }
 
 export const isLeadWorthy = (score: number) => score >= MIN_LEAD_SCORE;
 
-/** A positive score alone is insufficient: require an explicit negative quote from the post. */
+/** Validate negative evidence while tolerating punctuation and small wording differences in AI quotes. */
 export function isNegativeAssessment(
-  s: { score: number; sentiment?: string; negative_quote?: string },
+  s: { score: number; sentiment?: string; negative_quote?: string; complaint?: string },
   text: string,
 ): boolean {
   const normalize = (value: string) =>
-    value.normalize("NFKC").toLowerCase().replace(/\s+/g, " ").trim();
-  const quote = normalize(s.negative_quote ?? "");
+    value
+      .normalize("NFKC")
+      .toLowerCase()
+      .replace(/[’‘]/g, "'")
+      .replace(/[^\p{L}\p{N}]+/gu, " ")
+      .replace(/\s+/g, " ")
+      .trim();
+
+  const source = normalize(text);
+  const hasSupportingEvidence = (candidate: string | undefined): boolean => {
+    const evidence = normalize(candidate ?? "");
+    if (evidence.length < 3) return false;
+    if (source.includes(evidence)) return true;
+
+    // Gemini occasionally changes punctuation, inserts/removes a small word, or
+    // returns a short complaint phrase instead of a verbatim quote. Require at
+    // least two meaningful words and a strong token overlap to avoid false matches.
+    const tokens = [...new Set(evidence.split(" ").filter((token) => token.length > 1))];
+    if (tokens.length < 2) return false;
+    const sourceTokens = new Set(source.split(" "));
+    const matches = tokens.filter((token) => sourceTokens.has(token)).length;
+    const requiredMatches = tokens.length <= 2 ? tokens.length : Math.ceil(tokens.length * 0.75);
+    return matches >= requiredMatches;
+  };
+
   return (
     isLeadWorthy(s.score) &&
     s.sentiment === "negative" &&
-    quote.length >= 3 &&
-    normalize(text).includes(quote)
+    (hasSupportingEvidence(s.negative_quote) || hasSupportingEvidence(s.complaint))
   );
 }
 
@@ -250,7 +272,9 @@ export function decideLead(x: {
 }): LeadType | null {
   if (x.email) return "email";
   if (x.linkedin) return "linkedin";
-  if (!isReviewSite(x.platform) && x.threadUrl) return "social_signal";
+  // A negative review is still a useful lead when the review URL is the only
+  // available follow-up path; do not require a reviewer email or LinkedIn.
+  if (x.threadUrl) return "social_signal";
   return null;
 }
 

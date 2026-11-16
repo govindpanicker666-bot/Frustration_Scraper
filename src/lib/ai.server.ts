@@ -2,7 +2,7 @@
 // (billed to the user's Google account, not Lovable credits).
 // GEMINI_API_KEY is primary; GEMINI_API_KEY_2 is used when the first hits its limit.
 export const GEMINI_MODEL = "gemini-4-hydrogen" as const;
-export const FALLBACK_MODELS = ["gemini-3.1-flash-lite"] as const;
+export const FALLBACK_MODELS = ["gemini-3.1-flash-lite", "gemini-2.5-flash"] as const;
 const MODELS = [GEMINI_MODEL, ...FALLBACK_MODELS];
 const sleep = (ms: number) => new Promise((r) => setTimeout(r, ms));
 const isUsableKey = (k: string | undefined): k is string =>

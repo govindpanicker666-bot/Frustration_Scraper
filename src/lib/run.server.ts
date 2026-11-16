@@ -94,18 +94,14 @@ export async function scrapeCore(supabase: DB, competitorId: string, platform: P
     return result ? [{ platform: p, status: result.status, count: result.reviews.length }] : [];
   });
   const reviews: RawReview[] = [];
-  const maxPerSource = platform === "all" ? 10 : 60;
-  for (let round = 0; round < maxPerSource && reviews.length < 60; round++) {
-    let addedInRound = false;
-    for (const r of results) {
-      const item = r.reviews[round];
-      if (item) {
-        reviews.push(item);
-        addedInRound = true;
-        if (reviews.length >= 60) break;
-      }
+  // Interleave each source to preserve platform diversity, but do not cap the
+  // combined result set. Each scraper already applies its own provider limits.
+  const maxPerSource = Math.max(0, ...results.map((result) => result.reviews.length));
+  for (let round = 0; round < maxPerSource; round++) {
+    for (const result of results) {
+      const item = result.reviews[round];
+      if (item) reviews.push(item);
     }
-    if (!addedInRound) break;
   }
   return { reviews, sources };
 }
@@ -131,7 +127,7 @@ export async function analyzeCore(supabase: DB, competitorId: string, reviews: R
 
   const { geminiJson } = await import("./ai.server");
   const { findContact } = await import("./enrich.server");
-  const batchReviews = reviews.slice(0, 60);
+  const batchReviews = reviews;
   const scored: ScoredReviewItem[] = [];
   let lastChunkErr: unknown = null;
   let succeededChunks = 0;
@@ -200,7 +196,9 @@ ${list}`,
     );
   const stats = { ...empty, relevant: relevant.length, analyzed: scored.length };
   const rows = [];
-  const hotTargets = hot.slice(0, 15);
+  // Save every qualified negative item. Deduplication below remains the
+  // authoritative safeguard against duplicate posts, profiles, and content.
+  const hotTargets = hot;
 
   for (let i = 0; i < hotTargets.length; i += CONTACT_ENRICH_CONCURRENCY) {
     const batch = hotTargets.slice(i, i + CONTACT_ENRICH_CONCURRENCY);
@@ -208,14 +206,31 @@ ${list}`,
       batch.map(async (s) => {
         const r = batchReviews[s.index];
         if (!r) return null;
-        const ct = await findContactBounded(findContact, {
-          platform: r.platform,
-          name: r.reviewer_name,
-          profileUrl: r.reviewer_profile_url,
-          jobTitle: s.job_title,
-          company: s.company,
-          avoidDomain: compDomain,
-        });
+        // Anonymous review-site authors generally cannot be enriched. Save
+        // their source-linked complaint directly instead of waiting on a
+        // contact lookup that has no usable identity to search.
+        const canEnrichReviewAuthor =
+          !isReviewSite(r.platform) ||
+          isFullName(r.reviewer_name) ||
+          Boolean(r.reviewer_profile_url);
+        const ct: Contact = canEnrichReviewAuthor
+          ? await findContactBounded(findContact, {
+              platform: r.platform,
+              name: r.reviewer_name,
+              profileUrl: r.reviewer_profile_url,
+              jobTitle: s.job_title,
+              company: s.company,
+              avoidDomain: compDomain,
+            })
+          : {
+              email: null,
+              emailStatus: null,
+              linkedin: null,
+              jobTitle: s.job_title,
+              company: s.company,
+              companyDomain: null,
+              name: r.reviewer_name,
+            };
         return { s, r, ct };
       }),
     );
@@ -224,11 +239,8 @@ ${list}`,
       if (!item) continue;
       const { s, r, ct } = item;
       const { email, emailStatus, linkedin, jobTitle, company, companyDomain } = ct;
-      // Review sites need a full name to be useful; social posts can always be replied to.
-      if (isReviewSite(r.platform) && !isFullName(r.reviewer_name) && !email && !linkedin) {
-        stats.discarded++;
-        continue;
-      }
+      // A source-linked negative review is a valid lead even when the author
+      // is anonymous or contact enrichment cannot find an email/LinkedIn.
       const type = decideLead({ platform: r.platform, email, linkedin, threadUrl: r.source_url });
       if (!type) {
         stats.discarded++;

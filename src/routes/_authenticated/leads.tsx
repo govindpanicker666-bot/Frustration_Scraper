@@ -28,7 +28,6 @@ import { supabase } from "@/integrations/supabase/client";
 import { leadsQuery, type Lead } from "@/lib/queries";
 import {
   contactAction,
-  isOsintEligiblePlatform,
   leadsToCsv,
   normalizeStoredOsintContacts,
   platformLabel,
@@ -154,6 +153,20 @@ function OsintPlatformIcon({
   }
 }
 
+interface FindContactUpdatePayload {
+  osint_contacts: OsintStructuredContacts;
+  osint_checked: boolean;
+  email?: string | null | undefined;
+  email_status?: string | null | undefined;
+  linkedin_url?: string | null | undefined;
+  job_title?: string | null | undefined;
+  company?: string | null | undefined;
+  company_domain?: string | null | undefined;
+  reviewer_name?: string | null | undefined;
+  reviewer_profile_url?: string | null | undefined;
+  lead_type?: string | undefined;
+}
+
 function HowToContact({
   lead,
   onRefreshed,
@@ -161,7 +174,7 @@ function HowToContact({
 }: {
   lead: Lead;
   onRefreshed: () => void;
-  onOsintUpdated: (contacts: OsintStructuredContacts, checked: boolean) => void;
+  onOsintUpdated: (update: FindContactUpdatePayload) => void;
 }) {
   const refind = useServerFn(reenrichContacts);
   const [busy, setBusy] = useState(false);
@@ -205,11 +218,20 @@ function HowToContact({
         social_profiles?: Partial<Record<B2BSocialPlatform, string>>;
         other_contacts?: string[];
         osint_contacts?: unknown;
+        email?: string | null;
+        email_status?: string | null;
+        linkedin_url?: string | null;
+        job_title?: string | null;
+        company?: string | null;
+        company_domain?: string | null;
+        reviewer_name?: string | null;
+        reviewer_profile_url?: string | null;
+        lead_type?: string;
         error?: string;
       };
 
       if (!res.ok || !payload.ok) {
-        throw new Error(payload.error || "OSINT contact search failed");
+        throw new Error(payload.error || "Contact search failed");
       }
 
       const structured = normalizeStoredOsintContacts(
@@ -219,24 +241,37 @@ function HowToContact({
           other_contacts: payload.other_contacts ?? [],
         },
       );
+      const discoveredNewPrimary =
+        (!lead.email && Boolean(payload.email)) ||
+        (!lead.linkedin_url && Boolean(payload.linkedin_url));
       const totalFound =
         structured.emails.length +
         Object.keys(structured.social_profiles).length +
-        structured.other_contacts.length;
+        structured.other_contacts.length +
+        (discoveredNewPrimary ? 1 : 0);
 
-      onOsintUpdated(structured, Boolean(payload.osint_checked ?? true));
-      toast.success(
-        totalFound > 0 ? `Found ${totalFound} B2B contact(s)` : "No additional contacts found.",
-      );
+      onOsintUpdated({
+        osint_contacts: structured,
+        osint_checked: Boolean(payload.osint_checked ?? true),
+        email: payload.email,
+        email_status: payload.email_status,
+        linkedin_url: payload.linkedin_url,
+        job_title: payload.job_title,
+        company: payload.company,
+        company_domain: payload.company_domain,
+        reviewer_name: payload.reviewer_name,
+        reviewer_profile_url: payload.reviewer_profile_url,
+        lead_type: payload.lead_type,
+      });
+      toast.success(totalFound > 0 ? "Contact search completed" : "No additional contacts found.");
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not run open-web search");
+      toast.error(err instanceof Error ? err.message : "Could not run contact search");
     } finally {
       setOsintBusy(false);
     }
   }
 
   const profile = contactAction(lead.linkedin_url ?? lead.reviewer_profile_url, lead.source_url);
-  const showOsint = isOsintEligiblePlatform(lead.source_platform);
   const osintData = normalizeStoredOsintContacts(lead.osint_contacts);
   const osintProfileEntries = (
     Object.entries(osintData.social_profiles) as Array<[B2BSocialPlatform, string]>
@@ -245,6 +280,7 @@ function HowToContact({
     osintData.emails.length > 0 ||
     osintProfileEntries.length > 0 ||
     osintData.other_contacts.length > 0;
+  const hasPrimaryContact = Boolean(lead.email || lead.linkedin_url);
   const osintChecked = Boolean(lead.osint_checked);
 
   return (
@@ -307,118 +343,120 @@ function HowToContact({
         </li>
       </ul>
 
-      {showOsint && (
-        <div className="mt-4 border-t pt-4">
-          <Button
-            size="sm"
-            variant="outline"
-            onClick={runOsintSearch}
-            disabled={osintBusy}
-            className="w-full sm:w-auto"
-          >
-            {osintBusy ? <Loader2 className="animate-spin" /> : <Globe />}
-            {osintBusy ? "Searching public web..." : "Try To Find Another Contact"}
-          </Button>
-          <p className="mt-1.5 text-xs text-muted-foreground">
-            ⚠️ Automated open-web search. Accuracy is not guaranteed.
-          </p>
+      <div className="mt-4 border-t pt-4">
+        <Button
+          size="sm"
+          variant="outline"
+          onClick={runOsintSearch}
+          disabled={osintBusy}
+          className="w-full sm:w-auto"
+        >
+          {osintBusy ? <Loader2 className="animate-spin" /> : <Globe />}
+          {osintBusy
+            ? "Searching public web..."
+            : hasAnyOsint || hasPrimaryContact
+              ? "Find Another Contact"
+              : "Find Contact"}
+        </Button>
+        <p className="mt-1.5 text-xs text-muted-foreground">
+          Automated open-web &amp; B2B contact search across public profiles and company sites.
+        </p>
 
-          {osintData.emails.length > 0 && (
-            <div className="mt-3 space-y-2">
-              <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                Verified Emails
-              </div>
-              {osintData.emails.map((email) => (
-                <div
-                  key={email}
-                  className="flex items-center justify-between gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2"
+        {osintData.emails.length > 0 && (
+          <div className="mt-3 space-y-2">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Verified Emails
+            </div>
+            {osintData.emails.map((email) => (
+              <div
+                key={email}
+                className="flex items-center justify-between gap-2 rounded-md border border-primary/30 bg-primary/5 px-3 py-2"
+              >
+                <a
+                  className="flex min-w-0 items-center gap-2 truncate font-medium text-primary underline"
+                  href={`mailto:${email}`}
                 >
-                  <a
-                    className="flex min-w-0 items-center gap-2 truncate font-medium text-primary underline"
-                    href={`mailto:${email}`}
-                  >
-                    <Mail className="h-4 w-4 shrink-0" />
-                    <span className="truncate">{email}</span>
-                  </a>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="secondary"
-                    className="h-7 shrink-0 px-2.5 text-xs"
-                    onClick={() => {
-                      navigator.clipboard.writeText(email);
-                      toast.success("Email copied");
-                    }}
-                  >
-                    <Copy className="h-3 w-3" />
-                    Copy
-                  </Button>
-                </div>
-              ))}
-            </div>
-          )}
-
-          {osintProfileEntries.length > 0 && (
-            <div className="mt-3 space-y-2">
-              <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                B2B Profiles
-              </div>
-              <div className="flex flex-wrap gap-2">
-                {osintProfileEntries.map(([platform, url]) => {
-                  const meta = OSINT_PROFILE_META[platform];
-                  return (
-                    <Button key={platform} asChild size="sm" variant="secondary">
-                      <a href={url} target="_blank" rel="noreferrer">
-                        <OsintPlatformIcon kind={meta.icon} />
-                        {meta.label}
-                      </a>
-                    </Button>
-                  );
-                })}
-              </div>
-            </div>
-          )}
-
-          {osintData.other_contacts.length > 0 && (
-            <div className="mt-3 space-y-2">
-              <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
-                Phone Contacts
-              </div>
-              {osintData.other_contacts.map((phone) => (
-                <div
-                  key={phone}
-                  className="flex items-center justify-between gap-2 rounded-md border px-3 py-1.5"
+                  <Mail className="h-4 w-4 shrink-0" />
+                  <span className="truncate">{email}</span>
+                </a>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="secondary"
+                  className="h-7 shrink-0 px-2.5 text-xs"
+                  onClick={() => {
+                    navigator.clipboard.writeText(email);
+                    toast.success("Email copied");
+                  }}
                 >
-                  <a
-                    className="flex items-center gap-2 font-medium text-primary underline"
-                    href={`tel:${phone.replace(/[^\d+]/g, "")}`}
-                  >
-                    <Phone className="h-3.5 w-3.5" />
-                    {phone}
-                  </a>
-                  <Button
-                    type="button"
-                    size="sm"
-                    variant="ghost"
-                    className="h-7 px-2 text-xs"
-                    onClick={() => {
-                      navigator.clipboard.writeText(phone);
-                      toast.success("Phone copied");
-                    }}
-                  >
-                    <Copy className="h-3 w-3" />
-                    Copy
-                  </Button>
-                </div>
-              ))}
-            </div>
-          )}
+                  <Copy className="h-3 w-3" />
+                  Copy
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
 
-          {osintChecked && !hasAnyOsint && !osintBusy && (
-            <p className="mt-3 text-xs text-muted-foreground">No additional contacts found.</p>
-          )}
-        </div>
-      )}
+        {osintProfileEntries.length > 0 && (
+          <div className="mt-3 space-y-2">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              B2B Profiles
+            </div>
+            <div className="flex flex-wrap gap-2">
+              {osintProfileEntries.map(([platform, url]) => {
+                const meta = OSINT_PROFILE_META[platform];
+                return (
+                  <Button key={platform} asChild size="sm" variant="secondary">
+                    <a href={url} target="_blank" rel="noreferrer">
+                      <OsintPlatformIcon kind={meta.icon} />
+                      {meta.label}
+                    </a>
+                  </Button>
+                );
+              })}
+            </div>
+          </div>
+        )}
+
+        {osintData.other_contacts.length > 0 && (
+          <div className="mt-3 space-y-2">
+            <div className="text-[11px] font-semibold uppercase tracking-wider text-muted-foreground">
+              Phone Contacts
+            </div>
+            {osintData.other_contacts.map((phone) => (
+              <div
+                key={phone}
+                className="flex items-center justify-between gap-2 rounded-md border px-3 py-1.5"
+              >
+                <a
+                  className="flex items-center gap-2 font-medium text-primary underline"
+                  href={`tel:${phone.replace(/[^\d+]/g, "")}`}
+                >
+                  <Phone className="h-3.5 w-3.5" />
+                  {phone}
+                </a>
+                <Button
+                  type="button"
+                  size="sm"
+                  variant="ghost"
+                  className="h-7 px-2 text-xs"
+                  onClick={() => {
+                    navigator.clipboard.writeText(phone);
+                    toast.success("Phone copied");
+                  }}
+                >
+                  <Copy className="h-3 w-3" />
+                  Copy
+                </Button>
+              </div>
+            ))}
+          </div>
+        )}
+
+        {osintChecked && !hasAnyOsint && !osintBusy && (
+          <p className="mt-3 text-xs text-muted-foreground">No additional contacts found.</p>
+        )}
+      </div>
     </div>
   );
 }
@@ -432,6 +470,8 @@ function LeadsPage() {
   const [open, setOpen] = useState<Lead | null>(null);
   const [deleteTarget, setDeleteTarget] = useState<Lead | null>(null);
   const [deleting, setDeleting] = useState(false);
+  const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
+  const [deletingAll, setDeletingAll] = useState(false);
 
   const rows = useMemo(
     () =>
@@ -494,6 +534,42 @@ function LeadsPage() {
     }
   }
 
+  async function confirmDeleteAllLeads() {
+    setDeletingAll(true);
+    try {
+      const { data } = await supabase.auth.getSession();
+      const token = data.session?.access_token;
+      if (!token) {
+        toast.error("Session expired — please sign in again.");
+        return;
+      }
+
+      const res = await fetch("/api/leads", {
+        method: "DELETE",
+        headers: {
+          Accept: "application/json",
+          Authorization: `Bearer ${token}`,
+        },
+      });
+      const payload = (await res.json()) as { ok?: boolean; error?: string };
+      if (!res.ok || !payload.ok) {
+        throw new Error(payload.error || "Failed to delete leads");
+      }
+
+      setOpen(null);
+      setConfirmDeleteAll(false);
+      toast.success("All leads deleted");
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["leads"] }),
+        qc.invalidateQueries({ queryKey: ["stats"] }),
+      ]);
+    } catch (err) {
+      toast.error(err instanceof Error ? err.message : "Could not delete leads");
+    } finally {
+      setDeletingAll(false);
+    }
+  }
+
   function exportCsv() {
     if (rows.length === 0) {
       toast.info("No leads match the current filters to export.");
@@ -521,15 +597,27 @@ function LeadsPage() {
             People unhappy with your competitors, with the best way to reach each one.
           </p>
         </div>
-        <Button
-          variant="outline"
-          size="sm"
-          onClick={exportCsv}
-          className="whitespace-nowrap shrink-0"
-        >
-          <Download className="h-4 w-4" />
-          Export
-        </Button>
+        <div className="flex shrink-0 items-center gap-2">
+          <Button
+            variant="ghost"
+            size="sm"
+            onClick={() => setConfirmDeleteAll(true)}
+            disabled={leads.length === 0 || deletingAll}
+            className="whitespace-nowrap text-muted-foreground hover:text-destructive"
+          >
+            <Trash2 className="h-3.5 w-3.5" />
+            Delete All Leads
+          </Button>
+          <Button
+            variant="outline"
+            size="sm"
+            onClick={exportCsv}
+            className="whitespace-nowrap shrink-0"
+          >
+            <Download className="h-4 w-4" />
+            Export
+          </Button>
+        </div>
       </div>
       <div className="grid grid-cols-1 gap-3 sm:flex sm:flex-wrap">
         <Select value={platform} onValueChange={setPlatform}>
@@ -788,11 +876,30 @@ function LeadsPage() {
                       ?.find((x) => x.id === open.id);
                     if (fresh) setOpen(fresh);
                   }}
-                  onOsintUpdated={(contacts, checked) => {
+                  onOsintUpdated={(update) => {
                     setOpen({
                       ...open,
-                      osint_contacts: contacts,
-                      osint_checked: checked,
+                      osint_contacts: update.osint_contacts,
+                      osint_checked: update.osint_checked,
+                      ...(update.email !== undefined ? { email: update.email } : {}),
+                      ...(update.email_status !== undefined
+                        ? { email_status: update.email_status }
+                        : {}),
+                      ...(update.linkedin_url !== undefined
+                        ? { linkedin_url: update.linkedin_url }
+                        : {}),
+                      ...(update.job_title !== undefined ? { job_title: update.job_title } : {}),
+                      ...(update.company !== undefined ? { company: update.company } : {}),
+                      ...(update.company_domain !== undefined
+                        ? { company_domain: update.company_domain }
+                        : {}),
+                      ...(update.reviewer_name !== undefined
+                        ? { reviewer_name: update.reviewer_name }
+                        : {}),
+                      ...(update.reviewer_profile_url !== undefined
+                        ? { reviewer_profile_url: update.reviewer_profile_url }
+                        : {}),
+                      ...(update.lead_type !== undefined ? { lead_type: update.lead_type } : {}),
                     });
                     void qc.invalidateQueries({ queryKey: ["leads"] });
                   }}
@@ -857,6 +964,33 @@ function LeadsPage() {
             >
               {deleting ? <Loader2 className="animate-spin" /> : <Trash2 />}
               {deleting ? "Deleting..." : "Delete"}
+            </AlertDialogAction>
+          </AlertDialogFooter>
+        </AlertDialogContent>
+      </AlertDialog>
+      <AlertDialog
+        open={confirmDeleteAll}
+        onOpenChange={(isOpen) => !isOpen && !deletingAll && setConfirmDeleteAll(false)}
+      >
+        <AlertDialogContent>
+          <AlertDialogHeader>
+            <AlertDialogTitle>Are you sure?</AlertDialogTitle>
+            <AlertDialogDescription>
+              This will delete all saved leads. Tracked competitors will remain untouched.
+            </AlertDialogDescription>
+          </AlertDialogHeader>
+          <AlertDialogFooter>
+            <AlertDialogCancel disabled={deletingAll}>Cancel</AlertDialogCancel>
+            <AlertDialogAction
+              onClick={(e) => {
+                e.preventDefault();
+                void confirmDeleteAllLeads();
+              }}
+              disabled={deletingAll}
+              className="bg-destructive text-destructive-foreground hover:bg-destructive/90"
+            >
+              {deletingAll ? <Loader2 className="animate-spin" /> : <Trash2 />}
+              {deletingAll ? "Deleting..." : "Delete All Leads"}
             </AlertDialogAction>
           </AlertDialogFooter>
         </AlertDialogContent>
