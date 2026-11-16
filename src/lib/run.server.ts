@@ -79,14 +79,19 @@ async function findContactBounded(
 }
 
 const JIROSEARCH_DIRECT_PLATFORMS = new Set<Platform>([
-  "x",
-  "instagram",
-  "facebook",
-  "pinterest",
   "linkedin",
+  "x",
+  "facebook",
+  "instagram",
+  "pinterest",
+  "tiktok",
 ]);
 
-export async function scrapeCore(supabase: DB, competitorId: string, platform: Platform | "all") {
+export async function scrapeCore(
+  supabase: DB,
+  competitorId: string,
+  platform: Platform | "all" | Platform[],
+) {
   const { data: comp } = await supabase
     .from("competitors")
     .select("name,url,domain")
@@ -100,7 +105,11 @@ export async function scrapeCore(supabase: DB, competitorId: string, platform: P
     hasJirosearchConfig,
   } = await import("./scrapers.server");
   const ctx = { name: comp.name, domain: comp.domain ?? domainOf(comp.url) };
-  const platforms: Platform[] = platform === "all" ? PLATFORMS.map((p) => p.id) : [platform];
+  const platforms: Platform[] = Array.isArray(platform)
+    ? platform
+    : platform === "all"
+      ? PLATFORMS.map((p) => p.id)
+      : [platform];
 
   const useDirectJiro = typeof scrapeJirosearch === "function";
   const jiroPlatforms = useDirectJiro
@@ -122,6 +131,10 @@ export async function scrapeCore(supabase: DB, competitorId: string, platform: P
   const jiroPromise = (async () => {
     if (jiroPlatforms.length === 0) return;
     if (typeof hasJirosearchConfig === "function" && !hasJirosearchConfig()) {
+      console.warn(
+        "[Jirosearch] JIRO_SEARCH_URL is not configured; returning no_key for platforms:",
+        jiroPlatforms,
+      );
       for (const p of jiroPlatforms) {
         perPlatform.set(p, { status: "no_key", reviews: [] });
       }
@@ -136,6 +149,13 @@ export async function scrapeCore(supabase: DB, competitorId: string, platform: P
       typeof filterAndRecoverJirosearchReviews === "function"
         ? await filterAndRecoverJirosearchReviews(rawJiro, true)
         : rawJiro;
+
+    console.log("[Jirosearch] Filter summary:", {
+      competitor: ctx.name,
+      platforms: jiroPlatforms,
+      rawCount: rawJiro.length,
+      keptCount: preparedJiro.length,
+    });
 
     const grouped = new Map<Platform, RawReview[]>();
     for (const p of jiroPlatforms) grouped.set(p, []);

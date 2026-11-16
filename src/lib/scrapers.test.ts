@@ -52,7 +52,7 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res).toEqual({ status: "no_key", reviews: [] });
   });
 
-  it("calls JIRO_SEARCH_URL/api/search and maps items to RawReview across x, instagram, facebook, pinterest, linkedin", async () => {
+  it("calls JIRO_SEARCH_URL/search and maps items to RawReview across x, instagram, facebook, pinterest, linkedin, tiktok", async () => {
     process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     delete process.env["JIROSEARCH_API_KEY"];
     const nowIso = new Date().toISOString();
@@ -91,14 +91,15 @@ describe("scrapeJirosearch and social platform routing", () => {
       "facebook",
       "pinterest",
       "linkedin",
+      "tiktok",
     ]);
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://jiro-search-api-xyz.onrender.com/api/search",
+      "https://jiro-search-api-xyz.onrender.com/search",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
           query: "Acme",
-          platforms: ["x", "instagram", "facebook", "pinterest", "linkedin"],
+          platforms: ["x", "instagram", "facebook", "pinterest", "linkedin", "tiktok"],
         }),
       }),
     );
@@ -120,6 +121,45 @@ describe("scrapeJirosearch and social platform routing", () => {
       text: "Switched away from Acme after the price hike.",
       published_at: nowIso,
     });
+  });
+
+  it("falls back to /api/search when /search returns 404 on a bare JIRO_SEARCH_URL", async () => {
+    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
+    const nowIso = new Date().toISOString();
+    const fetchMock = vi
+      .fn()
+      .mockResolvedValueOnce(new Response("Not Found", { status: 404 }))
+      .mockResolvedValueOnce(
+        new Response(
+          JSON.stringify({
+            results: [
+              {
+                source: "linkedin",
+                text: "Acme keeps dropping connections.",
+                reviewerName: "Sam Lee",
+                reviewedAt: nowIso,
+                sourceUrl: "https://www.linkedin.com/posts/sam-lee-1",
+              },
+            ],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        ),
+      );
+    vi.stubGlobal("fetch", fetchMock);
+
+    const reviews = await scrapeJirosearch("Acme", ["linkedin"]);
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      1,
+      "https://jiro-search-api-xyz.onrender.com/search",
+      expect.anything(),
+    );
+    expect(fetchMock).toHaveBeenNthCalledWith(
+      2,
+      "https://jiro-search-api-xyz.onrender.com/api/search",
+      expect.anything(),
+    );
+    expect(reviews).toHaveLength(1);
+    expect(reviews[0]?.platform).toBe("linkedin");
   });
 
   it("handles sleeping or failing Jirosearch microservice gracefully by returning an empty array", async () => {

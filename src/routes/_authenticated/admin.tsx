@@ -176,9 +176,14 @@ function Admin() {
     setStarting(true);
     try {
       const token = await getBearerToken();
+      const selectedPlatforms =
+        platform === "all"
+          ? PLATFORMS.map((p) => p.id)
+          : [platform as (typeof PLATFORMS)[number]["id"]];
       console.log("[Admin] Triggering /api/admin/scrape-all", {
         competitorCount: targets.length,
         platform,
+        platforms: selectedPlatforms,
         hasBearerToken: Boolean(token),
       });
       if (!token) {
@@ -196,6 +201,7 @@ function Admin() {
         body: JSON.stringify({
           competitor_ids: targets.map((c) => c.id),
           platform,
+          platforms: selectedPlatforms,
         }),
       });
 

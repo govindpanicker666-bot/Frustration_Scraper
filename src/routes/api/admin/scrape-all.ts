@@ -3,10 +3,15 @@ import { z } from "zod";
 import { PLATFORMS, type Platform } from "@/lib/pipeline";
 
 const platformIds = PLATFORMS.map((p) => p.id) as [Platform, ...Platform[]];
-const requestSchema = z.object({
-  competitor_ids: z.array(z.string().uuid()).min(1),
-  platform: z.union([z.enum(platformIds), z.literal("all")]),
-});
+const requestSchema = z
+  .object({
+    competitor_ids: z.array(z.string().uuid()).min(1),
+    platform: z.union([z.enum(platformIds), z.literal("all")]).optional(),
+    platforms: z.array(z.enum(platformIds)).min(1).optional(),
+  })
+  .refine((d) => Boolean(d.platform) || Boolean(d.platforms?.length), {
+    message: "Either platform or platforms is required",
+  });
 
 export const Route = createFileRoute("/api/admin/scrape-all")({
   server: {
@@ -38,11 +43,29 @@ export const Route = createFileRoute("/api/admin/scrape-all")({
             );
           }
 
+          const resolvedPlatforms: Platform[] | undefined =
+            parsed.data.platforms ??
+            (parsed.data.platform === "all"
+              ? PLATFORMS.map((p) => p.id)
+              : parsed.data.platform
+                ? [parsed.data.platform]
+                : undefined);
+          const resolvedPlatform: Platform | "all" =
+            parsed.data.platform ??
+            (resolvedPlatforms && resolvedPlatforms.length === 1 ? resolvedPlatforms[0]! : "all");
+
+          console.log("[/api/admin/scrape-all] Parsed payload:", {
+            competitorCount: parsed.data.competitor_ids.length,
+            platform: resolvedPlatform,
+            platforms: resolvedPlatforms,
+          });
+
           const result = await startManualScrapeJob(
             auth.userId,
             parsed.data.competitor_ids,
-            parsed.data.platform,
+            resolvedPlatform,
             auth.supabase,
+            resolvedPlatforms,
           );
           return Response.json({ ok: true, ...result }, { status: 202 });
         } catch (err) {

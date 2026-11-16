@@ -31,6 +31,7 @@ export interface ManualScrapeJobState {
   competitor_ids: string[];
   competitor_names: string[];
   platform: Platform | "all";
+  platforms?: Platform[] | undefined;
   total_competitors: number;
   current_competitor_name: string | null;
   step: "idle" | "fetching" | "analyzing" | "done";
@@ -365,8 +366,14 @@ function launchBackgroundLoop(userId: string, initialState: ManualScrapeJobState
 
         try {
           const db = await resolveDbClient(userId);
+          const scrapeTarget =
+            state.platforms && state.platforms.length > 0 && state.platform !== "all"
+              ? state.platforms
+              : state.platform === "all" && state.platforms && state.platforms.length > 0
+                ? state.platforms
+                : state.platform;
           const s = await withStepTimeout(
-            scrapeCore(db, compId, state.platform),
+            scrapeCore(db, compId, scrapeTarget),
             `${compName} fetch`,
             STEP_TIMEOUT_MS,
           );
@@ -470,6 +477,7 @@ export async function startManualScrapeJob(
   competitorIds: string[],
   platform: Platform | "all",
   explicitClient?: SupabaseClient<Database>,
+  platforms?: Platform[],
 ): Promise<{ started: boolean; resumed: boolean; status: ManualScrapeJobState }> {
   const db = await resolveDbClient(userId, explicitClient);
   const activeLoops = getActiveLoops();
@@ -516,6 +524,7 @@ export async function startManualScrapeJob(
     competitor_ids: validIds,
     competitor_names: validNames,
     platform,
+    ...(platforms && platforms.length > 0 ? { platforms } : {}),
     total_competitors: validIds.length,
     current_competitor_name: validNames[0] ?? null,
     step: "fetching",

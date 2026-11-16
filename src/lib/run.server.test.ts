@@ -370,7 +370,7 @@ describe("negative-only lead analysis", () => {
     const result = await scrapeCore(client, "c", "all");
     expect(mocks.scrapeJirosearch).toHaveBeenCalledWith(
       "HubSpot",
-      ["linkedin", "x", "instagram", "facebook", "pinterest"],
+      ["linkedin", "x", "instagram", "tiktok", "facebook", "pinterest"],
       expect.objectContaining({ domain: "hubspot.com", apply48HourFilter: true }),
     );
     expect(result.reviews).toHaveLength(PLATFORMS.length * 2);

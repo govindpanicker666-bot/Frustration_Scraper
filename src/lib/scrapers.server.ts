@@ -992,6 +992,8 @@ function inferAuthorFromUrl(sourceUrl: string, platform: Platform): string | nul
   return null;
 }
 
+const JIROSEARCH_TIMEOUT_MS = 60_000;
+
 export function resolveJirosearchEndpoint(): string | null {
   const raw =
     process.env["JIRO_SEARCH_URL"]?.trim() || process.env["JIROSEARCH_API_URL"]?.trim() || "";
@@ -1000,12 +1002,27 @@ export function resolveJirosearchEndpoint(): string | null {
     if (/\/(?:api\/search|v1\/search|search)$/i.test(trimmed)) {
       return trimmed;
     }
-    return `${trimmed}/api/search`;
+    return `${trimmed}/search`;
   }
   if (process.env["JIROSEARCH_API_KEY"]?.trim()) {
     return "https://api.jirosearch.com/v1/search";
   }
   return null;
+}
+
+function getJirosearchCandidateEndpoints(): string[] {
+  const primary = resolveJirosearchEndpoint();
+  if (!primary) return [];
+
+  const raw =
+    process.env["JIRO_SEARCH_URL"]?.trim() || process.env["JIROSEARCH_API_URL"]?.trim() || "";
+  const trimmed = raw.replace(/\/+$/, "");
+  // If user gave a base URL without an explicit path, try /search first (Jiro docs)
+  // and fall back to /api/search only on 404 in case a custom wrapper is mounted there.
+  if (trimmed && !/\/(?:api\/search|v1\/search|search)$/i.test(trimmed)) {
+    return [`${trimmed}/search`, `${trimmed}/api/search`];
+  }
+  return [primary];
 }
 
 export function hasJirosearchConfig(): boolean {
@@ -1021,7 +1038,7 @@ export async function scrapeJirosearch(
     apply48HourFilter?: boolean | undefined;
   } = {},
 ): Promise<RawReview[]> {
-  const endpoint = resolveJirosearchEndpoint();
+  const endpoints = getJirosearchCandidateEndpoints();
   const apiKey = process.env["JIROSEARCH_API_KEY"]?.trim();
 
   const normalizedPlatforms = platforms
@@ -1030,7 +1047,7 @@ export async function scrapeJirosearch(
     .filter((p): p is Platform => JIROSEARCH_PLATFORM_SET.has(p as Platform));
 
   if (!query.trim() || normalizedPlatforms.length === 0) return [];
-  if (!endpoint) {
+  if (endpoints.length === 0) {
     console.warn("[Jirosearch] JIRO_SEARCH_URL is not set; returning empty results.");
     return [];
   }
@@ -1048,30 +1065,65 @@ export async function scrapeJirosearch(
     headers["X-API-Key"] = apiKey;
   }
 
-  let payload: unknown;
-  try {
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify({
-        query: queryText,
-        platforms: normalizedPlatforms,
-      }),
-      signal: AbortSignal.timeout(45_000),
-    });
+  const requestPayload = {
+    query: queryText,
+    platforms: normalizedPlatforms,
+  };
 
-    if (!res.ok) {
-      console.warn(`[Jirosearch] HTTP ${res.status} from ${endpoint}; returning empty results.`);
+  let payload: unknown = null;
+  for (let i = 0; i < endpoints.length; i++) {
+    const endpoint = endpoints[i]!;
+    const hasFallback = i + 1 < endpoints.length;
+    try {
+      console.log("[Jirosearch] Sending POST request:", {
+        url: endpoint,
+        payload: requestPayload,
+      });
+
+      const res = await fetch(endpoint, {
+        method: "POST",
+        headers,
+        body: JSON.stringify(requestPayload),
+        signal: AbortSignal.timeout(JIROSEARCH_TIMEOUT_MS),
+      });
+
+      const rawText = await res.text();
+      console.log("[Jirosearch] Response received:", {
+        url: endpoint,
+        status: res.status,
+        ok: res.ok,
+        body: rawText.slice(0, 4000),
+      });
+
+      if (res.status === 404 && hasFallback) {
+        console.warn(
+          `[Jirosearch] HTTP 404 from ${endpoint}; retrying fallback endpoint ${endpoints[i + 1]}`,
+        );
+        continue;
+      }
+
+      if (!res.ok) {
+        console.warn(`[Jirosearch] HTTP ${res.status} from ${endpoint}; returning empty results.`);
+        return [];
+      }
+
+      try {
+        payload = rawText ? (JSON.parse(rawText) as unknown) : null;
+      } catch (parseErr) {
+        console.warn(
+          `[Jirosearch] Invalid JSON returned by ${endpoint}:`,
+          parseErr instanceof Error ? parseErr.message : parseErr,
+        );
+        return [];
+      }
+      break;
+    } catch (err) {
+      console.warn(
+        `[Jirosearch] Request to ${endpoint} failed (timeout/asleep/unreachable):`,
+        err instanceof Error ? `${err.name}: ${err.message}` : err,
+      );
       return [];
     }
-
-    payload = (await res.json()) as unknown;
-  } catch (err) {
-    console.warn(
-      "[Jirosearch] Request failed (microservice asleep or unreachable):",
-      err instanceof Error ? err.message : err,
-    );
-    return [];
   }
 
   const rawList: unknown[] = Array.isArray(payload)
@@ -1187,6 +1239,20 @@ export async function scrapeJirosearch(
       text,
       published_at:
         parsedDate || (options.apply48HourFilter === false ? new Date().toISOString() : ""),
+    });
+  }
+
+  if (rawList.length > 0 && out.length === 0) {
+    const sample = rawList[0];
+    console.warn("[Jirosearch] Raw items were returned but 0 mapped to RawReview:", {
+      rawCount: rawList.length,
+      sampleKeys: sample && typeof sample === "object" ? Object.keys(sample) : typeof sample,
+    });
+  } else {
+    console.log("[Jirosearch] Mapped reviews:", {
+      rawCount: rawList.length,
+      mappedCount: out.length,
+      platforms: normalizedPlatforms,
     });
   }
 
