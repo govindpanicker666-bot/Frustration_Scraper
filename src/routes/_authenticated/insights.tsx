@@ -54,8 +54,12 @@ function Insights() {
   // Insights follow the competitors currently tracked; the Leads page keeps every saved lead.
   const ids = new Set(comps.map((c) => c.id));
   const leads = allLeads.filter((l) => l.competitor_id && ids.has(l.competitor_id));
-  const since = Date.now() - 24 * 3600_000;
-  const todays = leads.filter((l) => new Date(l.date_scraped).getTime() > since);
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
+  const todays = leads.filter((l) => {
+    const d = new Date(l.date_scraped);
+    return Number.isFinite(d.getTime()) && d >= startOfToday;
+  });
   const pool = todays.length ? todays : leads;
   const counts = new Map<string, number>();
   pool.forEach((l) => {

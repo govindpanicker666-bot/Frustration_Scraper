@@ -59,12 +59,13 @@ export function AutoScrape() {
   const st = q.data;
   const [runHour, setRunHour] = useState<number>(6);
   const [enabled, setEnabled] = useState<boolean>(false);
+  const [hasUnsavedChanges, setHasUnsavedChanges] = useState<boolean>(false);
 
   useEffect(() => {
-    if (!st) return;
+    if (!st || hasUnsavedChanges) return;
     setRunHour(st.run_hour);
     setEnabled(st.enabled);
-  }, [st]);
+  }, [st, hasUnsavedChanges]);
 
   const mutation = useMutation({
     mutationFn: async (patch: { enabled: boolean; run_hour: number }) => {
@@ -86,15 +87,26 @@ export function AutoScrape() {
       if (error) throw error;
     },
     onSuccess: async () => {
+      setHasUnsavedChanges(false);
       await qc.invalidateQueries({ queryKey: ["scrape_settings"] });
-      toast.success("Saved");
+      toast.success("Schedule saved");
     },
     onError: (err) => {
       toast.error(err instanceof Error ? err.message : "Could not save");
     },
   });
 
-  const local = (h: number) => {
+  const formatUtcHour = (h: number) => {
+    const d = new Date();
+    d.setUTCHours(h, 0, 0, 0);
+    return `${d.toLocaleTimeString([], {
+      hour: "numeric",
+      minute: "2-digit",
+      timeZone: "UTC",
+    })} (UTC)`;
+  };
+
+  const formatLocalHour = (h: number) => {
     const d = new Date();
     d.setUTCHours(h, 0, 0, 0);
     return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
@@ -103,24 +115,28 @@ export function AutoScrape() {
   return (
     <div className="glass space-y-3 p-5">
       <div className="flex flex-wrap items-center gap-4">
-        <div className="flex-1">
+        <div className="min-w-[220px] flex-1">
           <div className="font-bold">Automatic daily scrape</div>
           <div className="text-sm text-muted-foreground">
-            Scans all your competitors on every platform once a day, automatically.
+            Scans all your competitors once a day starting at {formatUtcHour(runHour)} (
+            {formatLocalHour(runHour)} your local time).
           </div>
         </div>
         <Select
           value={String(runHour)}
-          onValueChange={(v) => setRunHour(Number(v))}
+          onValueChange={(v) => {
+            setRunHour(Number(v));
+            setHasUnsavedChanges(true);
+          }}
           disabled={q.isLoading || mutation.isPending}
         >
-          <SelectTrigger className="w-40">
+          <SelectTrigger className="w-48">
             <SelectValue />
           </SelectTrigger>
           <SelectContent>
             {Array.from({ length: 24 }, (_, h) => (
               <SelectItem key={h} value={String(h)}>
-                Start {local(h)}
+                Start {formatUtcHour(h)}
               </SelectItem>
             ))}
           </SelectContent>
@@ -136,11 +152,11 @@ export function AutoScrape() {
         />
         <Button
           size="sm"
-          variant="outline"
+          variant={hasUnsavedChanges ? "default" : "outline"}
           disabled={q.isLoading || mutation.isPending}
           onClick={() => mutation.mutate({ enabled, run_hour: runHour })}
         >
-          {mutation.isPending ? "Saving…" : "Save"}
+          {mutation.isPending ? "Saving…" : hasUnsavedChanges ? "Save time" : "Save"}
         </Button>
       </div>
       {st && (

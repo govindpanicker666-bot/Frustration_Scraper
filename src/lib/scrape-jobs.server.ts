@@ -59,6 +59,7 @@ const globalLoops = globalThis as unknown as {
   __churnhoundCancelledJobs?: Set<string>;
   __churnhoundUserClients?: Map<string, SupabaseClient<Database>>;
   __churnhoundBootResumed?: boolean;
+  __churnhoundDailyCronLoops?: Map<string, Promise<void>>;
 };
 
 const STEP_TIMEOUT_MS = 120_000;
@@ -69,6 +70,13 @@ function getActiveLoops(): Map<string, Promise<void>> {
     globalLoops.__churnhoundManualLoops = new Map();
   }
   return globalLoops.__churnhoundManualLoops;
+}
+
+function getDailyCronLoops(): Map<string, Promise<void>> {
+  if (!globalLoops.__churnhoundDailyCronLoops) {
+    globalLoops.__churnhoundDailyCronLoops = new Map();
+  }
+  return globalLoops.__churnhoundDailyCronLoops;
 }
 
 function getCancelledJobs(): Set<string> {
@@ -665,4 +673,244 @@ export async function runDailyBrandListeningTick(
     console.warn("[BrandListening] daily tick skipped:", err instanceof Error ? err.message : err);
     return { ran: false };
   }
+}
+
+export function extractLastRunDate(row: {
+  last_run_date?: string | null | undefined;
+  progress?: unknown;
+}): string | null {
+  if (typeof row.last_run_date === "string" && row.last_run_date.trim()) {
+    return row.last_run_date.trim().slice(0, 10);
+  }
+  const env = parseEnvelope(row.progress as Json | null | undefined);
+  const raw = env["last_run_date"];
+  return typeof raw === "string" && raw.trim() ? raw.trim().slice(0, 10) : null;
+}
+
+async function tryWriteTopLevelLastRunDate(
+  db: SupabaseClient<Database>,
+  userId: string,
+  today: string,
+): Promise<void> {
+  try {
+    // Support optional `last_run_date` SQL column if added, without failing if absent.
+    const rawDb = db as unknown as {
+      from: (table: string) => {
+        update: (patch: Record<string, unknown>) => {
+          eq: (col: string, val: string) => PromiseLike<{ error?: unknown }>;
+        };
+      };
+    };
+    await rawDb.from("user_scrape_settings").update({ last_run_date: today }).eq("user_id", userId);
+  } catch {
+    /* ignore missing-column / schema cache errors */
+  }
+}
+
+async function persistDailyProgress(
+  db: SupabaseClient<Database>,
+  userId: string,
+  today: string,
+  stats: {
+    done: string[];
+    competitors: number;
+    found: number;
+    saved: number;
+  },
+  rowPatch: {
+    lock_until?: string | null;
+    last_run_at?: string | null;
+    pause_reason?: string | null;
+  },
+): Promise<void> {
+  const existing = await readUserEnvelope(userId, db);
+  const nextProgress: ProgressEnvelope = {
+    ...existing,
+    date: today,
+    last_run_date: today,
+    done: stats.done,
+    competitors: stats.competitors,
+    found: stats.found,
+    saved: stats.saved,
+  };
+  await db
+    .from("user_scrape_settings")
+    .update({
+      ...rowPatch,
+      progress: nextProgress as unknown as Json,
+      updated_at: new Date().toISOString(),
+    })
+    .eq("user_id", userId);
+}
+
+function launchDailyUserScrapeLoop(
+  db: SupabaseClient<Database>,
+  userId: string,
+  today: string,
+): Promise<void> {
+  const dailyLoops = getDailyCronLoops();
+  const existingLoop = dailyLoops.get(userId);
+  if (existingLoop) return existingLoop;
+
+  const holder: { promise?: Promise<void> } = {};
+  holder.promise = (async () => {
+    const done: string[] = [];
+    let competitors = 0;
+    let found = 0;
+    let saved = 0;
+    let pause: string | null = null;
+
+    try {
+      const { data: comps, error: compsErr } = await db
+        .from("competitors")
+        .select("id,name")
+        .eq("user_id", userId)
+        .order("created_at");
+
+      if (compsErr) {
+        console.error("[DailyCron] failed to load competitors:", userId, compsErr.message);
+      }
+
+      const { scrapeCore, analyzeCore } = await import("./run.server");
+
+      for (const comp of comps ?? []) {
+        done.push(comp.id);
+        try {
+          const s = await withStepTimeout(
+            scrapeCore(db, comp.id, "all"),
+            `${comp.name ?? comp.id} daily fetch`,
+            STEP_TIMEOUT_MS,
+          );
+          const a = await withStepTimeout(
+            analyzeCore(db, comp.id, s.reviews),
+            `${comp.name ?? comp.id} daily analysis`,
+            STEP_TIMEOUT_MS,
+          );
+          competitors++;
+          found += s.reviews.length;
+          saved += a.saved;
+        } catch (e) {
+          const m = e instanceof Error ? e.message : String(e);
+          console.error("[DailyCron] competitor error:", comp.id, m);
+          if (m.startsWith("AI_QUOTA")) {
+            pause = "AI daily limit reached — resumes tomorrow.";
+            await persistDailyProgress(
+              db,
+              userId,
+              today,
+              { done, competitors, found, saved },
+              {
+                last_run_at: new Date().toISOString(),
+                pause_reason: pause,
+              },
+            );
+            break;
+          }
+        }
+
+        await persistDailyProgress(
+          db,
+          userId,
+          today,
+          { done, competitors, found, saved },
+          {
+            last_run_at: new Date().toISOString(),
+            pause_reason: null,
+          },
+        );
+      }
+
+      if (!pause) {
+        await runDailyBrandListeningTick(db, userId, today);
+      }
+    } catch (err) {
+      console.error(
+        "[DailyCron] background loop failed:",
+        userId,
+        err instanceof Error ? err.message : err,
+      );
+    } finally {
+      await db
+        .from("user_scrape_settings")
+        .update({
+          lock_until: null,
+          last_run_at: new Date().toISOString(),
+          pause_reason: pause,
+          updated_at: new Date().toISOString(),
+        })
+        .eq("user_id", userId);
+      if (holder.promise && dailyLoops.get(userId) === holder.promise) {
+        dailyLoops.delete(userId);
+      }
+    }
+  })();
+
+  dailyLoops.set(userId, holder.promise);
+  return holder.promise;
+}
+
+export async function runDailyCronTick(
+  db: SupabaseClient<Database>,
+  now: Date = new Date(),
+): Promise<{
+  ok: true;
+  triggered: { user: string; started?: boolean; skipped?: string }[];
+  backgroundPromises: Promise<void>[];
+}> {
+  const today = now.toISOString().slice(0, 10);
+  const currentUtcHour = now.getUTCHours();
+
+  const { data: users } = await db
+    .from("user_scrape_settings")
+    .select("*")
+    .eq("enabled", true)
+    .eq("run_hour", currentUtcHour)
+    .order("last_run_at", { ascending: true, nullsFirst: true });
+
+  const dailyLoops = getDailyCronLoops();
+  const triggered: { user: string; started?: boolean; skipped?: string }[] = [];
+  const backgroundPromises: Promise<void>[] = [];
+
+  for (const st of users ?? []) {
+    const prev = parseEnvelope(st.progress);
+    const lastRunDate = extractLastRunDate(
+      st as { last_run_date?: string | null; progress?: Json | null },
+    );
+
+    if (lastRunDate === today) {
+      triggered.push({ user: st.user_id, skipped: "already_ran_today" });
+      continue;
+    }
+
+    if (st.pause_reason && prev.date === today) {
+      triggered.push({ user: st.user_id, skipped: "paused" });
+      continue;
+    }
+
+    if (dailyLoops.has(st.user_id) || (st.lock_until && new Date(st.lock_until) > now)) {
+      triggered.push({ user: st.user_id, skipped: "locked" });
+      continue;
+    }
+
+    // Immediately record today's last_run_date and lock before spawning fire-and-forget loop.
+    await persistDailyProgress(
+      db,
+      st.user_id,
+      today,
+      { done: [], competitors: 0, found: 0, saved: 0 },
+      {
+        lock_until: new Date(now.getTime() + 60 * 60_000).toISOString(),
+        last_run_at: now.toISOString(),
+        pause_reason: null,
+      },
+    );
+    await tryWriteTopLevelLastRunDate(db, st.user_id, today);
+
+    // Fire and forget: do NOT await the background loop in the cron HTTP response.
+    const loopPromise = launchDailyUserScrapeLoop(db, st.user_id, today);
+    backgroundPromises.push(loopPromise);
+    triggered.push({ user: st.user_id, started: true });
+  }
+
+  return { ok: true, triggered, backgroundPromises };
 }

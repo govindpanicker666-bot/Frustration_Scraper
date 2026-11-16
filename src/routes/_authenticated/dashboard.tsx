@@ -35,10 +35,11 @@ function Dashboard() {
   // Figures follow the competitors currently tracked; the Leads page keeps every saved lead.
   const ids = new Set(comps.map((c) => c.id));
   const leads = allLeads.filter((l) => l.competitor_id && ids.has(l.competitor_id));
-  const todayCutoff = Date.now() - 24 * 3600_000;
+  const startOfToday = new Date();
+  startOfToday.setHours(0, 0, 0, 0);
   const fresh = leads.filter((l) => {
-    const ts = new Date(l.date_scraped).getTime();
-    return Number.isFinite(ts) && ts > todayCutoff;
+    const d = new Date(l.date_scraped);
+    return Number.isFinite(d.getTime()) && d >= startOfToday;
   }).length;
   const leadsUnavailable = leadsQ.isError && !leadsQ.data;
   const compsUnavailable = compsQ.isError && !compsQ.data;
