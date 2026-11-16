@@ -78,6 +78,14 @@ async function findContactBounded(
   }
 }
 
+const JIROSEARCH_DIRECT_PLATFORMS = new Set<Platform>([
+  "x",
+  "instagram",
+  "facebook",
+  "pinterest",
+  "linkedin",
+]);
+
 export async function scrapeCore(supabase: DB, competitorId: string, platform: Platform | "all") {
   const { data: comp } = await supabase
     .from("competitors")
@@ -85,20 +93,84 @@ export async function scrapeCore(supabase: DB, competitorId: string, platform: P
     .eq("id", competitorId)
     .single();
   if (!comp) throw new Error("Competitor not found");
-  const { scrapePlatform } = await import("./scrapers.server");
+  const {
+    scrapePlatform,
+    scrapeJirosearch,
+    filterAndRecoverJirosearchReviews,
+    hasJirosearchConfig,
+  } = await import("./scrapers.server");
   const ctx = { name: comp.name, domain: comp.domain ?? domainOf(comp.url) };
   const platforms: Platform[] = platform === "all" ? PLATFORMS.map((p) => p.id) : [platform];
-  const results = await Promise.all(platforms.map((p) => scrapePlatform(ctx, p)));
-  const sources = platforms.flatMap((p, i) => {
-    const result = results[i];
-    return result ? [{ platform: p, status: result.status, count: result.reviews.length }] : [];
+
+  const useDirectJiro = typeof scrapeJirosearch === "function";
+  const jiroPlatforms = useDirectJiro
+    ? platforms.filter((p) => JIROSEARCH_DIRECT_PLATFORMS.has(p))
+    : [];
+  const standardPlatforms = useDirectJiro
+    ? platforms.filter((p) => !JIROSEARCH_DIRECT_PLATFORMS.has(p))
+    : platforms;
+
+  const perPlatform = new Map<Platform, { status: string; reviews: RawReview[] }>();
+
+  const standardPromise = Promise.all(
+    standardPlatforms.map(async (p) => {
+      const result = await scrapePlatform(ctx, p);
+      perPlatform.set(p, result);
+    }),
+  );
+
+  const jiroPromise = (async () => {
+    if (jiroPlatforms.length === 0) return;
+    if (typeof hasJirosearchConfig === "function" && !hasJirosearchConfig()) {
+      for (const p of jiroPlatforms) {
+        perPlatform.set(p, { status: "no_key", reviews: [] });
+      }
+      return;
+    }
+
+    const rawJiro = await scrapeJirosearch(ctx.name, jiroPlatforms, {
+      domain: ctx.domain,
+      apply48HourFilter: true,
+    });
+    const preparedJiro =
+      typeof filterAndRecoverJirosearchReviews === "function"
+        ? await filterAndRecoverJirosearchReviews(rawJiro, true)
+        : rawJiro;
+
+    const grouped = new Map<Platform, RawReview[]>();
+    for (const p of jiroPlatforms) grouped.set(p, []);
+    for (const item of preparedJiro) {
+      const bucket = grouped.get(item.platform);
+      if (bucket) {
+        bucket.push(item);
+      } else {
+        const first = jiroPlatforms[0];
+        if (first) grouped.get(first)?.push(item);
+      }
+    }
+
+    for (const p of jiroPlatforms) {
+      perPlatform.set(p, { status: "ok", reviews: grouped.get(p) ?? [] });
+    }
+  })();
+
+  await Promise.all([standardPromise, jiroPromise]);
+
+  const orderedResults = platforms.flatMap((p) => {
+    const result = perPlatform.get(p);
+    return result ? [{ platform: p, ...result }] : [];
   });
+  const sources = orderedResults.map((r) => ({
+    platform: r.platform,
+    status: r.status,
+    count: r.reviews.length,
+  }));
   const reviews: RawReview[] = [];
   // Interleave each source to preserve platform diversity, but do not cap the
   // combined result set. Each scraper already applies its own provider limits.
-  const maxPerSource = Math.max(0, ...results.map((result) => result.reviews.length));
+  const maxPerSource = Math.max(0, ...orderedResults.map((result) => result.reviews.length));
   for (let round = 0; round < maxPerSource; round++) {
-    for (const result of results) {
+    for (const result of orderedResults) {
       const item = result.reviews[round];
       if (item) reviews.push(item);
     }

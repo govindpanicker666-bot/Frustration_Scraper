@@ -1,6 +1,6 @@
 import { createFileRoute } from "@tanstack/react-router";
 import { useQueryClient, useSuspenseQuery } from "@tanstack/react-query";
-import { useMemo, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import {
   AtSign,
   Briefcase,
@@ -57,6 +57,9 @@ import {
 } from "@/components/ui/select";
 
 export const Route = createFileRoute("/_authenticated/leads")({
+  validateSearch: (search: Record<string, unknown>): { lead?: string | undefined } => ({
+    lead: typeof search["lead"] === "string" ? search["lead"] : undefined,
+  }),
   head: () => ({
     meta: [
       { title: "Leads — Churnhound" },
@@ -463,6 +466,8 @@ function HowToContact({
 
 function LeadsPage() {
   const { data: leads } = useSuspenseQuery(leadsQuery);
+  const { lead: leadParam } = Route.useSearch();
+  const navigate = Route.useNavigate();
   const qc = useQueryClient();
   const [platform, setPlatform] = useState("all");
   const [status, setStatus] = useState("active");
@@ -472,6 +477,38 @@ function LeadsPage() {
   const [deleting, setDeleting] = useState(false);
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
   const [deletingAll, setDeletingAll] = useState(false);
+  const handledLeadParamRef = useRef<string | null>(null);
+
+  useEffect(() => {
+    if (!leadParam) {
+      handledLeadParamRef.current = null;
+      return;
+    }
+    if (handledLeadParamRef.current === leadParam) return;
+    const target = leads.find((l) => l.id === leadParam);
+    if (!target) return;
+
+    handledLeadParamRef.current = leadParam;
+    if (platform !== "all" && target.source_platform !== platform) {
+      setPlatform("all");
+    }
+    if (status === "active" && target.status === "Archived") {
+      setStatus("all");
+    } else if (status !== "all" && status !== "active" && target.status !== status) {
+      setStatus("all");
+    }
+    if ((Number.isFinite(target.sentiment_score) ? target.sentiment_score : 1) < Number(minScore)) {
+      setMinScore("1");
+    }
+    setOpen(target);
+  }, [leadParam, leads, platform, status, minScore]);
+
+  function closeLeadDrawer() {
+    setOpen(null);
+    if (leadParam) {
+      void navigate({ search: {}, replace: true });
+    }
+  }
 
   const rows = useMemo(
     () =>
@@ -816,7 +853,7 @@ function LeadsPage() {
           </tbody>
         </table>
       </div>
-      <Sheet open={!!open} onOpenChange={(o) => !o && setOpen(null)}>
+      <Sheet open={!!open} onOpenChange={(o) => !o && closeLeadDrawer()}>
         <SheetContent className="w-full overflow-y-auto sm:max-w-lg">
           {open && (
             <>

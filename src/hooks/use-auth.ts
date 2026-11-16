@@ -18,7 +18,17 @@ export function useCurrentUser() {
         .select("*")
         .eq("id", user.id)
         .maybeSingle();
-      return { user, profile, isAdmin: !!roles?.some((r) => r.role === "admin") };
+      const meta = (user.user_metadata ?? {}) as Record<string, unknown>;
+      const metaName =
+        typeof meta["full_name"] === "string"
+          ? meta["full_name"].trim()
+          : typeof meta["name"] === "string"
+            ? meta["name"].trim()
+            : "";
+      const profileName =
+        profile && typeof profile.full_name === "string" ? profile.full_name.trim() : "";
+      const fullName = profileName || metaName || null;
+      return { user, profile, fullName, isAdmin: !!roles?.some((r) => r.role === "admin") };
     },
   });
 }

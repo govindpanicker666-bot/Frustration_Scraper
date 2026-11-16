@@ -1,9 +1,15 @@
 import { createFileRoute, Link } from "@tanstack/react-router";
-import { useQuery } from "@tanstack/react-query";
+import { useQuery, useQueryClient } from "@tanstack/react-query";
+import { useServerFn } from "@tanstack/react-start";
 import { motion } from "framer-motion";
-import { Flame, Users, Gauge, Sparkles } from "lucide-react";
+import { Flame, Users, Gauge, Sparkles, ChevronRight } from "lucide-react";
+import { useCallback, useState } from "react";
 import { AutoScrape } from "@/components/AutoScrape";
 import { CompanyBrandCard } from "@/components/CompanyBrandCard";
+import { DashboardScanButton, DashboardScanMonitor } from "@/components/DashboardScanMonitor";
+import { OnboardingTour } from "@/components/OnboardingTour";
+import { ScheduleOnboardingModal } from "@/components/ScheduleOnboardingModal";
+import { getTutorialStatus, markTutorialSeen } from "@/lib/leads.functions";
 import { leadsQuery, competitorsQuery } from "@/lib/queries";
 import { ScoreBadge } from "@/components/ScoreBadge";
 import { Button } from "@/components/ui/button";
@@ -28,8 +34,29 @@ export const Route = createFileRoute("/_authenticated/dashboard")({
 });
 
 function Dashboard() {
-  const leadsQ = useQuery(leadsQuery);
+  const qc = useQueryClient();
+  const fetchTutorialStatus = useServerFn(getTutorialStatus);
+  const saveTutorialSeen = useServerFn(markTutorialSeen);
+
+  const [showScheduleModal, setShowScheduleModal] = useState<boolean>(() => {
+    if (typeof window === "undefined") return false;
+    return window.sessionStorage.getItem("churnhound_onboarding_schedule_prompt") === "1";
+  });
+  const [scanRunning, setScanRunning] = useState<boolean>(false);
+  const [scanTriggerCount, setScanTriggerCount] = useState<number>(0);
+  const [tutorialDismissedLocally, setTutorialDismissedLocally] = useState<boolean>(false);
+
+  const leadsQ = useQuery({
+    ...leadsQuery,
+    refetchInterval: scanRunning ? 8000 : false,
+  });
   const compsQ = useQuery(competitorsQuery);
+  const tutorialQ = useQuery({
+    queryKey: ["tutorial_status"],
+    queryFn: () => fetchTutorialStatus(),
+    staleTime: Infinity,
+  });
+
   const allLeads = Array.isArray(leadsQ.data) ? leadsQ.data : [];
   const comps = Array.isArray(compsQ.data) ? compsQ.data : [];
   // Figures follow the competitors currently tracked; the Leads page keeps every saved lead.
@@ -41,6 +68,27 @@ function Dashboard() {
     const d = new Date(l.date_scraped);
     return Number.isFinite(d.getTime()) && d >= startOfToday;
   }).length;
+
+  const handleCloseScheduleModal = useCallback(() => {
+    if (typeof window !== "undefined") {
+      window.sessionStorage.removeItem("churnhound_onboarding_schedule_prompt");
+    }
+    setShowScheduleModal(false);
+  }, []);
+
+  const handleFinishTutorial = useCallback(() => {
+    setTutorialDismissedLocally(true);
+    qc.setQueryData(["tutorial_status"], { has_seen_tutorial: true });
+    void saveTutorialSeen().catch((err) => {
+      console.warn("[Tutorial] failed persisting has_seen_tutorial:", err);
+    });
+  }, [qc, saveTutorialSeen]);
+
+  const showTour =
+    !showScheduleModal &&
+    !tutorialDismissedLocally &&
+    comps.length > 0 &&
+    tutorialQ.data?.has_seen_tutorial === false;
   const leadsUnavailable = leadsQ.isError && !leadsQ.data;
   const compsUnavailable = compsQ.isError && !compsQ.data;
   const statsLoading = (leadsQ.isPending && !leadsQ.data) || (compsQ.isPending && !compsQ.data);
@@ -88,7 +136,19 @@ function Dashboard() {
 
   return (
     <div className="space-y-8">
-      <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
+      <div className="flex flex-wrap items-center justify-between gap-4">
+        <h1 className="text-2xl font-semibold tracking-tight">Dashboard</h1>
+        <DashboardScanButton
+          running={scanRunning}
+          disabled={comps.length === 0}
+          onClick={() => setScanTriggerCount((c) => c + 1)}
+        />
+      </div>
+      <DashboardScanMonitor
+        competitors={comps}
+        onRunningChange={setScanRunning}
+        startTriggerCount={scanTriggerCount}
+      />
       {detectSpikes(leads).map((sp) => (
         <div
           key={sp.competitor + sp.complaint}
@@ -128,7 +188,7 @@ function Dashboard() {
       </div>
       <CompanyBrandCard />
       <AutoScrape />
-      <div className="glass p-6">
+      <div className="glass p-6" data-tour="frustrated-leads">
         <div className="mb-4 flex items-center justify-between">
           <h2 className="text-lg font-bold">Hottest recent leads</h2>
           <Link to="/leads" className="text-sm text-primary">
@@ -153,19 +213,28 @@ function Dashboard() {
               .sort((a, b) => (Number(b.sentiment_score) || 0) - (Number(a.sentiment_score) || 0))
               .slice(0, 6)
               .map((l) => (
-                <li key={l.id} className="flex items-center gap-4 py-3">
-                  <ScoreBadge score={l.sentiment_score} />
-                  <div className="min-w-0 flex-1">
-                    <div className="truncate font-bold">{l.extracted_complaint}</div>
-                    <div className="truncate text-sm text-muted-foreground">
-                      {l.reviewer_name} · {l.competitor_name} · {platformLabel(l.source_platform)}
+                <li key={l.id}>
+                  <Link
+                    to="/leads"
+                    search={{ lead: l.id }}
+                    className="-mx-2.5 flex items-center gap-4 rounded-md px-2.5 py-3 transition-colors hover:bg-secondary/60 focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-ring"
+                  >
+                    <ScoreBadge score={l.sentiment_score} />
+                    <div className="min-w-0 flex-1">
+                      <div className="truncate font-bold">{l.extracted_complaint}</div>
+                      <div className="truncate text-sm text-muted-foreground">
+                        {l.reviewer_name} · {l.competitor_name} · {platformLabel(l.source_platform)}
+                      </div>
                     </div>
-                  </div>
+                    <ChevronRight className="h-4 w-4 shrink-0 text-muted-foreground" />
+                  </Link>
                 </li>
               ))}
           </ul>
         )}
       </div>
+      <ScheduleOnboardingModal open={showScheduleModal} onClose={handleCloseScheduleModal} />
+      <OnboardingTour open={showTour} onFinish={handleFinishTutorial} />
     </div>
   );
 }

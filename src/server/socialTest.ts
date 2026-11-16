@@ -28,14 +28,6 @@ export interface TikTokTestResult {
   error?: string | undefined;
 }
 
-interface TrueScrapeCliResult {
-  ok: boolean;
-  exitCode: number;
-  json: unknown;
-  rawStdout: string;
-  rawStderr: string;
-}
-
 function parseJsonSafe(text: string): unknown {
   const trimmed = text.trim();
   if (!trimmed) return null;
@@ -46,132 +38,44 @@ function parseJsonSafe(text: string): unknown {
   }
 }
 
-async function runTrueScrapeCli(args: string[]): Promise<TrueScrapeCliResult> {
-  const cliPath = path.resolve(process.cwd(), "node_modules/truescrape/dist/index.js");
-  try {
-    const { stdout, stderr } = await execFileAsync(
-      process.execPath,
-      [cliPath, ...args, "--envelope", "--quiet"],
-      {
-        env: process.env,
-        timeout: 30_000,
-        maxBuffer: 4 * 1024 * 1024,
-      },
-    );
-    return {
-      ok: true,
-      exitCode: 0,
-      json: parseJsonSafe(stdout),
-      rawStdout: stdout,
-      rawStderr: stderr,
-    };
-  } catch (err) {
-    const execErr = err as {
-      code?: number | string;
-      stdout?: string;
-      stderr?: string;
-      message?: string;
-    };
-    const stdout = typeof execErr.stdout === "string" ? execErr.stdout : "";
-    const stderr = typeof execErr.stderr === "string" ? execErr.stderr : "";
-    const parsed = parseJsonSafe(stdout) ?? parseJsonSafe(stderr) ?? execErr.message ?? String(err);
-    return {
-      ok: false,
-      exitCode: typeof execErr.code === "number" ? execErr.code : 1,
-      json: parsed,
-      rawStdout: stdout,
-      rawStderr: stderr,
-    };
-  }
-}
-
-function extractLinkedInProfileUrl(payload: unknown): string | null {
-  const regex = /https?:\/\/(?:[a-z]{2,3}\.)?linkedin\.com\/in\/[A-Za-z0-9\-_%]+/i;
-  const visited = new Set<unknown>();
-
-  function walk(value: unknown): string | null {
-    if (typeof value === "string") {
-      const match = value.match(regex);
-      return match?.[0] ?? null;
-    }
-    if (!value || typeof value !== "object" || visited.has(value)) return null;
-    visited.add(value);
-
-    if (Array.isArray(value)) {
-      for (const item of value) {
-        const found = walk(item);
-        if (found) return found;
-      }
-      return null;
-    }
-
-    for (const val of Object.values(value as Record<string, unknown>)) {
-      const found = walk(val);
-      if (found) return found;
-    }
-    return null;
-  }
-
-  return walk(payload);
-}
-
 export async function testLinkedInSearch(name: string): Promise<LinkedInTestResult> {
   const queryName = name.trim();
-  const hasApiKey = Boolean(process.env["TRUESCRAPE_API_KEY"]?.trim());
+  const hasJiroConfig = Boolean(
+    process.env["JIRO_SEARCH_URL"]?.trim() ||
+    process.env["JIROSEARCH_API_URL"]?.trim() ||
+    process.env["JIROSEARCH_API_KEY"]?.trim(),
+  );
 
   if (!queryName) {
     return {
       ok: false,
       name: queryName,
       profileUrl: null,
-      hasApiKey,
+      hasApiKey: hasJiroConfig,
       searchRaw: null,
       profileRaw: null,
       error: "Missing 'name' query parameter.",
     };
   }
 
-  // If the caller already passed a LinkedIn profile URL, look it up directly
-  if (/linkedin\.com\/in\//i.test(queryName)) {
-    const profileRes = await runTrueScrapeCli(["linkedin", "profile", "--url", queryName]);
-    return {
-      ok: profileRes.ok,
-      name: queryName,
-      profileUrl: queryName,
-      hasApiKey,
-      searchRaw: null,
-      profileRaw: profileRes.json,
-      error: profileRes.ok ? undefined : "Failed to fetch LinkedIn profile via TrueScrape CLI.",
-    };
-  }
-
-  const searchRes = await runTrueScrapeCli([
-    "google",
-    "search",
-    "--query",
-    `site:linkedin.com/in/ "${queryName}"`,
-  ]);
-
-  const profileUrl = extractLinkedInProfileUrl(searchRes.json);
-
-  let profileRaw: unknown = null;
-  if (profileUrl) {
-    const profileRes = await runTrueScrapeCli(["linkedin", "profile", "--url", profileUrl]);
-    profileRaw = profileRes.json;
-  }
+  const { scrapeJirosearch } = await import("@/lib/scrapers.server");
+  const reviews = await scrapeJirosearch(queryName, ["linkedin"]);
+  const firstWithProfile = reviews.find((r) => r.reviewer_profile_url) ?? reviews[0] ?? null;
+  const profileUrl = firstWithProfile?.reviewer_profile_url ?? firstWithProfile?.source_url ?? null;
 
   return {
-    ok: searchRes.ok && Boolean(profileUrl),
+    ok: reviews.length > 0,
     name: queryName,
     profileUrl,
-    hasApiKey,
-    searchRaw: searchRes.json,
-    profileRaw,
-    error: searchRes.ok
-      ? profileUrl
+    hasApiKey: hasJiroConfig,
+    searchRaw: reviews,
+    profileRaw: firstWithProfile,
+    error:
+      reviews.length > 0
         ? undefined
-        : "No LinkedIn profile URL found in TrueScrape search output."
-      : "TrueScrape CLI returned an error. Ensure TRUESCRAPE_API_KEY is set in .env.",
+        : hasJiroConfig
+          ? "No LinkedIn posts returned by Jirosearch."
+          : "JIRO_SEARCH_URL is not configured in environment variables.",
   };
 }
 

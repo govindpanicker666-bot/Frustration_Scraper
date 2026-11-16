@@ -3,23 +3,29 @@ import { PLATFORMS } from "./pipeline";
 import { scrapeJirosearch, scrapePlatform } from "./scrapers.server";
 
 describe("scrapeJirosearch and social platform routing", () => {
+  const originalJiroUrl = process.env["JIRO_SEARCH_URL"];
+  const originalLegacyUrl = process.env["JIROSEARCH_API_URL"];
   const originalJiroKey = process.env["JIROSEARCH_API_KEY"];
-  const originalTrueKey = process.env["TRUESCRAPE_API_KEY"];
 
   beforeEach(() => {
     vi.restoreAllMocks();
   });
 
   afterEach(() => {
+    if (originalJiroUrl === undefined) {
+      delete process.env["JIRO_SEARCH_URL"];
+    } else {
+      process.env["JIRO_SEARCH_URL"] = originalJiroUrl;
+    }
+    if (originalLegacyUrl === undefined) {
+      delete process.env["JIROSEARCH_API_URL"];
+    } else {
+      process.env["JIROSEARCH_API_URL"] = originalLegacyUrl;
+    }
     if (originalJiroKey === undefined) {
       delete process.env["JIROSEARCH_API_KEY"];
     } else {
       process.env["JIROSEARCH_API_KEY"] = originalJiroKey;
-    }
-    if (originalTrueKey === undefined) {
-      delete process.env["TRUESCRAPE_API_KEY"];
-    } else {
-      process.env["TRUESCRAPE_API_KEY"] = originalTrueKey;
     }
   });
 
@@ -38,15 +44,17 @@ describe("scrapeJirosearch and social platform routing", () => {
     }
   });
 
-  it("returns no_key status when both JIROSEARCH_API_KEY and fallback key are unset", async () => {
+  it("returns no_key status when JIRO_SEARCH_URL and legacy Jirosearch config are unset", async () => {
+    delete process.env["JIRO_SEARCH_URL"];
+    delete process.env["JIROSEARCH_API_URL"];
     delete process.env["JIROSEARCH_API_KEY"];
-    delete process.env["TRUESCRAPE_API_KEY"];
     const res = await scrapePlatform({ name: "Acme", domain: "acme.com" }, "instagram");
     expect(res).toEqual({ status: "no_key", reviews: [] });
   });
 
-  it("calls Jirosearch API and maps items to RawReview across instagram, linkedin, x, and youtube", async () => {
-    process.env["JIROSEARCH_API_KEY"] = "test-jiro-key";
+  it("calls JIRO_SEARCH_URL/api/search and maps items to RawReview across x, instagram, facebook, pinterest, linkedin", async () => {
+    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
+    delete process.env["JIROSEARCH_API_KEY"];
     const nowIso = new Date().toISOString();
 
     const fetchMock = vi.fn().mockResolvedValue(
@@ -55,6 +63,9 @@ describe("scrapeJirosearch and social platform routing", () => {
           results: [
             {
               source: "instagram",
+              productIdentifier: "acme",
+              reviewId: "rev-1",
+              rating: 1,
               title: "Support frustration",
               body: "Acme support took days to reply.",
               reviewerName: "@insta_user",
@@ -74,11 +85,21 @@ describe("scrapeJirosearch and social platform routing", () => {
     );
     vi.stubGlobal("fetch", fetchMock);
 
-    const reviews = await scrapeJirosearch("Acme", ["instagram", "linkedin", "x", "youtube"]);
+    const reviews = await scrapeJirosearch("Acme", [
+      "x",
+      "instagram",
+      "facebook",
+      "pinterest",
+      "linkedin",
+    ]);
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://api.jirosearch.com/v1/search",
+      "https://jiro-search-api-xyz.onrender.com/api/search",
       expect.objectContaining({
         method: "POST",
+        body: JSON.stringify({
+          query: "Acme",
+          platforms: ["x", "instagram", "facebook", "pinterest", "linkedin"],
+        }),
       }),
     );
 
@@ -101,8 +122,25 @@ describe("scrapeJirosearch and social platform routing", () => {
     });
   });
 
+  it("handles sleeping or failing Jirosearch microservice gracefully by returning an empty array", async () => {
+    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com/";
+
+    vi.stubGlobal(
+      "fetch",
+      vi.fn().mockResolvedValue(new Response("Service Unavailable", { status: 503 })),
+    );
+    await expect(scrapeJirosearch("Acme", ["x", "linkedin"])).resolves.toEqual([]);
+
+    vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("fetch failed / timeout")));
+    await expect(scrapeJirosearch("Acme", ["instagram", "facebook"])).resolves.toEqual([]);
+
+    delete process.env["JIRO_SEARCH_URL"];
+    delete process.env["JIROSEARCH_API_KEY"];
+    await expect(scrapeJirosearch("Acme", ["pinterest"])).resolves.toEqual([]);
+  });
+
   it("routes all Jirosearch platforms cleanly in scrapePlatform", async () => {
-    process.env["JIROSEARCH_API_KEY"] = "test-jiro-key";
+    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     const nowIso = new Date().toISOString();
 
     const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
@@ -153,7 +191,7 @@ describe("scrapeJirosearch and social platform routing", () => {
   });
 
   it("filters old Jirosearch social posts through the same 48-hour gate", async () => {
-    process.env["JIROSEARCH_API_KEY"] = "test-jiro-key";
+    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     const oldDate = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -184,7 +222,7 @@ describe("scrapeJirosearch and social platform routing", () => {
   });
 
   it("keeps the existing historical mode when the 48-hour filter is explicitly disabled", async () => {
-    process.env["JIROSEARCH_API_KEY"] = "test-jiro-key";
+    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     const oldDate = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
@@ -217,10 +255,10 @@ describe("scrapeJirosearch and social platform routing", () => {
   });
 
   it("recovers a missing social-post date from publication metadata before filtering", async () => {
-    process.env["JIROSEARCH_API_KEY"] = "test-jiro-key";
+    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     const publishedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     const fetchMock = vi.fn().mockImplementation(async (url: string | URL | Request) => {
-      if (String(url).includes("api.jirosearch.com")) {
+      if (String(url).includes("jiro-search-api-xyz.onrender.com")) {
         return new Response(
           JSON.stringify({
             results: [
@@ -251,9 +289,9 @@ describe("scrapeJirosearch and social platform routing", () => {
   });
 
   it("rejects undated posts when publication metadata cannot be recovered", async () => {
-    process.env["JIROSEARCH_API_KEY"] = "test-jiro-key";
+    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     const fetchMock = vi.fn().mockImplementation(async (url: string | URL | Request) => {
-      if (String(url).includes("api.jirosearch.com")) {
+      if (String(url).includes("jiro-search-api-xyz.onrender.com")) {
         return new Response(
           JSON.stringify({
             results: [

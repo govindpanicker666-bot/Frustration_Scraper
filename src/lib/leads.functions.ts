@@ -269,3 +269,83 @@ export const saveCompanyProfile = createServerFn({ method: "POST" })
       preserveEmptyName: false,
     });
   });
+
+export const getTutorialStatus = createServerFn({ method: "GET" })
+  .middleware([requireAppSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { readTutorialStatus } = await import("./tutorial.server");
+    return readTutorialStatus(context.supabase, context.userId);
+  });
+
+export const markTutorialSeen = createServerFn({ method: "POST" })
+  .middleware([requireAppSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { markTutorialSeenInDb } = await import("./tutorial.server");
+    const emailClaim =
+      context.claims && typeof context.claims["email"] === "string"
+        ? context.claims["email"]
+        : null;
+    return markTutorialSeenInDb(context.supabase, context.userId, emailClaim);
+  });
+
+export const syncMyFullName = createServerFn({ method: "POST" })
+  .middleware([requireAppSupabaseAuth])
+  .inputValidator((d: unknown) =>
+    z.object({ full_name: z.string().trim().min(1).max(120) }).parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    const { syncProfileFullNameInDb } = await import("./account.server");
+    const emailClaim =
+      context.claims && typeof context.claims["email"] === "string"
+        ? context.claims["email"]
+        : null;
+    return syncProfileFullNameInDb(context.supabase, context.userId, data.full_name, emailClaim);
+  });
+
+export const syncPendingSignupName = createServerFn({ method: "POST" })
+  .inputValidator((d: unknown) =>
+    z
+      .object({
+        user_id: z.string().uuid(),
+        full_name: z.string().trim().min(1).max(120),
+      })
+      .parse(d),
+  )
+  .handler(async ({ data }) => {
+    const { syncPendingSignupProfileInDb } = await import("./account.server");
+    return syncPendingSignupProfileInDb(data.user_id, data.full_name);
+  });
+
+export const deleteMyAccount = createServerFn({ method: "POST" })
+  .middleware([requireAppSupabaseAuth])
+  .handler(async ({ context }) => {
+    const { deleteUserAccountInDb } = await import("./account.server");
+    return deleteUserAccountInDb(context.userId);
+  });
+
+export const submitUserFeedback = createServerFn({ method: "POST" })
+  .middleware([requireAppSupabaseAuth])
+  .inputValidator((d: unknown) =>
+    z
+      .object({
+        type: z.enum(["feedback", "error"]),
+        subject: z.string().trim().min(2, "Please enter a brief subject").max(120),
+        details: z.string().trim().min(5, "Please add a few more details").max(2000),
+        pagePath: z.string().trim().max(200).optional(),
+      })
+      .parse(d),
+  )
+  .handler(async ({ data, context }) => {
+    const { submitUserFeedbackInDb } = await import("./account.server");
+    const emailClaim =
+      context.claims && typeof context.claims["email"] === "string"
+        ? context.claims["email"]
+        : undefined;
+    return submitUserFeedbackInDb(context.supabase, context.userId, {
+      type: data.type,
+      subject: data.subject,
+      details: data.details,
+      pagePath: data.pagePath,
+      userEmail: emailClaim,
+    });
+  });

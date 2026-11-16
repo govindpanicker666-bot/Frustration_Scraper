@@ -2,7 +2,7 @@ import { useMutation, useQuery, useQueryClient } from "@tanstack/react-query";
 import { useEffect, useState } from "react";
 import { toast } from "sonner";
 import { supabase } from "@/integrations/supabase/client";
-import { formatStatValue } from "@/lib/pipeline";
+import { formatLocalHour, formatStatValue, formatUtcHour } from "@/lib/pipeline";
 import { Button } from "@/components/ui/button";
 import { Switch } from "@/components/ui/switch";
 import {
@@ -95,22 +95,6 @@ export function AutoScrape() {
       toast.error(err instanceof Error ? err.message : "Could not save");
     },
   });
-
-  const formatUtcHour = (h: number) => {
-    const d = new Date();
-    d.setUTCHours(h, 0, 0, 0);
-    return `${d.toLocaleTimeString([], {
-      hour: "numeric",
-      minute: "2-digit",
-      timeZone: "UTC",
-    })} (UTC)`;
-  };
-
-  const formatLocalHour = (h: number) => {
-    const d = new Date();
-    d.setUTCHours(h, 0, 0, 0);
-    return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
-  };
 
   return (
     <div className="glass space-y-3 p-5">

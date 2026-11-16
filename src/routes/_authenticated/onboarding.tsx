@@ -25,7 +25,8 @@ import {
 import { Button } from "@/components/ui/button";
 import { Input } from "@/components/ui/input";
 import { cn } from "@/lib/utils";
-import { domainOf } from "@/lib/pipeline";
+import { domainOf, type ScrapeStatusSnapshot } from "@/lib/pipeline";
+import { FirstRunScan } from "@/components/FirstRunScan";
 
 export const Route = createFileRoute("/_authenticated/onboarding")({
   head: () => ({
@@ -51,6 +52,10 @@ function Onboarding() {
   const [desc, setDesc] = useState("");
   const [loading, setLoading] = useState(false);
   const [saving, setSaving] = useState(false);
+  const [firstRunScan, setFirstRunScan] = useState<{
+    status: ScrapeStatusSnapshot;
+    startError: string | null;
+  } | null>(null);
   const [list, setList] = useState<(DetectedCompetitor & { on: boolean })[]>([]);
   const [manual, setManual] = useState("");
   const [confirmDeleteAll, setConfirmDeleteAll] = useState(false);
@@ -114,27 +119,127 @@ function Onboarding() {
       return;
     }
     setSaving(true);
-    const {
-      data: { user },
-    } = await supabase.auth.getUser();
-    const { error } = await supabase.from("competitors").insert(
-      picks.map((c) => ({
-        user_id: user!.id,
-        name: c.name,
-        url: c.url || null,
-        category: c.category,
-        domain: domainOf(c.url),
-        description: c.description ?? null,
-        keywords: c.keywords ?? [],
-      })),
-    );
-    setSaving(false);
-    if (error) {
-      toast.error("Could not save competitors");
-      return;
+    try {
+      const {
+        data: { user },
+      } = await supabase.auth.getUser();
+      if (!user) {
+        toast.error("Please sign in again.");
+        return;
+      }
+
+      const { data: insertedRows, error } = await supabase
+        .from("competitors")
+        .insert(
+          picks.map((c) => ({
+            user_id: user.id,
+            name: c.name,
+            url: c.url || null,
+            category: c.category,
+            domain: domainOf(c.url),
+            description: c.description ?? null,
+            keywords: c.keywords ?? [],
+          })),
+        )
+        .select("id");
+
+      if (error) {
+        toast.error("Could not save competitors");
+        return;
+      }
+
+      const insertedIds = (insertedRows ?? []).map((r) => r.id).filter(Boolean);
+      const { data: sessionData } = await supabase.auth.getSession();
+      const token = sessionData.session?.access_token;
+
+      let initialStatus: ScrapeStatusSnapshot | null = null;
+      let startError: string | null = null;
+
+      if (token && insertedIds.length > 0) {
+        try {
+          const controller = new AbortController();
+          const timeoutId = window.setTimeout(() => controller.abort(), 8000);
+          const res = await fetch("/api/admin/scrape-all", {
+            method: "POST",
+            signal: controller.signal,
+            headers: {
+              Accept: "application/json",
+              "Content-Type": "application/json",
+              Authorization: `Bearer ${token}`,
+            },
+            body: JSON.stringify({
+              competitor_ids: insertedIds,
+              platform: "all",
+            }),
+          });
+          window.clearTimeout(timeoutId);
+
+          const payload = (await res.json().catch(() => ({}))) as {
+            ok?: boolean;
+            status?: ScrapeStatusSnapshot;
+            error?: string;
+          };
+          if (res.ok && payload.ok && payload.status) {
+            initialStatus = payload.status;
+          } else if (!res.ok) {
+            startError = payload.error || `Failed to start live scan (HTTP ${res.status})`;
+          }
+        } catch (scrapeErr) {
+          console.warn("[Onboarding] background scrape trigger warning:", scrapeErr);
+        }
+      }
+
+      const fallbackStatus: ScrapeStatusSnapshot = {
+        job_id: "pending",
+        job_status: startError ? "idle" : "running",
+        current_competitor_index: 0,
+        total_competitors: Math.max(1, insertedIds.length || picks.length),
+        current_competitor_name: picks[0]?.name ?? null,
+        step: startError ? "idle" : "fetching",
+        competitor_names: picks.map((p) => p.name),
+        stats: {
+          found: 0,
+          relevant: 0,
+          analyzed: 0,
+          saved: 0,
+          emails: 0,
+          linkedin: 0,
+          social: 0,
+          discarded: 0,
+        },
+        sources: [],
+        errors: [],
+      };
+
+      await Promise.all([
+        qc.invalidateQueries({ queryKey: ["competitors"] }),
+        qc.invalidateQueries({ queryKey: ["leads"] }),
+      ]);
+
+      setFirstRunScan({
+        status: initialStatus ?? fallbackStatus,
+        startError,
+      });
+    } finally {
+      setSaving(false);
     }
-    toast.success(`Saved ${picks.length} competitors`);
-    await qc.invalidateQueries({ queryKey: ["competitors"] });
+  }
+
+  async function handleViewDashboard(scanStillRunning: boolean) {
+    if (typeof window !== "undefined") {
+      window.sessionStorage.setItem("churnhound_onboarding_schedule_prompt", "1");
+      if (scanStillRunning) {
+        window.sessionStorage.setItem("churnhound_initial_scan_active", String(Date.now()));
+      } else {
+        window.sessionStorage.removeItem("churnhound_initial_scan_active");
+      }
+    }
+
+    await Promise.all([
+      qc.invalidateQueries({ queryKey: ["competitors"] }),
+      qc.invalidateQueries({ queryKey: ["leads"] }),
+      qc.invalidateQueries({ queryKey: ["stats"] }),
+    ]);
     navigate({ to: "/dashboard" });
   }
 
@@ -178,6 +283,18 @@ function Onboarding() {
     } finally {
       setDeletingAll(false);
     }
+  }
+
+  if (firstRunScan) {
+    return (
+      <FirstRunScan
+        initialStatus={firstRunScan.status}
+        startError={firstRunScan.startError}
+        onViewDashboard={(scanStillRunning) => {
+          void handleViewDashboard(scanStillRunning);
+        }}
+      />
+    );
   }
 
   return (
@@ -265,9 +382,29 @@ function Onboarding() {
               Add
             </Button>
             <Button variant="hero" className="ml-auto" disabled={saving} onClick={save}>
-              Save {list.filter((c) => c.on).length} competitors
+              {saving ? (
+                <>
+                  <Loader2 className="animate-spin" />
+                  Starting Monitoring…
+                </>
+              ) : (
+                `Finish & Start Monitoring (${list.filter((c) => c.on).length})`
+              )}
             </Button>
           </div>
+          {saving && (
+            <div className="glass flex items-center gap-3 border-primary/30 bg-primary/5 p-4 text-sm">
+              <Loader2 className="h-5 w-5 shrink-0 animate-spin text-primary" />
+              <div>
+                <div className="font-medium">
+                  Analyzing your competitors and finding frustrated leads. This may take a minute...
+                </div>
+                <div className="text-xs text-muted-foreground">
+                  Starting background web scan and preparing your dashboard.
+                </div>
+              </div>
+            </div>
+          )}
         </div>
       )}
 

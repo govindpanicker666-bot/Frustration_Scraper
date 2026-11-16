@@ -8,10 +8,18 @@ const mocks = vi.hoisted(() => ({
   geminiJson: vi.fn(),
   findContact: vi.fn(),
   scrapePlatform: vi.fn(),
+  scrapeJirosearch: vi.fn(),
+  filterAndRecoverJirosearchReviews: vi.fn(async (reviews: unknown[]) => reviews),
+  hasJirosearchConfig: vi.fn(() => true),
 }));
 vi.mock("./ai.server", () => ({ geminiJson: mocks.geminiJson }));
 vi.mock("./enrich.server", () => ({ findContact: mocks.findContact }));
-vi.mock("./scrapers.server", () => ({ scrapePlatform: mocks.scrapePlatform }));
+vi.mock("./scrapers.server", () => ({
+  scrapePlatform: mocks.scrapePlatform,
+  scrapeJirosearch: mocks.scrapeJirosearch,
+  filterAndRecoverJirosearchReviews: mocks.filterAndRecoverJirosearchReviews,
+  hasJirosearchConfig: mocks.hasJirosearchConfig,
+}));
 
 describe("negative-only lead analysis", () => {
   it("does not save a normal company mention even if AI assigns score 1", async () => {
@@ -330,6 +338,18 @@ describe("negative-only lead analysis", () => {
         published_at: new Date().toISOString(),
       })),
     }));
+    mocks.scrapeJirosearch.mockImplementation(async (_query: string, platforms: string[]) =>
+      platforms.flatMap((platform) =>
+        Array.from({ length: 2 }, (_, i) => ({
+          platform,
+          reviewer_name: `Reviewer ${i}`,
+          reviewer_profile_url: null,
+          source_url: `https://example.com/${platform}/${i}`,
+          text: `Complaint about product ${i}`,
+          published_at: new Date().toISOString(),
+        })),
+      ),
+    );
     const client = {
       from: () => ({
         select: () => ({
@@ -348,6 +368,11 @@ describe("negative-only lead analysis", () => {
     } as unknown as SupabaseClient<Database>;
 
     const result = await scrapeCore(client, "c", "all");
+    expect(mocks.scrapeJirosearch).toHaveBeenCalledWith(
+      "HubSpot",
+      ["linkedin", "x", "instagram", "facebook", "pinterest"],
+      expect.objectContaining({ domain: "hubspot.com", apply48HourFilter: true }),
+    );
     expect(result.reviews).toHaveLength(PLATFORMS.length * 2);
     expect(result.reviews.length).toBeGreaterThan(60);
   });

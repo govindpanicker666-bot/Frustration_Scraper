@@ -505,7 +505,9 @@ export type Database = {
           company_url: string | null;
           created_at: string;
           email: string | null;
+          full_name: string | null;
           has_completed_brand_baseline: boolean;
+          has_seen_tutorial: boolean;
           id: string;
         };
         Insert: {
@@ -513,7 +515,9 @@ export type Database = {
           company_url?: string | null;
           created_at?: string;
           email?: string | null;
+          full_name?: string | null;
           has_completed_brand_baseline?: boolean;
+          has_seen_tutorial?: boolean;
           id: string;
         };
         Update: {
@@ -521,7 +525,9 @@ export type Database = {
           company_url?: string | null;
           created_at?: string;
           email?: string | null;
+          full_name?: string | null;
           has_completed_brand_baseline?: boolean;
+          has_seen_tutorial?: boolean;
           id?: string;
         };
         Relationships: [];

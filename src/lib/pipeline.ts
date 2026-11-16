@@ -1822,3 +1822,212 @@ export function extractScoredReviews(rawOutput: unknown, batchLength: number): S
 
   return out;
 }
+
+export function formatUtcHour(h: number): string {
+  const d = new Date();
+  d.setUTCHours(h, 0, 0, 0);
+  return `${d.toLocaleTimeString([], {
+    hour: "numeric",
+    minute: "2-digit",
+    timeZone: "UTC",
+  })} (UTC)`;
+}
+
+export function formatLocalHour(h: number): string {
+  const d = new Date();
+  d.setUTCHours(h, 0, 0, 0);
+  return d.toLocaleTimeString([], { hour: "numeric", minute: "2-digit" });
+}
+
+export interface ScrapeStatusStatsView {
+  found: number;
+  relevant: number;
+  analyzed: number;
+  saved: number;
+  emails: number;
+  linkedin: number;
+  social: number;
+  discarded: number;
+}
+
+export interface ScrapeStatusSnapshot {
+  job_id: string;
+  job_status: "idle" | "running" | "completed";
+  current_competitor_index: number;
+  total_competitors: number;
+  current_competitor_name: string | null;
+  step: "idle" | "fetching" | "analyzing" | "done";
+  stats: ScrapeStatusStatsView;
+  sources?: Array<{ platform: string; status: string; count: number }>;
+  errors?: string[];
+  competitor_names?: string[];
+}
+
+export interface FirstRunProgressMetrics {
+  processedCompetitors: number;
+  totalCompetitors: number;
+  progressPercent: number;
+  totalPostsFound: number;
+  leadsSaved: number;
+  discarded: number;
+  canViewDashboard: boolean;
+  isComplete: boolean;
+  earlyUnlockReady: boolean;
+}
+
+export interface FirstRunLogEntry {
+  id: string;
+  timestamp: string;
+  message: string;
+  tone: "info" | "success" | "warn";
+}
+
+export function computeFirstRunProgress(
+  status: ScrapeStatusSnapshot,
+  fallbackTotal = 1,
+  elapsedSeconds = 0,
+  hasStartError = false,
+): FirstRunProgressMetrics {
+  const totalCompetitors = Math.max(1, status.total_competitors || fallbackTotal);
+  const isComplete = status.job_status === "completed";
+  const processedCompetitors = isComplete
+    ? totalCompetitors
+    : Math.min(totalCompetitors, Math.max(0, status.current_competitor_index));
+
+  const rawPercent = Math.round((processedCompetitors / totalCompetitors) * 100);
+  const progressPercent = isComplete
+    ? 100
+    : Math.min(99, Math.max(status.job_status === "running" ? 4 : 0, rawPercent));
+
+  const earlyUnlockReady = !isComplete && processedCompetitors >= 3;
+  const canViewDashboard =
+    isComplete || processedCompetitors >= 3 || elapsedSeconds >= 90 || hasStartError;
+
+  return {
+    processedCompetitors,
+    totalCompetitors,
+    progressPercent,
+    totalPostsFound: Math.max(0, status.stats.found ?? 0),
+    leadsSaved: Math.max(0, status.stats.saved ?? 0),
+    discarded: Math.max(0, status.stats.discarded ?? 0),
+    canViewDashboard,
+    isComplete,
+    earlyUnlockReady,
+  };
+}
+
+export function diffScrapeStatusLogs(
+  prev: ScrapeStatusSnapshot | null,
+  next: ScrapeStatusSnapshot,
+  now: Date = new Date(),
+  sequenceSeed = 0,
+): FirstRunLogEntry[] {
+  const timestamp = now.toLocaleTimeString([], {
+    hour: "2-digit",
+    minute: "2-digit",
+    second: "2-digit",
+    hour12: false,
+  });
+  const total = Math.max(1, next.total_competitors || 1);
+  const entries: FirstRunLogEntry[] = [];
+  let seq = sequenceSeed;
+
+  const push = (message: string, tone: FirstRunLogEntry["tone"] = "info") => {
+    entries.push({
+      id: `${now.getTime()}-${seq++}`,
+      timestamp,
+      message,
+      tone,
+    });
+  };
+
+  if (!prev) {
+    if (next.job_status === "completed") {
+      push(
+        `Scan complete! Saved ${next.stats.saved} qualified lead${next.stats.saved === 1 ? "" : "s"} from ${next.stats.found} post${next.stats.found === 1 ? "" : "s"}.`,
+        "success",
+      );
+    } else if (next.current_competitor_name) {
+      push(
+        `Scanning ${next.current_competitor_name} (${Math.min(next.current_competitor_index + 1, total)}/${total}) across social & review platforms...`,
+      );
+    } else {
+      push(`Initializing scan across ${total} competitor${total === 1 ? "" : "s"}...`);
+    }
+    return entries;
+  }
+
+  const targetName = next.current_competitor_name ?? prev.current_competitor_name ?? "competitors";
+
+  if (next.stats.found > prev.stats.found) {
+    const deltaFound = next.stats.found - prev.stats.found;
+    push(
+      `Found ${deltaFound} post${deltaFound === 1 ? "" : "s"} about ${targetName} (${next.stats.found} total scanned)`,
+    );
+  }
+
+  if (
+    next.step === "analyzing" &&
+    (prev.step !== "analyzing" || prev.current_competitor_index !== next.current_competitor_index)
+  ) {
+    push(`Gemini analyzing ${targetName} mentions for frustration & buying signals...`);
+  }
+
+  if (next.stats.saved > prev.stats.saved) {
+    const deltaSaved = next.stats.saved - prev.stats.saved;
+    push(`Qualified lead saved! (+${deltaSaved} new · ${next.stats.saved} total saved)`, "success");
+  }
+
+  if (next.stats.discarded > prev.stats.discarded) {
+    const deltaDiscarded = next.stats.discarded - prev.stats.discarded;
+    push(
+      `Filtered out ${deltaDiscarded} non-lead post${deltaDiscarded === 1 ? "" : "s"} (${next.stats.discarded} discarded)`,
+    );
+  }
+
+  const deltaEmails = Math.max(0, next.stats.emails - prev.stats.emails);
+  const deltaLinkedin = Math.max(0, next.stats.linkedin - prev.stats.linkedin);
+  if (deltaEmails > 0 || deltaLinkedin > 0) {
+    const foundParts = [
+      deltaEmails > 0 ? `${deltaEmails} email${deltaEmails === 1 ? "" : "s"}` : "",
+      deltaLinkedin > 0 ? `${deltaLinkedin} LinkedIn profile${deltaLinkedin === 1 ? "" : "s"}` : "",
+    ].filter(Boolean);
+    push(`Contact enrichment discovered ${foundParts.join(" and ")}.`, "success");
+  }
+
+  if (
+    next.current_competitor_index >= 3 &&
+    prev.current_competitor_index < 3 &&
+    next.job_status === "running"
+  ) {
+    push("3 competitors processed — View Dashboard is now unlocked!", "success");
+  }
+
+  if (
+    next.job_status === "running" &&
+    next.current_competitor_name &&
+    (next.current_competitor_name !== prev.current_competitor_name ||
+      next.current_competitor_index !== prev.current_competitor_index)
+  ) {
+    push(
+      `Now scanning ${next.current_competitor_name} (${Math.min(next.current_competitor_index + 1, total)}/${total})...`,
+    );
+  }
+
+  const prevErrors = prev.errors?.length ?? 0;
+  const nextErrors = next.errors?.length ?? 0;
+  if (nextErrors > prevErrors && next.errors) {
+    for (const err of next.errors.slice(prevErrors)) {
+      push(`Note: ${err}`, "warn");
+    }
+  }
+
+  if (next.job_status === "completed" && prev.job_status !== "completed") {
+    push(
+      `First scan complete! Saved ${next.stats.saved} qualified lead${next.stats.saved === 1 ? "" : "s"} from ${next.stats.found} scanned posts.`,
+      "success",
+    );
+  }
+
+  return entries;
+}
