@@ -1017,34 +1017,79 @@ export function resolveJirosearchEndpoint(): string | null {
     process.env["JIRO_SEARCH_URL"]?.trim() || process.env["JIROSEARCH_API_URL"]?.trim() || "";
   if (raw) {
     const trimmed = raw.replace(/\/+$/, "");
-    if (/\/(?:api\/search|v1\/search|search)$/i.test(trimmed)) {
+    if (/\/(?:api\/)?(?:v1\/)?social\/search$/i.test(trimmed)) {
       return trimmed;
     }
-    return `${trimmed}/search`;
+    if (/\/(?:api\/search|v1\/search|search)$/i.test(trimmed)) {
+      return trimmed.replace(/\/search$/i, "/social/search");
+    }
+    return `${trimmed}/social/search`;
   }
   if (process.env["JIROSEARCH_API_KEY"]?.trim()) {
-    return "https://api.jirosearch.com/v1/search";
+    return "https://api.jirosearch.com/v1/social/search";
   }
   return null;
 }
 
-function getJirosearchCandidateEndpoints(): string[] {
-  const primary = resolveJirosearchEndpoint();
-  if (!primary) return [];
-
-  const raw =
-    process.env["JIRO_SEARCH_URL"]?.trim() || process.env["JIROSEARCH_API_URL"]?.trim() || "";
-  const trimmed = raw.replace(/\/+$/, "");
-  // If user gave a base URL without an explicit path, try /search first (Jiro docs)
-  // and fall back to /api/search only on 404 in case a custom wrapper is mounted there.
-  if (trimmed && !/\/(?:api\/search|v1\/search|search)$/i.test(trimmed)) {
-    return [`${trimmed}/search`, `${trimmed}/api/search`];
-  }
-  return [primary];
-}
-
 export function hasJirosearchConfig(): boolean {
   return resolveJirosearchEndpoint() !== null;
+}
+
+function extractJirosearchRawList(payload: unknown): unknown[] {
+  if (Array.isArray(payload)) return payload;
+  if (!payload || typeof payload !== "object") return [];
+
+  const obj = payload as Record<string, unknown>;
+  for (const key of [
+    "results",
+    "data",
+    "items",
+    "posts",
+    "social_results",
+    "organic_results",
+    "reviews",
+    "hits",
+    "news_results",
+  ]) {
+    const val = obj[key];
+    if (Array.isArray(val)) return val as unknown[];
+    if (val && typeof val === "object") {
+      const flattened: unknown[] = [];
+      for (const [platformKey, bucket] of Object.entries(val as Record<string, unknown>)) {
+        if (!Array.isArray(bucket)) continue;
+        for (const entry of bucket) {
+          if (entry && typeof entry === "object") {
+            flattened.push({
+              ...(entry as Record<string, unknown>),
+              ...("source" in (entry as Record<string, unknown>) ||
+              "platform" in (entry as Record<string, unknown>)
+                ? {}
+                : { source: platformKey }),
+            });
+          }
+        }
+      }
+      if (flattened.length > 0) return flattened;
+    }
+  }
+
+  // Handle direct platform-keyed response objects like { linkedin: [...], x: [...] }
+  const directFlattened: unknown[] = [];
+  for (const [key, val] of Object.entries(obj)) {
+    if (!Array.isArray(val)) continue;
+    for (const entry of val) {
+      if (entry && typeof entry === "object") {
+        directFlattened.push({
+          ...(entry as Record<string, unknown>),
+          ...("source" in (entry as Record<string, unknown>) ||
+          "platform" in (entry as Record<string, unknown>)
+            ? {}
+            : { source: key }),
+        });
+      }
+    }
+  }
+  return directFlattened;
 }
 
 export async function scrapeJirosearch(
@@ -1056,7 +1101,7 @@ export async function scrapeJirosearch(
     apply48HourFilter?: boolean | undefined;
   } = {},
 ): Promise<RawReview[]> {
-  const endpoints = getJirosearchCandidateEndpoints();
+  const endpoint = resolveJirosearchEndpoint();
   const apiKey = process.env["JIROSEARCH_API_KEY"]?.trim();
 
   const normalizedPlatforms = platforms
@@ -1065,7 +1110,7 @@ export async function scrapeJirosearch(
     .filter((p): p is Platform => JIROSEARCH_PLATFORM_SET.has(p as Platform));
 
   if (!query.trim() || normalizedPlatforms.length === 0) return [];
-  if (endpoints.length === 0) {
+  if (!endpoint) {
     console.warn("[Jirosearch] JIRO_SEARCH_URL is not set; returning empty results.");
     return [];
   }
@@ -1084,86 +1129,55 @@ export async function scrapeJirosearch(
   }
 
   const requestPayload = {
-    q: queryText,
-    engine: "google",
+    query: queryText,
+    platforms: normalizedPlatforms,
   };
 
   let payload: unknown = null;
-  for (let i = 0; i < endpoints.length; i++) {
-    const endpoint = endpoints[i]!;
-    const hasFallback = i + 1 < endpoints.length;
+  try {
+    console.log("[Jirosearch] Sending POST request:", {
+      url: endpoint,
+      payload: requestPayload,
+    });
+
+    const res = await fetch(endpoint, {
+      method: "POST",
+      headers,
+      body: JSON.stringify(requestPayload),
+      signal: AbortSignal.timeout(JIROSEARCH_TIMEOUT_MS),
+    });
+
+    const rawText = await res.text();
+    console.log("[Jirosearch] Response received:", {
+      url: endpoint,
+      status: res.status,
+      ok: res.ok,
+      body: rawText.slice(0, 4000),
+    });
+
+    if (!res.ok) {
+      console.warn(`[Jirosearch] HTTP ${res.status} from ${endpoint}; returning empty results.`);
+      return [];
+    }
+
     try {
-      console.log("[Jirosearch] Sending POST request:", {
-        url: endpoint,
-        payload: requestPayload,
-      });
-
-      const res = await fetch(endpoint, {
-        method: "POST",
-        headers,
-        body: JSON.stringify(requestPayload),
-        signal: AbortSignal.timeout(JIROSEARCH_TIMEOUT_MS),
-      });
-
-      const rawText = await res.text();
-      console.log("[Jirosearch] Response received:", {
-        url: endpoint,
-        status: res.status,
-        ok: res.ok,
-        body: rawText.slice(0, 4000),
-      });
-
-      if (res.status === 404 && hasFallback) {
-        console.warn(
-          `[Jirosearch] HTTP 404 from ${endpoint}; retrying fallback endpoint ${endpoints[i + 1]}`,
-        );
-        continue;
-      }
-
-      if (!res.ok) {
-        console.warn(`[Jirosearch] HTTP ${res.status} from ${endpoint}; returning empty results.`);
-        return [];
-      }
-
-      try {
-        payload = rawText ? (JSON.parse(rawText) as unknown) : null;
-      } catch (parseErr) {
-        console.warn(
-          `[Jirosearch] Invalid JSON returned by ${endpoint}:`,
-          parseErr instanceof Error ? parseErr.message : parseErr,
-        );
-        return [];
-      }
-      break;
-    } catch (err) {
+      payload = rawText ? (JSON.parse(rawText) as unknown) : null;
+    } catch (parseErr) {
       console.warn(
-        `[Jirosearch] Request to ${endpoint} failed (timeout/asleep/unreachable):`,
-        err instanceof Error ? `${err.name}: ${err.message}` : err,
+        `[Jirosearch] Invalid JSON returned by ${endpoint}:`,
+        parseErr instanceof Error ? parseErr.message : parseErr,
       );
       return [];
     }
+  } catch (err) {
+    console.warn(
+      `[Jirosearch] Request to ${endpoint} failed (timeout/asleep/unreachable):`,
+      err instanceof Error ? `${err.name}: ${err.message}` : err,
+    );
+    return [];
   }
 
-  const rawList: unknown[] = Array.isArray(payload)
-    ? payload
-    : payload && typeof payload === "object"
-      ? (() => {
-          const obj = payload as Record<string, unknown>;
-          for (const key of [
-            "organic_results",
-            "results",
-            "data",
-            "items",
-            "posts",
-            "reviews",
-            "hits",
-            "news_results",
-          ]) {
-            if (Array.isArray(obj[key])) return obj[key] as unknown[];
-          }
-          return [];
-        })()
-      : [];
+  const rawList = extractJirosearchRawList(payload);
 
   const fallbackPlatform = (normalizedPlatforms[0] as Platform | undefined) ?? "x";
   const out: RawReview[] = [];
@@ -1182,9 +1196,13 @@ export async function scrapeJirosearch(
     const rawSourceUrl =
       item["sourceUrl"] ??
       item["source_url"] ??
+      item["postUrl"] ??
+      item["post_url"] ??
       item["url"] ??
       item["link"] ??
       item["permalink"] ??
+      item["web_url"] ??
+      item["href"] ??
       (/^https?:\/\//i.test(rawReviewId) ? rawReviewId : null);
     const sourceUrl = typeof rawSourceUrl === "string" ? rawSourceUrl.trim() : "";
     if (!/^https?:\/\//i.test(sourceUrl)) continue;
@@ -1199,10 +1217,14 @@ export async function scrapeJirosearch(
     const rawBodyVal =
       item["body"] ??
       item["text"] ??
+      item["post_text"] ??
+      item["postText"] ??
       item["content"] ??
       item["snippet"] ??
       item["caption"] ??
-      item["description"];
+      item["description"] ??
+      item["message"] ??
+      item["summary"];
     const rawBody = typeof rawBodyVal === "string" ? stripHtml(rawBodyVal) : "";
     const text = (
       rawTitle && rawBody && !rawBody.toLowerCase().startsWith(rawTitle.toLowerCase())
@@ -1218,11 +1240,17 @@ export async function scrapeJirosearch(
       item["reviewer_name"] ??
       item["authorName"] ??
       item["author_name"] ??
+      item["author_handle"] ??
+      item["authorHandle"] ??
       (typeof item["author"] === "string" ? item["author"] : null) ??
       item["username"] ??
+      item["user_name"] ??
       item["handle"] ??
+      item["creator"] ??
       item["channelTitle"] ??
       userObj?.["name"] ??
+      userObj?.["display_name"] ??
+      userObj?.["full_name"] ??
       userObj?.["username"] ??
       userObj?.["handle"];
     const reviewerName =
@@ -1237,7 +1265,8 @@ export async function scrapeJirosearch(
       item["profileUrl"] ??
       item["profile_url"] ??
       userObj?.["url"] ??
-      userObj?.["profileUrl"];
+      userObj?.["profileUrl"] ??
+      userObj?.["profile_url"];
     const profileUrl =
       typeof rawProfileUrl === "string" && /^https?:\/\//i.test(rawProfileUrl.trim())
         ? rawProfileUrl.trim()
@@ -1250,12 +1279,17 @@ export async function scrapeJirosearch(
       item["published_at"],
       item["createdAt"],
       item["created_at"],
+      item["created_utc"],
       item["datePublished"],
       item["date_published"],
       item["postedAt"],
+      item["posted_at"],
       item["postDate"],
+      item["post_date"],
       item["date"],
       item["timestamp"],
+      item["time"],
+      item["created"],
     ];
     const parsedDate =
       rawDates.map(normalizePublishedDate).find(Boolean) || parseSnippetDate(rawBody);

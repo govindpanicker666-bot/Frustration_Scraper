@@ -52,7 +52,7 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res).toEqual({ status: "no_key", reviews: [] });
   });
 
-  it("calls JIRO_SEARCH_URL/search and maps items to RawReview across x, instagram, facebook, pinterest, linkedin, tiktok", async () => {
+  it("calls JIRO_SEARCH_URL/social/search with { query, platforms } and maps items to RawReview across x, instagram, facebook, pinterest, linkedin, tiktok", async () => {
     process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     delete process.env["JIROSEARCH_API_KEY"];
     const nowIso = new Date().toISOString();
@@ -94,22 +94,15 @@ describe("scrapeJirosearch and social platform routing", () => {
       "tiktok",
     ]);
     expect(fetchMock).toHaveBeenCalledWith(
-      "https://jiro-search-api-xyz.onrender.com/search",
+      "https://jiro-search-api-xyz.onrender.com/social/search",
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
-          q: "Acme",
-          engine: "google",
+          query: "Acme",
+          platforms: ["x", "instagram", "facebook", "pinterest", "linkedin", "tiktok"],
         }),
       }),
     );
-    const sentPayload = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as Record<
-      string,
-      unknown
-    >;
-    expect(sentPayload).not.toHaveProperty("platforms");
-    expect(sentPayload).not.toHaveProperty("sources");
-    expect(sentPayload).not.toHaveProperty("query");
 
     expect(reviews).toHaveLength(2);
     expect(reviews[0]).toEqual({
@@ -130,43 +123,50 @@ describe("scrapeJirosearch and social platform routing", () => {
     });
   });
 
-  it("falls back to /api/search when /search returns 404 on a bare JIRO_SEARCH_URL", async () => {
+  it("flattens platform-grouped /social/search results cleanly", async () => {
     process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     const nowIso = new Date().toISOString();
-    const fetchMock = vi
-      .fn()
-      .mockResolvedValueOnce(new Response("Not Found", { status: 404 }))
-      .mockResolvedValueOnce(
-        new Response(
-          JSON.stringify({
-            results: [
+    const fetchMock = vi.fn().mockResolvedValue(
+      new Response(
+        JSON.stringify({
+          results: {
+            linkedin: [
               {
-                source: "linkedin",
                 text: "Acme keeps dropping connections.",
-                reviewerName: "Sam Lee",
-                reviewedAt: nowIso,
-                sourceUrl: "https://www.linkedin.com/posts/sam-lee-1",
+                author_name: "Sam Lee",
+                posted_at: nowIso,
+                post_url: "https://www.linkedin.com/posts/sam-lee-1",
               },
             ],
-          }),
-          { status: 200, headers: { "Content-Type": "application/json" } },
-        ),
-      );
+            x: [
+              {
+                content: "Migrating off Acme today.",
+                username: "@dev_maya",
+                created_at: nowIso,
+                url: "https://x.com/dev_maya/status/999",
+              },
+            ],
+          },
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      ),
+    );
     vi.stubGlobal("fetch", fetchMock);
 
-    const reviews = await scrapeJirosearch("Acme", ["linkedin"]);
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      1,
-      "https://jiro-search-api-xyz.onrender.com/search",
-      expect.anything(),
-    );
-    expect(fetchMock).toHaveBeenNthCalledWith(
-      2,
-      "https://jiro-search-api-xyz.onrender.com/api/search",
-      expect.anything(),
-    );
-    expect(reviews).toHaveLength(1);
-    expect(reviews[0]?.platform).toBe("linkedin");
+    const reviews = await scrapeJirosearch("Acme", ["linkedin", "x"]);
+    expect(reviews).toHaveLength(2);
+    expect(reviews[0]).toMatchObject({
+      platform: "linkedin",
+      reviewer_name: "Sam Lee",
+      source_url: "https://www.linkedin.com/posts/sam-lee-1",
+      published_at: nowIso,
+    });
+    expect(reviews[1]).toMatchObject({
+      platform: "x",
+      reviewer_name: "@dev_maya",
+      source_url: "https://x.com/dev_maya/status/999",
+      published_at: nowIso,
+    });
   });
 
   it("handles sleeping or failing Jirosearch microservice gracefully by returning an empty array", async () => {
@@ -213,21 +213,23 @@ describe("scrapeJirosearch and social platform routing", () => {
 
     let callIdx = 0;
     const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
-      const sent = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
-      expect(sent["engine"]).toBe("google");
-      expect(typeof sent["q"]).toBe("string");
-      expect(sent).not.toHaveProperty("platforms");
-      expect(sent).not.toHaveProperty("sources");
+      const sent = JSON.parse(String(init?.body ?? "{}")) as {
+        query?: string;
+        platforms?: string[];
+      };
+      expect(typeof sent.query).toBe("string");
+      expect(Array.isArray(sent.platforms)).toBe(true);
 
-      const target = platformOrder[callIdx++] ?? "x";
+      const target = sent.platforms?.[0] ?? platformOrder[callIdx++] ?? "x";
       return new Response(
         JSON.stringify({
-          organic_results: [
+          results: [
             {
-              title: `Review on ${target}`,
-              snippet: `Review on ${target} about Acme.`,
-              link: urlByPlatform[target],
-              date: nowIso,
+              source: target,
+              body: `Review on ${target} about Acme.`,
+              reviewerName: "Alex Rivera",
+              reviewedAt: nowIso,
+              sourceUrl: urlByPlatform[target],
             },
           ],
         }),
@@ -280,11 +282,11 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res.status).toBe("ok");
     expect(res.reviews).toHaveLength(0);
     const sentBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as {
-      q?: string;
-      engine?: string;
+      query?: string;
+      platforms?: string[];
     };
-    expect(sentBody.q).toContain("after:");
-    expect(sentBody.engine).toBe("google");
+    expect(sentBody.query).toContain("after:");
+    expect(sentBody.platforms).toEqual(["x"]);
   });
 
   it("keeps the existing historical mode when the 48-hour filter is explicitly disabled", async () => {
@@ -315,11 +317,11 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res.status).toBe("ok");
     expect(res.reviews).toHaveLength(1);
     const sentBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as {
-      q?: string;
-      engine?: string;
+      query?: string;
+      platforms?: string[];
     };
-    expect(sentBody.q).not.toContain("after:");
-    expect(sentBody.engine).toBe("google");
+    expect(sentBody.query).not.toContain("after:");
+    expect(sentBody.platforms).toEqual(["x"]);
   });
 
   it("recovers a missing social-post date from publication metadata before filtering", async () => {
