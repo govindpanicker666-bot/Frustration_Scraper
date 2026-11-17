@@ -1,5 +1,11 @@
 import { describe, expect, it } from "vitest";
-import {\n  isLinkedInPostWithin48Hours,\n  normalizeLinkedInPostUrl,\n  normalizeLinkedInScrapedPosts,\n  normalizeThreadsSearchPosts,\n  parseLinkedInSearchDate,\n} from "./public-social-scrapers.server";
+import {
+  isLinkedInPostWithin48Hours,
+  normalizeLinkedInPostUrl,
+  normalizeLinkedInScrapedPosts,
+  normalizeThreadsSearchPosts,
+  parseLinkedInSearchDate,
+} from "./public-social-scrapers.server";
 
 describe("public social scraper normalizers", () => {
   it("validates and canonicalizes LinkedIn post URLs", () => {
