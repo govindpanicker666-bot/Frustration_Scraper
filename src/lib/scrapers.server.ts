@@ -931,6 +931,11 @@ const JIROSEARCH_PLATFORM_SET = new Set<Platform>([
   "threads",
 ]);
 
+/** Translate app platform identifiers to the names accepted by Jirosearch. */
+function toJirosearchApiPlatform(platform: Platform): string {
+  return platform === "x" ? "twitter" : platform;
+}
+
 function inferPlatformFromUrl(sourceUrl: string): Platform | null {
   try {
     const host = new URL(sourceUrl).hostname.toLowerCase();
@@ -1268,7 +1273,8 @@ export async function scrapeJirosearch(
     normalizedPlatforms.map(async (targetPlatform): Promise<RawReview[]> => {
       const requestPayload = {
         query: queryText,
-        platform: targetPlatform,
+        // The app uses "x" internally, but Jirosearch's API expects "twitter".
+        platform: toJirosearchApiPlatform(targetPlatform),
         limit: 10,
       };
 
