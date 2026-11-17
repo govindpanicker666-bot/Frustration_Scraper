@@ -51,13 +51,27 @@ function decodeSearchHtml(value: string): string {
 }
 
 function unwrapSearchResultUrl(value: unknown): string {
-  let candidate = textValue(value).replace(/&amp;/g, "&");
+  let candidate = decodeSearchHtml(textValue(value));
   if (candidate.startsWith("//")) candidate = "https:" + candidate;
-  for (let attempt = 0; attempt < 4; attempt++) {
+
+  for (let attempt = 0; attempt < 5; attempt++) {
     try {
       const parsed = new URL(candidate);
       const host = parsed.hostname.toLowerCase();
       if (host === "linkedin.com" || host.endsWith(".linkedin.com")) return parsed.toString();
+
+      // Bing RSS commonly wraps destination URLs in /ck/a?u=a1<base64url>.
+      if (host === "bing.com" || host.endsWith(".bing.com")) {
+        const encoded = parsed.searchParams.get("u") ?? "";
+        if (encoded.startsWith("a1") && encoded.length > 2) {
+          const decoded = Buffer.from(encoded.slice(2), "base64url").toString("utf8");
+          if (/^https?:\/\//i.test(decoded)) {
+            candidate = decoded;
+            continue;
+          }
+        }
+      }
+
       const wrapped = ["uddg", "url", "q", "u", "target", "dest"]
         .map((key) => parsed.searchParams.get(key))
         .find((entry) => entry && /^https?:\/\//i.test(entry));
@@ -99,13 +113,13 @@ export function parseLinkedInSearchDate(value: string, now = Date.now()): string
   const text = value.replace(/\s+/g, " ").trim();
   if (!text) return "";
   const relative = text.match(
-    /(?:^|[|·•–—]\s*|\b(?:posted|published|created|updated)\s*(?:on|at|:)?\s*)(just now|moments ago|today|yesterday|\d{1,4}\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|years?)\s*ago)(?=$|[\s|·•–—])/i,
+    /(?:^|[|·•–—]\s*|\b(?:posted|published|created|updated)\s*(?:on|at|:)?\s*)(just now|moments ago|today|yesterday|\d{1,4}\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|mo|years?|y)(?:\s*ago)?)(?=$|[\s|·•–—])/i,
   );
   if (relative && relative[1]) {
     const label = relative[1].toLowerCase();
     if (label === "just now" || label === "moments ago" || label === "today") return new Date(now).toISOString();
     if (label === "yesterday") return new Date(now - 36 * 60 * 60 * 1000).toISOString();
-    const amountMatch = label.match(/(\d{1,4})\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|years?)/i);
+    const amountMatch = label.match(/(\d{1,4})\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|mo|years?|y)/i);
     if (amountMatch) {
       const amount = Number(amountMatch[1]);
       const unit = amountMatch[2].toLowerCase();
@@ -114,7 +128,7 @@ export function parseLinkedInSearchDate(value: string, now = Date.now()): string
         : /^(h|hr|hrs|hour|hours)$/.test(unit) ? 60 * 60 * 1000
         : /^(d|day|days)$/.test(unit) ? 24 * 60 * 60 * 1000
         : /^(w|week|weeks)$/.test(unit) ? 7 * 24 * 60 * 60 * 1000
-        : /^(month|months)$/.test(unit) ? 30 * 24 * 60 * 60 * 1000
+        : /^(mo|month|months)$/.test(unit) ? 30 * 24 * 60 * 60 * 1000
         : 365 * 24 * 60 * 60 * 1000;
       const conservativeOffset = /^(d|day|days)$/.test(unit) ? 12 * 60 * 60 * 1000 : 0;
       return new Date(now - amount * unitMs - conservativeOffset).toISOString();
@@ -248,9 +262,8 @@ export async function searchAndScrapeLinkedInPosts(
   const tomorrow = new Date(Date.parse(endDate + "T00:00:00.000Z") + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
   const dateClauses = recent ? " after:" + startDate + " before:" + tomorrow : "";
   const queries = [
-    "site:linkedin.com " + name + dateClauses,
-    name + " LinkedIn posts" + dateClauses,
-    "posts about " + name + " on LinkedIn" + dateClauses,
+    "site:linkedin.com/posts " + name + dateClauses,
+    "site:linkedin.com/feed/update " + name + dateClauses,
   ];
   const batches = await Promise.all(queries.map(query => searchLinkedInIndex(query, recent)));
   const successfulProviders = batches.reduce((total, batch) => total + batch.successfulProviders, 0);
@@ -310,6 +323,12 @@ export async function searchAndScrapeLinkedInPosts(
     providerErrors,
     indexedResults: batches.reduce((total, batch) => total + batch.results.length, 0),
     matchingPostUrls: hitsByUrl.size,
+    sampleIndexedHits: batches.flatMap((batch) => batch.results).slice(0, 10).map((hit) => ({
+      url: hit.url.slice(0, 400),
+      normalizedPostUrl: normalizeLinkedInPostUrl(hit.url),
+      title: hit.title.slice(0, 180),
+      snippet: hit.snippet.slice(0, 240),
+    })),
     readablePreviews: posts.length,
     undated,
     outside48Hours: outsideWindow,
