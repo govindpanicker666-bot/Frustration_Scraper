@@ -156,7 +156,7 @@ function stripSearchMarkup(value: string): string {
   return decodeSearchHtml(value.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
 }
 
-function parseGoogleLinkedInResults(html: string): LinkedInSearchHit[] {
+export function parseGoogleLinkedInResults(html: string): LinkedInSearchHit[] {
   const results: LinkedInSearchHit[] = [];
   const blocks = html.split(/<div\b[^>]*class=["'][^"']*\bMjjYud\b[^"']*["'][^>]*>/i).slice(1);
   const candidates = blocks.length ? blocks : [html];
