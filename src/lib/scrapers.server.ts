@@ -1,3 +1,5 @@
+import { execFile } from "node:child_process";
+import { join } from "node:path";
 import {
   exactQuery,
   isRecent,
@@ -755,35 +757,270 @@ async function devto(c: CompetitorCtx) {
   }));
 }
 
-// ---------- Reddit (public search JSON) ----------
-async function reddit(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  const apply48HourFilter = opts.apply48HourFilter ?? true;
-  type P = {
-    data: {
-      author: string;
-      title: string;
-      selftext: string;
-      permalink: string;
-      created_utc: number;
-    };
-  };
-  const queryUrl = apply48HourFilter
-    ? `https://www.reddit.com/search.json?q=${encodeURIComponent(exactQuery(c.name))}&sort=new&t=week&limit=50`
-    : `https://www.reddit.com/search.json?q=${encodeURIComponent(exactQuery(c.name))}&sort=relevance&t=all&limit=100`;
-  const j = await getJson<{ data: { children: P[] } }>(queryUrl, {
-    headers: { "User-Agent": "Churnhound/1.0 (lead research)" },
+// ---------- Anonymous public-source adapters ----------
+
+const SOCIALFETCH_SCRIPT =
+  process.env["SOCIALFETCH_SCRIPT_PATH"]?.trim() || join(process.cwd(), "scripts", "socialfetch");
+const SOCIALFETCH_TIMEOUT_MS = 25_000;
+
+type JsonRecord = Record<string, unknown>;
+function asRecord(value: unknown): JsonRecord | null {
+  return value !== null && typeof value === "object" && !Array.isArray(value)
+    ? value as JsonRecord
+    : null;
+}
+function asString(value: unknown): string {
+  return typeof value === "string" ? value.trim() : "";
+}
+
+/** Run the vendored SocialFetch CLI with a fixed argument array (never through a shell). */
+async function runSocialFetch(args: string[]): Promise<unknown> {
+  const python = process.env["SOCIALFETCH_PYTHON"]?.trim() || "python3";
+  const stdout = await new Promise<string>((resolve, reject) => {
+    execFile(
+      python,
+      [SOCIALFETCH_SCRIPT, ...args, "--json"],
+      { timeout: SOCIALFETCH_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, windowsHide: true },
+      (error, output, stderr) => {
+        if (error) {
+          const detail = asString(stderr).slice(0, 240);
+          reject(new Blocked(detail
+            ? `SocialFetch failed: ${detail}`
+            : `SocialFetch could not run (${error.message.slice(0, 180)})`));
+          return;
+        }
+        resolve(output);
+      },
+    );
   });
-  return j.data.children.map(({ data: p }): RawReview => {
-    const url = `https://www.reddit.com${p.permalink}`;
-    return {
+  let envelope: unknown;
+  try {
+    envelope = JSON.parse(stdout) as unknown;
+  } catch {
+    throw new Blocked("SocialFetch returned invalid JSON");
+  }
+  const result = asRecord(envelope);
+  if (!result || result["ok"] !== true) {
+    throw new Blocked(asString(result?.["error"]) || "SocialFetch returned an unsuccessful response");
+  }
+  return result["data"];
+}
+
+function redditPostUrl(post: JsonRecord): string {
+  const permalink = asString(post["permalink"]);
+  if (permalink.startsWith("https://")) return permalink;
+  if (permalink.startsWith("/")) return `https://www.reddit.com${permalink}`;
+  const id = asString(post["id"]);
+  return id ? `https://www.reddit.com/comments/${encodeURIComponent(id)}/` : "";
+}
+
+export function mapSocialFetchRedditPosts(data: unknown): RawReview[] {
+  const posts = asRecord(data)?.["posts"];
+  if (!Array.isArray(posts)) return [];
+  return posts.flatMap((item): RawReview[] => {
+    const post = asRecord(item);
+    if (!post) return [];
+    const sourceUrl = redditPostUrl(post);
+    const title = asString(post["title"]);
+    const body = asString(post["selftext"]);
+    const text = [title, body].filter(Boolean).join(". ").slice(0, 5000);
+    if (!sourceUrl || !text) return [];
+    const author = asString(post["author"]);
+    return [{
       platform: "reddit",
-      reviewer_name: p.author,
-      reviewer_profile_url: `https://www.reddit.com/user/${p.author}`,
-      source_url: url,
-      text: `${p.title}. ${p.selftext}`.slice(0, 3000),
-      published_at: new Date(p.created_utc * 1000).toISOString(),
-    };
+      reviewer_name: author && author !== "[deleted]" ? author : null,
+      reviewer_profile_url: author && author !== "[deleted]"
+        ? `https://www.reddit.com/user/${encodeURIComponent(author)}/`
+        : null,
+      source_url: sourceUrl,
+      text,
+      published_at: normalizePublishedDate(post["created_utc"] ?? post["created_at"]),
+    }];
   });
+}
+
+export function mapSocialFetchInstagramPosts(data: unknown, fallbackHandle: string): RawReview[] {
+  const record = asRecord(data);
+  const handle = asString(record?.["username"]) || fallbackHandle;
+  const recent = record?.["recent"];
+  if (!Array.isArray(recent)) return [];
+  return recent.flatMap((item): RawReview[] => {
+    const post = asRecord(item);
+    if (!post) return [];
+    const shortcode = asString(post["shortcode"]);
+    const sourceUrl = asString(post["url"]) ||
+      (shortcode ? `https://www.instagram.com/p/${shortcode}/` : "");
+    const text = asString(post["caption"]);
+    if (!sourceUrl || !text) return [];
+    return [{
+      platform: "instagram",
+      reviewer_name: handle ? `@${handle}` : null,
+      reviewer_profile_url: handle ? `https://www.instagram.com/${handle}/` : null,
+      source_url: sourceUrl,
+      text: text.slice(0, 5000),
+      published_at: normalizePublishedDate(post["taken_at"] ?? post["published_at"]),
+    }];
+  });
+}
+
+export function mapSocialFetchFacebookPost(data: unknown): RawReview[] {
+  const post = asRecord(data);
+  if (!post) return [];
+  const sourceUrl = asString(post["url"]);
+  const text = asString(post["title"]);
+  if (!sourceUrl || !text) return [];
+  const author = asString(post["author"]);
+  return [{
+    platform: "facebook",
+    reviewer_name: author || null,
+    reviewer_profile_url: asString(post["author_url"]) || null,
+    source_url: sourceUrl,
+    text: text.slice(0, 5000),
+    // Public oEmbed responses usually omit publication dates. Never invent one:
+    // the existing metadata recovery + strict 48-hour gate remains authoritative.
+    published_at: normalizePublishedDate(post["published_at"] ?? post["created_at"] ?? post["timestamp"]),
+  }];
+}
+
+interface DiscoveredSocialLinks {
+  instagramHandles: string[];
+  facebookPostUrls: string[];
+}
+
+/** Inspect only social URLs explicitly linked from the competitor's own homepage. */
+async function discoverCompetitorSocialLinks(c: CompetitorCtx): Promise<DiscoveredSocialLinks> {
+  if (!c.domain?.trim()) return { instagramHandles: [], facebookPostUrls: [] };
+  let homepage: URL;
+  try {
+    homepage = new URL(c.domain.includes("://") ? c.domain : `https://${c.domain}`);
+    if (homepage.protocol !== "https:" && homepage.protocol !== "http:") {
+      return { instagramHandles: [], facebookPostUrls: [] };
+    }
+  } catch {
+    return { instagramHandles: [], facebookPostUrls: [] };
+  }
+
+  let html = "";
+  try {
+    const response = await fetch(homepage.toString(), {
+      headers: { "User-Agent": BROWSER_UA, Accept: "text/html" },
+      redirect: "follow",
+      signal: AbortSignal.timeout(8_000),
+    });
+    if (!response.ok) return { instagramHandles: [], facebookPostUrls: [] };
+    html = (await response.text()).slice(0, 2_000_000);
+  } catch {
+    return { instagramHandles: [], facebookPostUrls: [] };
+  }
+
+  const instagramHandles = new Set<string>();
+  const facebookPostUrls = new Set<string>();
+  for (const match of html.matchAll(/href\s*=\s*["']([^"']+)["']/gi)) {
+    const href = match[1]!.replaceAll("&amp;", "&");
+    let url: URL;
+    try {
+      url = new URL(href, homepage);
+    } catch {
+      continue;
+    }
+    const host = url.hostname.toLowerCase();
+    if (host === "instagram.com" || host.endsWith(".instagram.com")) {
+      const handle = url.pathname.split("/").filter(Boolean)[0] ?? "";
+      if (handle && !/^(p|reel|reels|tv|stories|explore|accounts|direct)$/i.test(handle) &&
+          /^[a-z0-9._]{1,30}$/i.test(handle)) {
+        instagramHandles.add(handle);
+      }
+    }
+    if ((host === "facebook.com" || host.endsWith(".facebook.com") || host === "fb.watch") &&
+        (/\/(posts|videos|watch|reel|reels|share\/p|share\/v)\//i.test(url.pathname) || host === "fb.watch")) {
+      facebookPostUrls.add(url.toString());
+    }
+  }
+  return {
+    instagramHandles: [...instagramHandles].slice(0, 3),
+    facebookPostUrls: [...facebookPostUrls].slice(0, 10),
+  };
+}
+
+async function xLookup(c: CompetitorCtx, opts: ScrapePlatformOptions = {}): Promise<RawReview[]> {
+  const base = (process.env["X_LOOKUP_BASE_URL"]?.trim() || "https://x-lookup.mynameistito.com")
+    .replace(/\/+$/, "");
+  const query = c.name.trim();
+  if (!query) return [];
+  const requestQuery = opts.apply48HourFilter === false
+    ? query
+    : `${query} since:${new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10)}`;
+  const url = new URL(`${base}/search`);
+  url.searchParams.set("q", requestQuery);
+  url.searchParams.set("feed", "latest");
+  url.searchParams.set("limit", "50");
+  url.searchParams.set("format", "json");
+  url.searchParams.set("full", "true");
+  const response = await fetch(url, {
+    headers: { Accept: "application/json", "User-Agent": BROWSER_UA },
+    signal: AbortSignal.timeout(20_000),
+  });
+  if (!response.ok) throw new Blocked(`X Lookup returned HTTP ${response.status}`);
+  const payload = asRecord(await response.json());
+  const posts = payload?.["posts"];
+  if (!Array.isArray(posts)) throw new Blocked("X Lookup returned an unexpected response");
+  return posts.flatMap((item): RawReview[] => {
+    const post = asRecord(item);
+    if (!post) return [];
+    const author = asRecord(post["author"]);
+    const handle = asString(author?.["screen_name"]).replace(/^@/, "");
+    const sourceUrl = asString(post["url"]) ||
+      (handle && asString(post["id"]) ? `https://x.com/${handle}/status/${asString(post["id"])}` : "");
+    const text = asString(post["text"]);
+    if (!sourceUrl || !text) return [];
+    return [{
+      platform: "x",
+      reviewer_name: handle ? `@${handle}` : asString(author?.["name"]) || null,
+      reviewer_profile_url: asString(author?.["url"]) || (handle ? `https://x.com/${handle}` : null),
+      source_url: sourceUrl,
+      text: text.slice(0, 5000),
+      published_at: normalizePublishedDate(post["created_at"] ?? post["created_timestamp"]),
+    }];
+  });
+}
+
+async function scrapeSocialFetchReddit(c: CompetitorCtx): Promise<RawReview[]> {
+  if (!c.name.trim()) return [];
+  const data = await runSocialFetch(["reddit", "search", c.name.trim(), "--limit", "50"]);
+  return mapSocialFetchRedditPosts(data);
+}
+
+async function instagram(c: CompetitorCtx): Promise<RawReview[]> {
+  const { instagramHandles } = await discoverCompetitorSocialLinks(c);
+  if (!instagramHandles.length) throw new NoMatch("no public Instagram handle linked from competitor website");
+  const results = await Promise.allSettled(instagramHandles.map(async (handle) => {
+    const data = await runSocialFetch(["ig", "user", handle, "--limit", "40"]);
+    return mapSocialFetchInstagramPosts(data, handle);
+  }));
+  const reviews = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  if (!reviews.length) throw new NoMatch("no public Instagram posts available");
+  return reviews;
+}
+
+async function facebook(c: CompetitorCtx): Promise<RawReview[]> {
+  const { facebookPostUrls } = await discoverCompetitorSocialLinks(c);
+  if (!facebookPostUrls.length) throw new NoMatch("no public Facebook post URLs linked from competitor website");
+  const results = await Promise.allSettled(facebookPostUrls.map(async (url) => {
+    const parsed = new URL(url);
+    const action = /\/(videos|watch|reel|reels)\//i.test(parsed.pathname) || parsed.hostname === "fb.watch"
+      ? "video"
+      : "post";
+    const data = await runSocialFetch(["fb", action, url]);
+    return mapSocialFetchFacebookPost(data);
+  }));
+  const reviews = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  if (!reviews.length) throw new NoMatch("no public Facebook post metadata available");
+  return reviews;
+}
+
+// ---------- Reddit (SocialFetch public search) ----------
+async function reddit(c: CompetitorCtx) {
+  return scrapeSocialFetchReddit(c);
 }
 
 // ---------- ComplaintsBoard (server-rendered HTML; page found via free web search) ----------
@@ -920,9 +1157,7 @@ async function googlereviews(c: CompetitorCtx, opts: ScrapePlatformOptions = {})
     }));
 }
 const JIROSEARCH_PLATFORM_SET = new Set<Platform>([
-  "instagram",
   "linkedin",
-  "x",
   "youtube",
   "tiktok",
   "facebook",
@@ -1370,11 +1605,7 @@ async function linkedin(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   });
 }
 async function x(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["x"], {
-    domain: c.domain,
-    intent: opts.intent,
-    apply48HourFilter: opts.apply48HourFilter ?? true,
-  });
+  return xLookup(c, opts);
 }
 async function youtube(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   return scrapeJirosearch(c.name, ["youtube"], {
@@ -1383,13 +1614,7 @@ async function youtube(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
     apply48HourFilter: opts.apply48HourFilter ?? true,
   });
 }
-async function instagram(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["instagram"], {
-    domain: c.domain,
-    intent: opts.intent,
-    apply48HourFilter: opts.apply48HourFilter ?? true,
-  });
-}
+// Instagram is handled by the anonymous SocialFetch adapter above.
 async function tiktok(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   return scrapeJirosearch(c.name, ["tiktok"], {
     domain: c.domain,
@@ -1397,13 +1622,7 @@ async function tiktok(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
     apply48HourFilter: opts.apply48HourFilter ?? true,
   });
 }
-async function facebook(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["facebook"], {
-    domain: c.domain,
-    intent: opts.intent,
-    apply48HourFilter: opts.apply48HourFilter ?? true,
-  });
-}
+// Facebook is handled by the anonymous SocialFetch adapter above.
 async function telegram(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   return scrapeJirosearch(c.name, ["telegram"], {
     domain: c.domain,
