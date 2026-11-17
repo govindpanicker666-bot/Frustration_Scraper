@@ -780,7 +780,12 @@ async function runSocialFetch(args: string[]): Promise<unknown> {
     execFile(
       python,
       [SOCIALFETCH_SCRIPT, ...args, "--json"],
-      { timeout: SOCIALFETCH_TIMEOUT_MS, maxBuffer: 4 * 1024 * 1024, windowsHide: true },
+      {
+        encoding: "utf8",
+        timeout: SOCIALFETCH_TIMEOUT_MS,
+        maxBuffer: 4 * 1024 * 1024,
+        windowsHide: true,
+      },
       (error, output, stderr) => {
         if (error) {
           const detail = asString(stderr).slice(0, 240);
