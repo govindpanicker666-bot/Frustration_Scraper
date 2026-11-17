@@ -1160,7 +1160,6 @@ const JIROSEARCH_PLATFORM_SET = new Set<Platform>([
   "linkedin",
   "youtube",
   "tiktok",
-  "facebook",
   "telegram",
   "pinterest",
   "threads",
