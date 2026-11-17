@@ -59,7 +59,7 @@ const LINKEDIN_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 
 const LINKEDIN_SEARCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-function parseLinkedInSearchDate(value, now = Date.now()) {
+function parseLinkedInSearchDate(value: string, now = Date.now()): string {
   const text = value.replace(/\s+/g, " ").trim();
   if (!text) return "";
   const relative = text.match(/\b(just now|moments ago|today|yesterday|\d{1,4}\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|years?)\s*ago)\b/i);
@@ -82,8 +82,11 @@ function parseLinkedInSearchDate(value, now = Date.now()) {
       return new Date(now - amount * unitMs - conservativeOffset).toISOString();
     }
   }
-  const month = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
-  const absolute = text.match(new RegExp("\\b((?:20\\\\d{2}-\\\\d{1,2}-\\\\d{1,2}(?:[T ][0-9:.Z+-]+)?)|(?:" + month + "\\\\s+\\\\d{1,2}(?:,?\\\\s+20\\\\d{2})?)|(?:\\\\d{1,2}\\\\s+" + month + "(?:\\\\s+20\\\\d{2})?))\\\\b", "i"));
+  const month =
+    "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
+  const absolute = text.match(
+    /\\b((?:20\\d{2}-\\d{1,2}-\\d{1,2}(?:[T ][0-9:.Z+-]+)?)|(?:(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2}(?:,?\\s+20\\d{2})?)|(?:\\d{1,2}\\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?:\\s+20\\d{2})?))\\b/i,
+  );
   if (!absolute || !absolute[1]) return "";
   const dateText = absolute[1];
   const normalizedDate = /\b20\d{2}\b/.test(dateText) ? dateText : dateText + ", " + new Date(now).getUTCFullYear();
@@ -91,15 +94,18 @@ function parseLinkedInSearchDate(value, now = Date.now()) {
   return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString();
 }
 
-function isLinkedInPostWithin48Hours(publishedAt, now) {
+function isLinkedInPostWithin48Hours(publishedAt: string, now: number): boolean {
   const timestamp = Date.parse(publishedAt);
   const age = now - timestamp;
   return Number.isFinite(timestamp) && age >= -5 * 60 * 1000 && age <= 48 * 60 * 60 * 1000;
 }
 
-async function searchLinkedInIndex(query, recent) {
+async function searchLinkedInIndex(
+  query: string,
+  recent: boolean,
+): Promise<{ results: LinkedInSearchHit[]; errors: string[]; successfulProviders: number }> {
   const headers = {
-    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "User-Agent": LINKEDIN_SEARCH_UA,
     "Accept-Language": "en-US,en;q=0.9",
   };
   const ddgUrl = new URL("https://html.duckduckgo.com/html/");
@@ -119,8 +125,8 @@ async function searchLinkedInIndex(query, recent) {
       return parseBingRss(await response.text());
     }),
   ]);
-  const results = [];
-  const errors = [];
+  const results: LinkedInSearchHit[] = [];
+  const errors: string[] = [];
   let successfulProviders = 0;
   for (const result of [ddg, bing]) {
     if (result.status === "fulfilled") {
@@ -192,7 +198,10 @@ export async function scrapeLinkedInPostUrls(urls: string[]): Promise<LinkedInPu
   const output = await runPython("scrape_linkedin_posts.py", safeUrls, Math.max(90_000, safeUrls.length * 25_000));
   return normalizeLinkedInScrapedPosts(parseJson(output));
 }
-export async function searchAndScrapeLinkedInPosts(competitor, options = {}) {
+export async function searchAndScrapeLinkedInPosts(
+  competitor: { name: string; domain: string | null },
+  options: { apply48HourFilter?: boolean; limit?: number } = {},
+): Promise<LinkedInPublicPost[]> {
   const name = competitor.name.replace(/["']/g, "").replace(/\s+/g, " ").trim();
   if (!name) return [];
   const recent = options.apply48HourFilter ?? true;
@@ -214,7 +223,7 @@ export async function searchAndScrapeLinkedInPosts(competitor, options = {}) {
     throw new Error("LinkedIn search providers failed: " + (providerErrors.join("; ") || "no provider response"));
   }
 
-  const hitsByUrl = new Map();
+  const hitsByUrl = new Map<string, LinkedInSearchHit>();
   for (const batch of batches) {
     for (const hit of batch.results) {
       const url = normalizeLinkedInPostUrl(hit.url);
@@ -224,7 +233,7 @@ export async function searchAndScrapeLinkedInPosts(competitor, options = {}) {
     }
   }
 
-  const posts = [];
+  const posts: LinkedInPublicPost[] = []
   let undated = 0;
   let outsideWindow = 0;
   let unreadablePreview = 0;
