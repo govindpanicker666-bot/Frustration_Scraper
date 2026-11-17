@@ -347,10 +347,11 @@ export async function searchAndScrapeLinkedInPosts(
         hitsByUrl.set(url, {...hit, url});
       } else {
         const betterText = hit.snippet.length > previous.snippet.length ? hit : previous;
+        const publishedAt = betterText.publishedAt || previous.publishedAt || hit.publishedAt;
         hitsByUrl.set(url, {
           ...betterText,
           url,
-          publishedAt: betterText.publishedAt || previous.publishedAt || hit.publishedAt,
+          ...(publishedAt ? { publishedAt } : {}),
         });
       }
     }
