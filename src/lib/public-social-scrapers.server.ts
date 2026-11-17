@@ -58,7 +58,7 @@ function unwrapSearchResultUrl(value: unknown): string {
 
   for (let attempt = 0; attempt < 5; attempt++) {
     try {
-      const parsed = new URL(candidate);
+      const parsed = new URL(candidate, "https://www.google.com");
       const host = parsed.hostname.toLowerCase();
       if (host === "linkedin.com" || host.endsWith(".linkedin.com")) return parsed.toString();
 
