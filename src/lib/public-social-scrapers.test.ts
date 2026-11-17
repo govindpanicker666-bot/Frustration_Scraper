@@ -18,6 +18,11 @@ describe("public social scraper normalizers", () => {
     expect(normalizeLinkedInPostUrl("https://www.bing.com/ck/a?u=" + bingEncoded)).toBe(
       "https://www.linkedin.com/posts/alex_topic-activity-123",
     );
+    const bingTarget = "https://www.linkedin.com/posts/alex_topic-activity-123";
+    const bingEncoded = "a1" + Buffer.from(bingTarget).toString("base64url");
+    expect(normalizeLinkedInPostUrl("https://www.bing.com/ck/a?u=" + bingEncoded)).toBe(
+      "https://www.linkedin.com/posts/alex_topic-activity-123",
+    );
   });
   it("retains the complete LinkedIn post body, author and timestamp", () => {
     const body = "A complete public post body. ".repeat(300);
@@ -34,6 +39,9 @@ describe("public social scraper normalizers", () => {
   it("parses LinkedIn result-card relative timestamps without reading ordinary post text as a date", () => {
     const now = Date.parse("2026-11-18T12:00:00.000Z");
     expect(parseLinkedInSearchDate("Duncan Lennox · 2 hours ago · 190 reactions", now)).toBe(
+      "2026-11-18T10:00:00.000Z",
+    );
+    expect(parseLinkedInSearchDate("Duncan Lennox · 2h · 190 reactions", now)).toBe(
       "2026-11-18T10:00:00.000Z",
     );
     expect(parseLinkedInSearchDate("Duncan Lennox · 2h · 190 reactions", now)).toBe(
