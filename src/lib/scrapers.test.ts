@@ -52,121 +52,112 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res).toEqual({ status: "no_key", reviews: [] });
   });
 
-  it("calls JIRO_SEARCH_URL/social/search with { query, platforms } and maps items to RawReview across x, instagram, facebook, pinterest, linkedin, tiktok", async () => {
+  it("sends separate /social/search requests per platform with { query, platform, limit: 10 } and maps results", async () => {
     process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     delete process.env["JIROSEARCH_API_KEY"];
     const nowIso = new Date().toISOString();
 
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
+    const urlByPlatform: Record<string, string> = {
+      x: "https://x.com/jane_founder/status/123456",
+      instagram: "https://www.instagram.com/p/abc123/",
+      facebook: "https://www.facebook.com/alex/posts/123",
+      pinterest: "https://www.pinterest.com/pin/123456/",
+      linkedin: "https://www.linkedin.com/posts/sam-lee-1",
+      tiktok: "https://www.tiktok.com/@alex/video/123456",
+    };
+
+    const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
+      const sent = JSON.parse(String(init?.body ?? "{}")) as {
+        query?: string;
+        platform?: string;
+        limit?: number;
+      };
+      const target = sent.platform ?? "x";
+      return new Response(
         JSON.stringify({
           results: [
             {
-              source: "instagram",
-              productIdentifier: "acme",
-              reviewId: "rev-1",
-              rating: 1,
               title: "Support frustration",
-              body: "Acme support took days to reply.",
-              reviewerName: "@insta_user",
-              reviewedAt: nowIso,
-              sourceUrl: "https://www.instagram.com/p/abc123/",
-            },
-            {
-              source: "twitter",
-              text: "Switched away from Acme after the price hike.",
-              url: "https://x.com/jane_founder/status/123456",
-              createdAt: nowIso,
+              content: `Acme issue reported on ${target}.`,
+              author: target === "x" ? "@jane_founder" : "Alex Rivera",
+              url: urlByPlatform[target],
+              date: nowIso,
             },
           ],
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
-      ),
-    );
+      );
+    });
     vi.stubGlobal("fetch", fetchMock);
 
-    const reviews = await scrapeJirosearch("Acme", [
-      "x",
-      "instagram",
-      "facebook",
-      "pinterest",
-      "linkedin",
-      "tiktok",
-    ]);
-    expect(fetchMock).toHaveBeenCalledWith(
-      "https://jiro-search-api-xyz.onrender.com/social/search",
-      expect.objectContaining({
-        method: "POST",
-        body: JSON.stringify({
-          query: "Acme",
-          platforms: ["x", "instagram", "facebook", "pinterest", "linkedin", "tiktok"],
-        }),
-      }),
-    );
+    const platforms = ["x", "instagram", "facebook", "pinterest", "linkedin", "tiktok"];
+    const reviews = await scrapeJirosearch("Acme", platforms);
 
-    expect(reviews).toHaveLength(2);
+    expect(fetchMock).toHaveBeenCalledTimes(platforms.length);
+    for (const p of platforms) {
+      expect(fetchMock).toHaveBeenCalledWith(
+        "https://jiro-search-api-xyz.onrender.com/social/search",
+        expect.objectContaining({
+          method: "POST",
+          body: JSON.stringify({
+            query: "Acme",
+            platform: p,
+            limit: 10,
+          }),
+        }),
+      );
+    }
+
+    expect(reviews).toHaveLength(platforms.length);
     expect(reviews[0]).toEqual({
-      platform: "instagram",
-      reviewer_name: "@insta_user",
-      reviewer_profile_url: null,
-      source_url: "https://www.instagram.com/p/abc123/",
-      text: "Support frustration. Acme support took days to reply.",
-      published_at: nowIso,
-    });
-    expect(reviews[1]).toEqual({
       platform: "x",
       reviewer_name: "@jane_founder",
       reviewer_profile_url: null,
       source_url: "https://x.com/jane_founder/status/123456",
-      text: "Switched away from Acme after the price hike.",
+      text: "Support frustration. Acme issue reported on x.",
+      published_at: nowIso,
+    });
+    expect(reviews[4]).toMatchObject({
+      platform: "linkedin",
+      reviewer_name: "Alex Rivera",
+      source_url: "https://www.linkedin.com/posts/sam-lee-1",
       published_at: nowIso,
     });
   });
 
-  it("flattens platform-grouped /social/search results cleanly", async () => {
+  it("continues scraping remaining platforms if one platform fails or is blocked", async () => {
     process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     const nowIso = new Date().toISOString();
-    const fetchMock = vi.fn().mockResolvedValue(
-      new Response(
+
+    const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
+      const sent = JSON.parse(String(init?.body ?? "{}")) as { platform?: string };
+      if (sent.platform === "instagram") {
+        return new Response("Forbidden", { status: 403 });
+      }
+      if (sent.platform === "facebook") {
+        throw new Error("Network reset");
+      }
+      return new Response(
         JSON.stringify({
-          results: {
-            linkedin: [
-              {
-                text: "Acme keeps dropping connections.",
-                author_name: "Sam Lee",
-                posted_at: nowIso,
-                post_url: "https://www.linkedin.com/posts/sam-lee-1",
-              },
-            ],
-            x: [
-              {
-                content: "Migrating off Acme today.",
-                username: "@dev_maya",
-                created_at: nowIso,
-                url: "https://x.com/dev_maya/status/999",
-              },
-            ],
-          },
+          results: [
+            {
+              title: "Post title",
+              content: "Migrating off Acme today.",
+              author: "Sam Lee",
+              url: `https://www.${sent.platform}.com/posts/123`,
+              published_at: nowIso,
+            },
+          ],
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
-      ),
-    );
+      );
+    });
     vi.stubGlobal("fetch", fetchMock);
 
-    const reviews = await scrapeJirosearch("Acme", ["linkedin", "x"]);
+    const reviews = await scrapeJirosearch("Acme", ["instagram", "linkedin", "facebook", "x"]);
+    expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(reviews).toHaveLength(2);
-    expect(reviews[0]).toMatchObject({
-      platform: "linkedin",
-      reviewer_name: "Sam Lee",
-      source_url: "https://www.linkedin.com/posts/sam-lee-1",
-      published_at: nowIso,
-    });
-    expect(reviews[1]).toMatchObject({
-      platform: "x",
-      reviewer_name: "@dev_maya",
-      source_url: "https://x.com/dev_maya/status/999",
-      published_at: nowIso,
-    });
+    expect(reviews.map((r) => r.platform)).toEqual(["linkedin", "x"]);
   });
 
   it("handles sleeping or failing Jirosearch microservice gracefully by returning an empty array", async () => {
@@ -215,21 +206,23 @@ describe("scrapeJirosearch and social platform routing", () => {
     const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
       const sent = JSON.parse(String(init?.body ?? "{}")) as {
         query?: string;
-        platforms?: string[];
+        platform?: string;
+        limit?: number;
       };
       expect(typeof sent.query).toBe("string");
-      expect(Array.isArray(sent.platforms)).toBe(true);
+      expect(typeof sent.platform).toBe("string");
+      expect(sent.limit).toBe(10);
 
-      const target = sent.platforms?.[0] ?? platformOrder[callIdx++] ?? "x";
+      const target = sent.platform ?? platformOrder[callIdx++] ?? "x";
       return new Response(
         JSON.stringify({
           results: [
             {
-              source: target,
-              body: `Review on ${target} about Acme.`,
-              reviewerName: "Alex Rivera",
+              title: `Post on ${target}`,
+              content: `Review on ${target} about Acme.`,
+              author: "Alex Rivera",
+              url: urlByPlatform[target],
               reviewedAt: nowIso,
-              sourceUrl: urlByPlatform[target],
             },
           ],
         }),
@@ -283,10 +276,12 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res.reviews).toHaveLength(0);
     const sentBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as {
       query?: string;
-      platforms?: string[];
+      platform?: string;
+      limit?: number;
     };
     expect(sentBody.query).toContain("after:");
-    expect(sentBody.platforms).toEqual(["x"]);
+    expect(sentBody.platform).toBe("x");
+    expect(sentBody.limit).toBe(10);
   });
 
   it("keeps the existing historical mode when the 48-hour filter is explicitly disabled", async () => {
@@ -318,10 +313,12 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res.reviews).toHaveLength(1);
     const sentBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as {
       query?: string;
-      platforms?: string[];
+      platform?: string;
+      limit?: number;
     };
     expect(sentBody.query).not.toContain("after:");
-    expect(sentBody.platforms).toEqual(["x"]);
+    expect(sentBody.platform).toBe("x");
+    expect(sentBody.limit).toBe(10);
   });
 
   it("recovers a missing social-post date from publication metadata before filtering", async () => {

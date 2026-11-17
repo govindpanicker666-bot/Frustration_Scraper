@@ -1092,94 +1092,11 @@ function extractJirosearchRawList(payload: unknown): unknown[] {
   return directFlattened;
 }
 
-export async function scrapeJirosearch(
-  query: string,
-  platforms: string[],
-  options: {
-    domain?: string | null | undefined;
-    intent?: "complaints" | "mentions" | undefined;
-    apply48HourFilter?: boolean | undefined;
-  } = {},
-): Promise<RawReview[]> {
-  const endpoint = resolveJirosearchEndpoint();
-  const apiKey = process.env["JIROSEARCH_API_KEY"]?.trim();
-
-  const normalizedPlatforms = platforms
-    .map((p) => p.trim().toLowerCase())
-    .map((p) => (p === "twitter" ? "x" : p))
-    .filter((p): p is Platform => JIROSEARCH_PLATFORM_SET.has(p as Platform));
-
-  if (!query.trim() || normalizedPlatforms.length === 0) return [];
-  if (!endpoint) {
-    console.warn("[Jirosearch] JIRO_SEARCH_URL is not set; returning empty results.");
-    return [];
-  }
-
-  const queryText = options.apply48HourFilter
-    ? query.trim() + " after:" + new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10)
-    : query.trim();
-
-  const headers: Record<string, string> = {
-    "Content-Type": "application/json",
-    Accept: "application/json",
-  };
-  if (apiKey) {
-    headers["Authorization"] = `Bearer ${apiKey}`;
-    headers["X-API-Key"] = apiKey;
-  }
-
-  const requestPayload = {
-    query: queryText,
-    platforms: normalizedPlatforms,
-  };
-
-  let payload: unknown = null;
-  try {
-    console.log("[Jirosearch] Sending POST request:", {
-      url: endpoint,
-      payload: requestPayload,
-    });
-
-    const res = await fetch(endpoint, {
-      method: "POST",
-      headers,
-      body: JSON.stringify(requestPayload),
-      signal: AbortSignal.timeout(JIROSEARCH_TIMEOUT_MS),
-    });
-
-    const rawText = await res.text();
-    console.log("[Jirosearch] Response received:", {
-      url: endpoint,
-      status: res.status,
-      ok: res.ok,
-      body: rawText.slice(0, 4000),
-    });
-
-    if (!res.ok) {
-      console.warn(`[Jirosearch] HTTP ${res.status} from ${endpoint}; returning empty results.`);
-      return [];
-    }
-
-    try {
-      payload = rawText ? (JSON.parse(rawText) as unknown) : null;
-    } catch (parseErr) {
-      console.warn(
-        `[Jirosearch] Invalid JSON returned by ${endpoint}:`,
-        parseErr instanceof Error ? parseErr.message : parseErr,
-      );
-      return [];
-    }
-  } catch (err) {
-    console.warn(
-      `[Jirosearch] Request to ${endpoint} failed (timeout/asleep/unreachable):`,
-      err instanceof Error ? `${err.name}: ${err.message}` : err,
-    );
-    return [];
-  }
-
-  const rawList = extractJirosearchRawList(payload);
-
-  const fallbackPlatform = (normalizedPlatforms[0] as Platform | undefined) ?? "x";
+function mapJirosearchItems(
+  rawList: unknown[],
+  fallbackPlatform: Platform,
+  apply48HourFilter: boolean | undefined,
+): RawReview[] {
   const out: RawReview[] = [];
 
   for (const entry of rawList) {
@@ -1300,26 +1217,131 @@ export async function scrapeJirosearch(
       reviewer_profile_url: profileUrl,
       source_url: sourceUrl,
       text,
-      published_at:
-        parsedDate || (options.apply48HourFilter === false ? new Date().toISOString() : ""),
-    });
-  }
-
-  if (rawList.length > 0 && out.length === 0) {
-    const sample = rawList[0];
-    console.warn("[Jirosearch] Raw items were returned but 0 mapped to RawReview:", {
-      rawCount: rawList.length,
-      sampleKeys: sample && typeof sample === "object" ? Object.keys(sample) : typeof sample,
-    });
-  } else {
-    console.log("[Jirosearch] Mapped reviews:", {
-      rawCount: rawList.length,
-      mappedCount: out.length,
-      platforms: normalizedPlatforms,
+      published_at: parsedDate || (apply48HourFilter === false ? new Date().toISOString() : ""),
     });
   }
 
   return out;
+}
+
+export async function scrapeJirosearch(
+  query: string,
+  platforms: string[],
+  options: {
+    domain?: string | null | undefined;
+    intent?: "complaints" | "mentions" | undefined;
+    apply48HourFilter?: boolean | undefined;
+  } = {},
+): Promise<RawReview[]> {
+  const endpoint = resolveJirosearchEndpoint();
+  const apiKey = process.env["JIROSEARCH_API_KEY"]?.trim();
+
+  const normalizedPlatforms = Array.from(
+    new Set(
+      platforms
+        .map((p) => p.trim().toLowerCase())
+        .map((p) => (p === "twitter" ? "x" : p))
+        .filter((p): p is Platform => JIROSEARCH_PLATFORM_SET.has(p as Platform)),
+    ),
+  );
+
+  if (!query.trim() || normalizedPlatforms.length === 0) return [];
+  if (!endpoint) {
+    console.warn("[Jirosearch] JIRO_SEARCH_URL is not set; returning empty results.");
+    return [];
+  }
+
+  const queryText = options.apply48HourFilter
+    ? query.trim() + " after:" + new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10)
+    : query.trim();
+
+  const headers: Record<string, string> = {
+    "Content-Type": "application/json",
+    Accept: "application/json",
+  };
+  if (apiKey) {
+    headers["Authorization"] = `Bearer ${apiKey}`;
+    headers["X-API-Key"] = apiKey;
+  }
+
+  const perPlatformResults = await Promise.all(
+    normalizedPlatforms.map(async (targetPlatform): Promise<RawReview[]> => {
+      const requestPayload = {
+        query: queryText,
+        platform: targetPlatform,
+        limit: 10,
+      };
+
+      try {
+        console.log("[Jirosearch] Sending POST request:", {
+          url: endpoint,
+          payload: requestPayload,
+        });
+
+        const res = await fetch(endpoint, {
+          method: "POST",
+          headers,
+          body: JSON.stringify(requestPayload),
+          signal: AbortSignal.timeout(JIROSEARCH_TIMEOUT_MS),
+        });
+
+        const rawText = await res.text();
+        console.log("[Jirosearch] Response received:", {
+          url: endpoint,
+          platform: targetPlatform,
+          status: res.status,
+          ok: res.ok,
+          body: rawText.slice(0, 4000),
+        });
+
+        if (!res.ok) {
+          console.warn(
+            `[Jirosearch] HTTP ${res.status} for platform '${targetPlatform}' from ${endpoint}; skipping.`,
+          );
+          return [];
+        }
+
+        let payload: unknown = null;
+        try {
+          payload = rawText ? (JSON.parse(rawText) as unknown) : null;
+        } catch (parseErr) {
+          console.warn(
+            `[Jirosearch] Invalid JSON returned for platform '${targetPlatform}' by ${endpoint}:`,
+            parseErr instanceof Error ? parseErr.message : parseErr,
+          );
+          return [];
+        }
+
+        const rawList = extractJirosearchRawList(payload);
+        const mapped = mapJirosearchItems(rawList, targetPlatform, options.apply48HourFilter);
+
+        if (rawList.length > 0 && mapped.length === 0) {
+          const sample = rawList[0];
+          console.warn("[Jirosearch] Raw items were returned but 0 mapped to RawReview:", {
+            platform: targetPlatform,
+            rawCount: rawList.length,
+            sampleKeys: sample && typeof sample === "object" ? Object.keys(sample) : typeof sample,
+          });
+        } else {
+          console.log("[Jirosearch] Mapped reviews:", {
+            platform: targetPlatform,
+            rawCount: rawList.length,
+            mappedCount: mapped.length,
+          });
+        }
+
+        return mapped;
+      } catch (err) {
+        console.warn(
+          `[Jirosearch] Request for platform '${targetPlatform}' to ${endpoint} failed:`,
+          err instanceof Error ? `${err.name}: ${err.message}` : err,
+        );
+        return [];
+      }
+    }),
+  );
+
+  return perPlatformResults.flat();
 }
 
 export async function filterAndRecoverJirosearchReviews(
