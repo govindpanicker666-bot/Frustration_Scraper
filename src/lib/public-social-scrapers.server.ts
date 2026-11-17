@@ -38,14 +38,49 @@ function dateIso(value: unknown): string {
   return raw && !Number.isNaN(date.getTime()) ? date.toISOString() : "";
 }
 
+function decodeSearchHtml(value: string): string {
+  return value
+    .replace(/&amp;/g, "&")
+    .replace(/&quot;/g, '"')
+    .replace(/&#39;|&#x27;/gi, "'")
+    .replace(/&lt;/g, "<")
+    .replace(/&gt;/g, ">")
+    .replace(/&nbsp;/g, " ")
+    .replace(/&#(\d+);/g, (_match, code: string) => String.fromCodePoint(Number(code)))
+    .replace(/&#x([0-9a-f]+);/gi, (_match, code: string) => String.fromCodePoint(parseInt(code, 16)));
+}
+
+function unwrapSearchResultUrl(value: unknown): string {
+  let candidate = textValue(value).replace(/&amp;/g, "&");
+  if (candidate.startsWith("//")) candidate = "https:" + candidate;
+  for (let attempt = 0; attempt < 4; attempt++) {
+    try {
+      const parsed = new URL(candidate);
+      const host = parsed.hostname.toLowerCase();
+      if (host === "linkedin.com" || host.endsWith(".linkedin.com")) return parsed.toString();
+      const wrapped = ["uddg", "url", "q", "u", "target", "dest"]
+        .map((key) => parsed.searchParams.get(key))
+        .find((entry) => entry && /^https?:\/\//i.test(entry));
+      if (!wrapped || wrapped === candidate) return candidate;
+      candidate = wrapped;
+    } catch {
+      return candidate;
+    }
+  }
+  return candidate;
+}
+
 export function normalizeLinkedInPostUrl(value: unknown): string | null {
   try {
-    const url = new URL(textValue(value));
+    const url = new URL(unwrapSearchResultUrl(value));
     const host = url.hostname.toLowerCase();
     if (!["http:", "https:"].includes(url.protocol) || !(host === "linkedin.com" || host.endsWith(".linkedin.com"))) return null;
-    if (!(url.pathname.startsWith("/posts/") || url.pathname.startsWith("/feed/update/"))) return null;
-    return `https://www.linkedin.com${url.pathname.replace(/\/+$/, "")}`;
-  } catch { return null; }
+    const pathname = decodeURIComponent(url.pathname);
+    if (!(/^\/posts\//i.test(pathname) || /^\/feed\/update\//i.test(pathname))) return null;
+    return "https://www.linkedin.com" + pathname.replace(/\/+$/, "");
+  } catch {
+    return null;
+  }
 }
 function activityDate(url: string): string {
   const id = url.match(/activity[-:](\d{15,20})(?:[-/:?#]|$)/i)?.[1];
