@@ -370,8 +370,25 @@ describe("negative-only lead analysis", () => {
     const result = await scrapeCore(client, "c", "all");
     expect(mocks.scrapeJirosearch).toHaveBeenCalledWith(
       "HubSpot",
-      ["linkedin", "x", "instagram", "tiktok", "facebook", "pinterest"],
+      ["linkedin", "tiktok", "pinterest"],
       expect.objectContaining({ domain: "hubspot.com", apply48HourFilter: true }),
+    );
+    // X, Reddit, Instagram and Facebook now use their dedicated public-data adapters.
+    expect(mocks.scrapePlatform).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "HubSpot", domain: "hubspot.com" }),
+      "x",
+    );
+    expect(mocks.scrapePlatform).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "HubSpot", domain: "hubspot.com" }),
+      "reddit",
+    );
+    expect(mocks.scrapePlatform).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "HubSpot", domain: "hubspot.com" }),
+      "instagram",
+    );
+    expect(mocks.scrapePlatform).toHaveBeenCalledWith(
+      expect.objectContaining({ name: "HubSpot", domain: "hubspot.com" }),
+      "facebook",
     );
     expect(result.reviews).toHaveLength(PLATFORMS.length * 2);
     expect(result.reviews.length).toBeGreaterThan(60);
