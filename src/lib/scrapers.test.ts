@@ -98,11 +98,18 @@ describe("scrapeJirosearch and social platform routing", () => {
       expect.objectContaining({
         method: "POST",
         body: JSON.stringify({
-          query: "Acme",
-          platforms: ["x", "instagram", "facebook", "pinterest", "linkedin", "tiktok"],
+          q: "Acme",
+          engine: "google",
         }),
       }),
     );
+    const sentPayload = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as Record<
+      string,
+      unknown
+    >;
+    expect(sentPayload).not.toHaveProperty("platforms");
+    expect(sentPayload).not.toHaveProperty("sources");
+    expect(sentPayload).not.toHaveProperty("query");
 
     expect(reviews).toHaveLength(2);
     expect(reviews[0]).toEqual({
@@ -182,28 +189,18 @@ describe("scrapeJirosearch and social platform routing", () => {
   it("routes all Jirosearch platforms cleanly in scrapePlatform", async () => {
     process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     const nowIso = new Date().toISOString();
+    const urlByPlatform: Record<string, string> = {
+      x: "https://x.com/alex_rivera/status/123456",
+      youtube: "https://www.youtube.com/watch?v=abc123",
+      linkedin: "https://www.linkedin.com/posts/alex-rivera-1",
+      instagram: "https://www.instagram.com/p/abc123/",
+      tiktok: "https://www.tiktok.com/@alex/video/123456",
+      facebook: "https://www.facebook.com/alex/posts/123456",
+      telegram: "https://t.me/saaschat/123",
+      pinterest: "https://www.pinterest.com/pin/123456/",
+    };
 
-    const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
-      const parsed = JSON.parse(String(init?.body ?? "{}")) as { platforms?: string[] };
-      const target = parsed.platforms?.[0] ?? "x";
-      return new Response(
-        JSON.stringify({
-          results: [
-            {
-              source: target,
-              body: `Review on ${target} about Acme.`,
-              reviewerName: "Alex Rivera",
-              reviewedAt: nowIso,
-              sourceUrl: `https://example.com/${target}/post-1`,
-            },
-          ],
-        }),
-        { status: 200, headers: { "Content-Type": "application/json" } },
-      );
-    });
-    vi.stubGlobal("fetch", fetchMock);
-
-    for (const p of [
+    const platformOrder = [
       "x",
       "youtube",
       "linkedin",
@@ -212,7 +209,34 @@ describe("scrapeJirosearch and social platform routing", () => {
       "facebook",
       "telegram",
       "pinterest",
-    ] as const) {
+    ] as const;
+
+    let callIdx = 0;
+    const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
+      const sent = JSON.parse(String(init?.body ?? "{}")) as Record<string, unknown>;
+      expect(sent["engine"]).toBe("google");
+      expect(typeof sent["q"]).toBe("string");
+      expect(sent).not.toHaveProperty("platforms");
+      expect(sent).not.toHaveProperty("sources");
+
+      const target = platformOrder[callIdx++] ?? "x";
+      return new Response(
+        JSON.stringify({
+          organic_results: [
+            {
+              title: `Review on ${target}`,
+              snippet: `Review on ${target} about Acme.`,
+              link: urlByPlatform[target],
+              date: nowIso,
+            },
+          ],
+        }),
+        { status: 200, headers: { "Content-Type": "application/json" } },
+      );
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    for (const p of platformOrder) {
       const res = await scrapePlatform({ name: "Acme", domain: "acme.com" }, p);
       expect(res.status).toBe("ok");
       expect(res.reviews).toHaveLength(1);
@@ -256,9 +280,11 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res.status).toBe("ok");
     expect(res.reviews).toHaveLength(0);
     const sentBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as {
-      query?: string;
+      q?: string;
+      engine?: string;
     };
-    expect(sentBody.query).toContain("after:");
+    expect(sentBody.q).toContain("after:");
+    expect(sentBody.engine).toBe("google");
   });
 
   it("keeps the existing historical mode when the 48-hour filter is explicitly disabled", async () => {
@@ -289,9 +315,11 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res.status).toBe("ok");
     expect(res.reviews).toHaveLength(1);
     const sentBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as {
-      query?: string;
+      q?: string;
+      engine?: string;
     };
-    expect(sentBody.query).not.toContain("after:");
+    expect(sentBody.q).not.toContain("after:");
+    expect(sentBody.engine).toBe("google");
   });
 
   it("recovers a missing social-post date from publication metadata before filtering", async () => {

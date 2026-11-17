@@ -931,7 +931,25 @@ const JIROSEARCH_PLATFORM_SET = new Set<Platform>([
   "threads",
 ]);
 
-function normalizeJirosearchPlatform(raw: unknown, fallback: Platform): Platform {
+function inferPlatformFromUrl(sourceUrl: string): Platform | null {
+  try {
+    const host = new URL(sourceUrl).hostname.toLowerCase();
+    if (host.includes("linkedin.com")) return "linkedin";
+    if (host === "x.com" || host.endsWith(".x.com") || host.includes("twitter.com")) return "x";
+    if (host.includes("instagram.com")) return "instagram";
+    if (host.includes("facebook.com") || host.includes("fb.watch")) return "facebook";
+    if (host.includes("pinterest.") || host === "pin.it") return "pinterest";
+    if (host.includes("tiktok.com")) return "tiktok";
+    if (host.includes("youtube.com") || host === "youtu.be") return "youtube";
+    if (host.includes("threads.net")) return "threads";
+    if (host === "t.me" || host.includes("telegram.me")) return "telegram";
+  } catch {
+    /* ignore malformed URL */
+  }
+  return null;
+}
+
+function normalizeJirosearchPlatform(raw: unknown, fallback: Platform, sourceUrl = ""): Platform {
   if (typeof raw === "string") {
     const lower = raw.trim().toLowerCase();
     if (lower === "twitter" || lower === "x") return "x";
@@ -944,7 +962,7 @@ function normalizeJirosearchPlatform(raw: unknown, fallback: Platform): Platform
     if (lower === "pinterest" || lower === "pin") return "pinterest";
     if (lower === "threads") return "threads";
   }
-  return fallback;
+  return inferPlatformFromUrl(sourceUrl) ?? fallback;
 }
 
 function inferAuthorFromUrl(sourceUrl: string, platform: Platform): string | null {
@@ -1066,8 +1084,8 @@ export async function scrapeJirosearch(
   }
 
   const requestPayload = {
-    query: queryText,
-    platforms: normalizedPlatforms,
+    q: queryText,
+    engine: "google",
   };
 
   let payload: unknown = null;
@@ -1131,7 +1149,16 @@ export async function scrapeJirosearch(
     : payload && typeof payload === "object"
       ? (() => {
           const obj = payload as Record<string, unknown>;
-          for (const key of ["results", "data", "items", "posts", "reviews", "hits"]) {
+          for (const key of [
+            "organic_results",
+            "results",
+            "data",
+            "items",
+            "posts",
+            "reviews",
+            "hits",
+            "news_results",
+          ]) {
             if (Array.isArray(obj[key])) return obj[key] as unknown[];
           }
           return [];
@@ -1151,11 +1178,6 @@ export async function scrapeJirosearch(
           ? (item["author"] as Record<string, unknown>)
           : null;
 
-    const platform = normalizeJirosearchPlatform(
-      item["source"] ?? item["platform"],
-      fallbackPlatform,
-    );
-
     const rawReviewId = typeof item["reviewId"] === "string" ? item["reviewId"].trim() : "";
     const rawSourceUrl =
       item["sourceUrl"] ??
@@ -1166,6 +1188,12 @@ export async function scrapeJirosearch(
       (/^https?:\/\//i.test(rawReviewId) ? rawReviewId : null);
     const sourceUrl = typeof rawSourceUrl === "string" ? rawSourceUrl.trim() : "";
     if (!/^https?:\/\//i.test(sourceUrl)) continue;
+
+    const platform = normalizeJirosearchPlatform(
+      item["source"] ?? item["platform"],
+      fallbackPlatform,
+      sourceUrl,
+    );
 
     const rawTitle = typeof item["title"] === "string" ? stripHtml(item["title"]) : "";
     const rawBodyVal =
@@ -1229,7 +1257,8 @@ export async function scrapeJirosearch(
       item["date"],
       item["timestamp"],
     ];
-    const parsedDate = rawDates.map(normalizePublishedDate).find(Boolean) ?? "";
+    const parsedDate =
+      rawDates.map(normalizePublishedDate).find(Boolean) || parseSnippetDate(rawBody);
 
     out.push({
       platform,
