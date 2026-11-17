@@ -14,6 +14,8 @@ export interface ThreadsPublicPost {
   url: string; code: string; text: string; createdAt: string; username: string | null; fullName: string | null;
 }
 interface LinkedInSearchHit extends SearchResult { publishedAt?: string }
+type LinkedInSearchProvider = "Google" | "DuckDuckGo" | "Bing";
+type LinkedInProviderResultCounts = Record<LinkedInSearchProvider, number>;
 
 async function runPython(script: string, args: string[], timeoutMs: number): Promise<string> {
   try {
@@ -193,7 +195,12 @@ async function searchLinkedInIndex(
   recent: boolean,
   startDate: string,
   endDate: string,
-): Promise<{ results: LinkedInSearchHit[]; errors: string[]; successfulProviders: number }> {
+): Promise<{
+  results: LinkedInSearchHit[];
+  errors: string[];
+  successfulProviders: LinkedInSearchProvider[];
+  providerResultCounts: LinkedInProviderResultCounts;
+}> {
   const headers = {
     "User-Agent": LINKEDIN_SEARCH_UA,
     "Accept-Language": "en-US,en;q=0.9",
@@ -239,19 +246,26 @@ async function searchLinkedInIndex(
 
   const results: LinkedInSearchHit[] = [];
   const errors: string[] = [];
-  let successfulProviders = 0;
-  const providerNames = ["Google", "DuckDuckGo", "Bing"];
+  const successfulProviders: LinkedInSearchProvider[] = [];
+  const providerResultCounts: LinkedInProviderResultCounts = {
+    Google: 0,
+    "DuckDuckGo": 0,
+    Bing: 0,
+  };
+  const providerNames: LinkedInSearchProvider[] = ["Google", "DuckDuckGo", "Bing"];
   attempts.forEach((attempt, index) => {
+    const providerName = providerNames[index]!;
     if (attempt.status === "fulfilled") {
-      successfulProviders++;
+      successfulProviders.push(providerName);
+      providerResultCounts[providerName] = attempt.value.length;
       results.push(...attempt.value);
     } else {
       const reason = attempt.reason instanceof Error ? attempt.reason.message : String(attempt.reason);
-      errors.push(providerNames[index] + ": " + reason);
+      errors.push(providerName + ": " + reason);
     }
   });
 
-  return {results, errors, successfulProviders};
+  return {results, errors, successfulProviders, providerResultCounts};
 }
 
 export function normalizeLinkedInScrapedPosts(payload: unknown): LinkedInPublicPost[] {
@@ -331,9 +345,15 @@ export async function searchAndScrapeLinkedInPosts(
     "site:linkedin.com/feed/update " + name + dateClauses,
   ];
   const batches = await Promise.all(queries.map(query => searchLinkedInIndex(query, recent, startDate, endDate)));
-  const successfulProviders = batches.reduce((total, batch) => total + batch.successfulProviders, 0);
+  const successfulProviders = Array.from(new Set(batches.flatMap((batch) => batch.successfulProviders)));
+  const providerResultCounts: LinkedInProviderResultCounts = {
+    Google: batches.reduce((total, batch) => total + batch.providerResultCounts.Google, 0),
+    "DuckDuckGo": batches.reduce((total, batch) => total + batch.providerResultCounts["DuckDuckGo"], 0),
+    Bing: batches.reduce((total, batch) => total + batch.providerResultCounts.Bing, 0),
+  };
+  const successfulSearchRequests = batches.reduce((total, batch) => total + batch.successfulProviders.length, 0);
   const providerErrors = batches.flatMap(batch => batch.errors);
-  if (successfulProviders === 0) {
+  if (successfulSearchRequests === 0) {
     throw new Error("LinkedIn search providers failed: " + (providerErrors.join("; ") || "no provider response"));
   }
 
@@ -395,6 +415,8 @@ export async function searchAndScrapeLinkedInPosts(
     queries,
     searchTimeWindow: recent ? {after:startDate, before:tomorrow, maxAgeHours:48} : "unrestricted",
     successfulProviders,
+    successfulSearchRequests,
+    providerResultCounts,
     providerErrors,
     indexedResults: batches.reduce((total, batch) => total + batch.results.length, 0),
     matchingPostUrls: hitsByUrl.size,
