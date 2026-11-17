@@ -13,6 +13,7 @@ export interface LinkedInPublicPost {
 export interface ThreadsPublicPost {
   url: string; code: string; text: string; createdAt: string; username: string | null; fullName: string | null;
 }
+type LinkedInSearchHit = SearchResult;
 
 async function runPython(script: string, args: string[], timeoutMs: number): Promise<string> {
   try {
@@ -59,10 +60,12 @@ const LINKEDIN_MAX_AGE_MS = 48 * 60 * 60 * 1000;
 
 const LINKEDIN_SEARCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
 
-function parseLinkedInSearchDate(value: string, now = Date.now()): string {
+export function parseLinkedInSearchDate(value: string, now = Date.now()): string {
   const text = value.replace(/\s+/g, " ").trim();
   if (!text) return "";
-  const relative = text.match(/\b(just now|moments ago|today|yesterday|\d{1,4}\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|years?)\s*ago)\b/i);
+  const relative = text.match(
+    /(?:^|[|·•–—]\s*|\b(?:posted|published|created|updated)\s*(?:on|at|:)?\s*)(just now|moments ago|today|yesterday|\d{1,4}\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|years?)\s*ago)(?=$|[\s|·•–—])/i,
+  );
   if (relative && relative[1]) {
     const label = relative[1].toLowerCase();
     if (label === "just now" || label === "moments ago" || label === "today") return new Date(now).toISOString();
@@ -82,10 +85,8 @@ function parseLinkedInSearchDate(value: string, now = Date.now()): string {
       return new Date(now - amount * unitMs - conservativeOffset).toISOString();
     }
   }
-  const month =
-    "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
   const absolute = text.match(
-    /\\b((?:20\\d{2}-\\d{1,2}-\\d{1,2}(?:[T ][0-9:.Z+-]+)?)|(?:(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\\s+\\d{1,2}(?:,?\\s+20\\d{2})?)|(?:\\d{1,2}\\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?:\\s+20\\d{2})?))\\b/i,
+    /(?:^|[|·•–—]\s*|\b(?:posted|published|created|updated)\s*(?:on|at|:)?\s*)(20\d{2}-\d{1,2}-\d{1,2}(?:[T ][0-9:.Z+-]+)?|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:,?\s+20\d{2})?|\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?:\s+20\d{2})?)(?=$|[\s|·•–—])/i,
   );
   if (!absolute || !absolute[1]) return "";
   const dateText = absolute[1];
@@ -94,7 +95,7 @@ function parseLinkedInSearchDate(value: string, now = Date.now()): string {
   return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString();
 }
 
-function isLinkedInPostWithin48Hours(publishedAt: string, now: number): boolean {
+export function isLinkedInPostWithin48Hours(publishedAt: string, now: number): boolean {
   const timestamp = Date.parse(publishedAt);
   const age = now - timestamp;
   return Number.isFinite(timestamp) && age >= -5 * 60 * 1000 && age <= 48 * 60 * 60 * 1000;
@@ -233,7 +234,7 @@ export async function searchAndScrapeLinkedInPosts(
     }
   }
 
-  const posts: LinkedInPublicPost[] = []
+  const posts: LinkedInPublicPost[] = [];
   let undated = 0;
   let outsideWindow = 0;
   let unreadablePreview = 0;
