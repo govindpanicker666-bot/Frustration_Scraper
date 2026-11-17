@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { normalizeLinkedInPostUrl, normalizeLinkedInScrapedPosts, normalizeThreadsSearchPosts } from "./public-social-scrapers.server";
+import {\n  isLinkedInPostWithin48Hours,\n  normalizeLinkedInPostUrl,\n  normalizeLinkedInScrapedPosts,\n  normalizeThreadsSearchPosts,\n  parseLinkedInSearchDate,\n} from "./public-social-scrapers.server";
 
 describe("public social scraper normalizers", () => {
   it("validates and canonicalizes LinkedIn post URLs", () => {
@@ -20,6 +20,25 @@ describe("public social scraper normalizers", () => {
     expect(posts[0]?.authorUrl).toBe("https://www.linkedin.com/in/alex-doe");
     expect(posts[0]?.publishedAt).toBe("2026-11-17T10:00:00.000Z");
   });
+  it("parses LinkedIn result-card relative timestamps without reading ordinary post text as a date", () => {
+    const now = Date.parse("2026-11-18T12:00:00.000Z");
+    expect(parseLinkedInSearchDate("Duncan Lennox · 2 hours ago · 190 reactions", now)).toBe(
+      "2026-11-18T10:00:00.000Z",
+    );
+    expect(parseLinkedInSearchDate("Posted today · 190 reactions", now)).toBe(
+      "2026-11-18T12:00:00.000Z",
+    );
+    expect(parseLinkedInSearchDate("I am frustrated because today the app failed again.", now)).toBe("");
+  });
+
+  it("applies a rolling 48-hour boundary to LinkedIn posts", () => {
+    const now = Date.parse("2026-11-18T12:00:00.000Z");
+    expect(isLinkedInPostWithin48Hours("2026-11-16T12:00:00.000Z", now)).toBe(true);
+    expect(isLinkedInPostWithin48Hours("2026-11-16T11:59:59.999Z", now)).toBe(false);
+    expect(isLinkedInPostWithin48Hours("2026-11-18T12:10:00.000Z", now)).toBe(false);
+    expect(isLinkedInPostWithin48Hours("", now)).toBe(false);
+  });
+
   it("retains full Threads text, timestamp and post link", () => {
     const body = "Full Threads post text. ".repeat(250);
     const posts = normalizeThreadsSearchPosts([{
