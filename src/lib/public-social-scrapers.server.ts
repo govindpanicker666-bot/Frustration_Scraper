@@ -343,7 +343,16 @@ export async function searchAndScrapeLinkedInPosts(
       const url = normalizeLinkedInPostUrl(hit.url);
       if (!url) continue;
       const previous = hitsByUrl.get(url);
-      if (!previous || hit.snippet.length > previous.snippet.length) hitsByUrl.set(url, {...hit, url});
+      if (!previous) {
+        hitsByUrl.set(url, {...hit, url});
+      } else {
+        const betterText = hit.snippet.length > previous.snippet.length ? hit : previous;
+        hitsByUrl.set(url, {
+          ...betterText,
+          url,
+          publishedAt: betterText.publishedAt || previous.publishedAt || hit.publishedAt,
+        });
+      }
     }
   }
 
