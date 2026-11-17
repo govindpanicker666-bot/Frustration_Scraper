@@ -212,7 +212,6 @@ describe("scrapeJirosearch and social platform routing", () => {
     const nowIso = new Date().toISOString();
     const urlByPlatform: Record<string, string> = {
       youtube: "https://www.youtube.com/watch?v=abc123",
-      linkedin: "https://www.linkedin.com/posts/alex-rivera-1",
       tiktok: "https://www.tiktok.com/@alex/video/123456",
       telegram: "https://t.me/saaschat/123",
       pinterest: "https://www.pinterest.com/pin/123456/",
@@ -220,7 +219,6 @@ describe("scrapeJirosearch and social platform routing", () => {
 
     const platformOrder = [
       "youtube",
-      "linkedin",
       "tiktok",
       "telegram",
       "pinterest",
@@ -453,4 +451,30 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(res.status).toBe("ok");
     expect(res.reviews).toHaveLength(0);
   });
+
+  it("searches public Mastodon hashtag timelines across instances and applies the strict 48-hour cutoff", async () => {
+    delete process.env["JIRO_SEARCH_URL"];
+    const recent = new Date(Date.now() - 60 * 60 * 1000).toISOString();
+    const old = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      const host = new URL(String(input)).hostname;
+      const statuses = host === "mastodon.social"
+        ? [
+            { id: "1", url: "https://mastodon.social/@alice/1", content: "<p>Acme export is painfully slow.</p>", created_at: recent, visibility: "public", account: { display_name: "Alice Doe", acct: "alice@mastodon.social", url: "https://mastodon.social/@alice" } },
+            { id: "2", url: "https://mastodon.social/@bob/2", content: "<p>Acme was broken last week.</p>", created_at: old, visibility: "public", account: { display_name: "Bob Doe", acct: "bob@mastodon.social", url: "https://mastodon.social/@bob" } },
+          ]
+        : [
+            { id: "3", url: `https://${host}/@carol/3`, content: "<p>Acme sync failed again.</p>", created_at: recent, visibility: "public", account: { display_name: "Carol Doe", acct: `carol@${host}`, url: `https://${host}/@carol` } },
+          ];
+      return new Response(JSON.stringify(statuses), { status: 200, headers: { "Content-Type": "application/json" } });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+    const result = await scrapePlatform({ name: "Acme", domain: "acme.com" }, "mastodon");
+    expect(result.status).toBe("ok");
+    expect(result.reviews.length).toBeGreaterThanOrEqual(1);
+    expect(result.reviews.every((review) => Date.now() - Date.parse(review.published_at) <= 48 * 60 * 60 * 1000)).toBe(true);
+    expect(new Set(fetchMock.mock.calls.map(([url]) => new URL(String(url)).hostname)).size).toBeGreaterThan(1);
+    expect(result.reviews.some((review) => review.source_url.includes("/@carol/"))).toBe(true);
+  });
+
 });

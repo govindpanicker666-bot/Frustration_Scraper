@@ -3,7 +3,7 @@ services:
     name: frustration-scraper
     env: node
     plan: free
-    buildCommand: npm install && npm run build
+    buildCommand: npm install && python3 -m pip install --break-system-packages --disable-pip-version-check -r scripts/toolzerhub/requirements.txt && npm run build
     startCommand: node .output/server/index.mjs
     envVars:
       - key: NITRO_PRESET

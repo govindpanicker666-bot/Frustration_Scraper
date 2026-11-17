@@ -1,11 +1,3 @@
-import { execFile } from "node:child_process";
-import { mkdtemp, readFile, rm } from "node:fs/promises";
-import os from "node:os";
-import path from "node:path";
-import { promisify } from "node:util";
-
-const execFileAsync = promisify(execFile);
-
 export interface LinkedInTestResult {
   ok: boolean;
   name: string;
@@ -40,42 +32,30 @@ function parseJsonSafe(text: string): unknown {
 
 export async function testLinkedInSearch(name: string): Promise<LinkedInTestResult> {
   const queryName = name.trim();
-  const hasJiroConfig = Boolean(
+  const hasLegacyJiroConfig = Boolean(
     process.env["JIRO_SEARCH_URL"]?.trim() ||
     process.env["JIROSEARCH_API_URL"]?.trim() ||
     process.env["JIROSEARCH_API_KEY"]?.trim(),
   );
+  if (!queryName) return {
+    ok: false, name: queryName, profileUrl: null, hasApiKey: hasLegacyJiroConfig,
+    searchRaw: null, profileRaw: null, error: "Missing 'name' query parameter.",
+  };
 
-  if (!queryName) {
-    return {
-      ok: false,
-      name: queryName,
-      profileUrl: null,
-      hasApiKey: hasJiroConfig,
-      searchRaw: null,
-      profileRaw: null,
-      error: "Missing 'name' query parameter.",
-    };
-  }
-
-  const { scrapeJirosearch } = await import("@/lib/scrapers.server");
-  const reviews = await scrapeJirosearch(queryName, ["linkedin"]);
-  const firstWithProfile = reviews.find((r) => r.reviewer_profile_url) ?? reviews[0] ?? null;
-  const profileUrl = firstWithProfile?.reviewer_profile_url ?? firstWithProfile?.source_url ?? null;
-
+  const { scrapePlatform } = await import("@/lib/scrapers.server");
+  const result = await scrapePlatform({ name: queryName, domain: null }, "linkedin");
+  const first = result.reviews.find((review) => review.reviewer_profile_url) ?? result.reviews[0] ?? null;
   return {
-    ok: reviews.length > 0,
+    ok: result.reviews.length > 0,
     name: queryName,
-    profileUrl,
-    hasApiKey: hasJiroConfig,
-    searchRaw: reviews,
-    profileRaw: firstWithProfile,
-    error:
-      reviews.length > 0
-        ? undefined
-        : hasJiroConfig
-          ? "No LinkedIn posts returned by Jirosearch."
-          : "JIRO_SEARCH_URL is not configured in environment variables.",
+    profileUrl: first?.reviewer_profile_url ?? first?.source_url ?? null,
+    hasApiKey: hasLegacyJiroConfig,
+    searchRaw: result.reviews,
+    profileRaw: first,
+    error: result.reviews.length ? undefined
+      : result.status === "blocked"
+        ? "Free LinkedIn search or public post extraction was blocked. Try again later."
+        : "No readable public LinkedIn posts were found in the indexed results.",
   };
 }
 
@@ -595,167 +575,40 @@ export interface ThreadsTestResult {
   error?: string | undefined;
 }
 
-function parseCsvRecords(csvText: string): Array<Record<string, string>> {
-  const rows: string[][] = [];
-  let currentRow: string[] = [];
-  let currentField = "";
-  let inQuotes = false;
-
-  for (let i = 0; i < csvText.length; i++) {
-    const ch = csvText[i]!;
-    if (inQuotes) {
-      if (ch === '"') {
-        if (csvText[i + 1] === '"') {
-          currentField += '"';
-          i++;
-        } else {
-          inQuotes = false;
-        }
-      } else {
-        currentField += ch;
-      }
-    } else if (ch === '"') {
-      inQuotes = true;
-    } else if (ch === ",") {
-      currentRow.push(currentField);
-      currentField = "";
-    } else if (ch === "\r") {
-      if (csvText[i + 1] === "\n") i++;
-      currentRow.push(currentField);
-      rows.push(currentRow);
-      currentRow = [];
-      currentField = "";
-    } else if (ch === "\n") {
-      currentRow.push(currentField);
-      rows.push(currentRow);
-      currentRow = [];
-      currentField = "";
-    } else {
-      currentField += ch;
-    }
-  }
-
-  if (currentField.length > 0 || currentRow.length > 0) {
-    currentRow.push(currentField);
-    rows.push(currentRow);
-  }
-
-  if (rows.length < 2) return [];
-  const headers = rows[0] ?? [];
-  const out: Array<Record<string, string>> = [];
-
-  for (let r = 1; r < rows.length; r++) {
-    const row = rows[r];
-    if (!row || (row.length === 1 && row[0] === "")) continue;
-    const record: Record<string, string> = {};
-    for (let c = 0; c < headers.length; c++) {
-      const key = headers[c] ?? `col_${c}`;
-      record[key] = row[c] ?? "";
-    }
-    out.push(record);
-  }
-
-  return out;
-}
-
 export async function testThreadsScraper(
   keyword: string,
   opts: { limit?: number } = {},
 ): Promise<ThreadsTestResult> {
   const term = keyword.trim();
-  const command = `threads-scraper --keywords "${term}"`;
-  const limit = Math.max(1, Math.min(100, Math.floor(opts.limit ?? 15)));
-
-  if (!term) {
-    return {
-      ok: false,
-      keyword: term,
-      command,
-      stdout: "",
-      stderr: "",
-      parsedStdout: null,
-      totalRows: 0,
-      results: [],
-      error: "Missing 'keyword' query parameter.",
-    };
-  }
-
-  const tempDir = await mkdtemp(path.join(os.tmpdir(), "threads-scraper-"));
-  const outputCsvPath = path.join(tempDir, "output.csv");
-  const args = [
-    "--keywords",
-    term,
-    "--output",
-    outputCsvPath,
-    "--limit",
-    String(limit),
-    "--delay-min",
-    "0.5",
-    "--delay-max",
-    "1.5",
-    "--no-checkpoint",
-  ];
+  const limit = Math.max(1, Math.min(50, Math.floor(opts.limit ?? 20)));
+  const command = "python3 scripts/toolzerhub/threads_scraper.py search <keyword>";
+  if (!term) return {
+    ok: false, keyword: term, command, stdout: "", stderr: "", parsedStdout: null,
+    totalRows: 0, results: [], error: "Missing 'keyword' query parameter.",
+  };
 
   try {
-    const { stdout, stderr } = await execFileAsync("threads-scraper", args, {
-      cwd: tempDir,
-      env: process.env,
-      timeout: 90_000,
-      maxBuffer: 4 * 1024 * 1024,
-    });
-
-    const parsedStdout = parseJsonSafe(stdout);
-    let results: Array<Record<string, string>> = [];
-
-    try {
-      const csvRaw = await readFile(outputCsvPath, "utf8");
-      results = parseCsvRecords(csvRaw);
-    } catch {
-      // output.csv is only created when at least 1 post passes filters
-    }
-
-    const combinedOutput = `${stdout}\n${stderr}`;
-    const blockMatch = combinedOutput.match(/(captcha|login|checkpoint|403|blocked|challenge)/i);
-
+    const { searchThreadsPublicPosts } = await import("@/lib/public-social-scrapers.server");
+    const posts = await searchThreadsPublicPosts(term, { limit });
+    const results = posts.map((post) => ({
+      username: post.username ?? "",
+      post_code: post.code,
+      comment_text: post.text,
+      timestamp: String(Math.floor(Date.parse(post.createdAt) / 1000)),
+      created_at: post.createdAt,
+      url: post.url,
+    }));
+    const stdout = JSON.stringify(posts);
     return {
-      ok: results.length > 0,
-      keyword: term,
-      command,
-      stdout: stdout.trim(),
-      stderr: stderr.trim(),
-      parsedStdout,
-      totalRows: results.length,
-      results,
-      error:
-        results.length > 0
-          ? undefined
-          : blockMatch
-            ? `Blocked or gated (${blockMatch[0]}): ${combinedOutput.trim()}`
-            : "threads-scraper completed with 0 comments saved.",
+      ok: results.length > 0, keyword: term, command, stdout, stderr: "",
+      parsedStdout: posts, totalRows: results.length, results,
+      error: results.length ? undefined : "Threads returned no public posts.",
     };
   } catch (err) {
-    const execErr = err as {
-      stdout?: string;
-      stderr?: string;
-      message?: string;
-    };
-    const stdout = typeof execErr.stdout === "string" ? execErr.stdout.trim() : "";
-    const stderr = typeof execErr.stderr === "string" ? execErr.stderr.trim() : "";
-    const parsedStdout = parseJsonSafe(stdout);
-    const errorDetail = stderr || stdout || execErr.message || String(err);
-
+    const detail = err instanceof Error ? err.message : String(err);
     return {
-      ok: false,
-      keyword: term,
-      command,
-      stdout,
-      stderr,
-      parsedStdout,
-      totalRows: 0,
-      results: [],
-      error: errorDetail,
+      ok: false, keyword: term, command, stdout: "", stderr: detail,
+      parsedStdout: null, totalRows: 0, results: [], error: detail,
     };
-  } finally {
-    await rm(tempDir, { recursive: true, force: true }).catch(() => {});
   }
 }

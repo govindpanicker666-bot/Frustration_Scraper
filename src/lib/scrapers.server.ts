@@ -647,26 +647,79 @@ async function bluesky(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   });
 }
 
-// ---------- Mastodon (public hashtag timeline) ----------
+// ---------- Mastodon public hashtag timelines across several instances ----------
+const MASTODON_PUBLIC_INSTANCES = [
+  "mastodon.social",
+  "mastodon.online",
+  "mstdn.social",
+  "fosstodon.org",
+  "hachyderm.io",
+] as const;
+
 async function mastodon(c: CompetitorCtx) {
-  const tag = c.name.replace(/[^a-z0-9]/gi, "");
   type S = {
+    id: string;
     url: string;
     content: string;
     created_at: string;
-    account: { display_name: string; acct: string };
+    visibility?: string;
+    account: { display_name?: string; acct: string; url?: string };
   };
-  const list = await getJson<S[]>(
-    `https://mastodon.social/api/v1/timelines/tag/${encodeURIComponent(tag)}?limit=40`,
+
+  const nameTag = c.name.normalize("NFKD")
+    .replace(/[\u0300-\u036f]/g, "")
+    .replace(/[^a-z0-9]/gi, "")
+    .toLowerCase();
+  const domainTag = (c.domain ?? "")
+    .toLowerCase()
+    .replace(/^www\./, "")
+    .split(".")[0]
+    ?.replace(/[^a-z0-9]/g, "") ?? "";
+  const wordTags = c.name.toLowerCase().match(/[a-z0-9]{4,}/g) ?? [];
+  const tags = [...new Set([nameTag, domainTag, ...wordTags])]
+    .filter((tag) => tag.length >= 4)
+    .slice(0, 3);
+  if (!tags.length) throw new NoMatch("no usable Mastodon hashtag");
+
+  const responses = await Promise.all(
+    MASTODON_PUBLIC_INSTANCES.flatMap((instance) =>
+      tags.map(async (tag) => {
+        try {
+          const statuses = await getJson<S[]>(
+            `https://${instance}/api/v1/timelines/tag/${encodeURIComponent(tag)}?limit=30`,
+          );
+          return { ok: true as const, statuses };
+        } catch {
+          return { ok: false as const, statuses: [] as S[] };
+        }
+      }),
+    ),
   );
-  return list.map((s): RawReview => ({
-    platform: "mastodon",
-    reviewer_name: s.account.display_name || s.account.acct,
-    reviewer_profile_url: (s.account as { url?: string }).url ?? s.url,
-    source_url: s.url,
-    text: stripHtml(s.content),
-    published_at: iso(s.created_at),
-  }));
+  if (!responses.some((response) => response.ok)) {
+    throw new Blocked("all public Mastodon instances blocked or unavailable");
+  }
+
+  const seen = new Set<string>();
+  const posts: RawReview[] = [];
+  for (const response of responses) {
+    for (const status of response.statuses) {
+      if (status.visibility && status.visibility !== "public" && status.visibility !== "unlisted") continue;
+      const sourceUrl = (status.url ?? "").trim();
+      const body = stripHtml(status.content ?? "");
+      if (!sourceUrl || !body || seen.has(sourceUrl)) continue;
+      seen.add(sourceUrl);
+      posts.push({
+        platform: "mastodon",
+        reviewer_name: status.account?.display_name?.trim() || status.account?.acct || null,
+        reviewer_profile_url: status.account?.url || null,
+        source_url: sourceUrl,
+        text: body,
+        published_at: iso(status.created_at),
+      });
+    }
+  }
+  if (!posts.length) throw new NoMatch("no public Mastodon posts for searched hashtags");
+  return posts;
 }
 
 // ---------- Discourse community forums (competitor's own forum) ----------
@@ -1602,11 +1655,21 @@ export async function filterAndRecoverJirosearchReviews(
 }
 
 async function linkedin(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  return scrapeJirosearch(c.name, ["linkedin"], {
-    domain: c.domain,
-    intent: opts.intent,
+  const { searchAndScrapeLinkedInPosts } = await import("./public-social-scrapers.server");
+  const posts = await searchAndScrapeLinkedInPosts(c, {
     apply48HourFilter: opts.apply48HourFilter ?? true,
+    limit: 12,
   });
+  if (!posts.length) throw new NoMatch("no readable public LinkedIn posts found in search indexes");
+
+  return posts.map((post): RawReview => ({
+    platform: "linkedin",
+    reviewer_name: post.authorName,
+    reviewer_profile_url: post.authorUrl,
+    source_url: post.url,
+    text: post.text,
+    published_at: post.publishedAt,
+  }));
 }
 async function x(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   return xLookup(c, opts);
@@ -1841,54 +1904,24 @@ export async function scrapeThreadsReviews(
   keyword: string,
   opts: { limit?: number } = {},
 ): Promise<RawReview[]> {
-  const { testThreadsScraper } = await import("@/server/socialTest");
-  const res = await testThreadsScraper(keyword, opts);
-  if (!res.ok && res.error && /blocked or gated|403|captcha|login/i.test(res.error)) {
-    throw new Blocked(res.error);
-  }
-
-  const out: RawReview[] = [];
-  for (const row of res.results) {
-    const body = (row["comment_text"] ?? "").trim();
-    if (!body || body.length < 10) continue;
-
-    const postCode = (row["post_code"] ?? "").trim();
-    if (!postCode) continue;
-
-    const ts = Number.parseInt(row["timestamp"] ?? "", 10);
-    if (!Number.isFinite(ts) || ts <= 0) continue;
-    const reviewedAt = new Date(ts * 1000).toISOString();
-
-    const username = (row["username"] ?? "").trim().replace(/^@/, "");
-    const sourceUrl = username
-      ? `https://www.threads.net/@${username}/post/${postCode}`
-      : `https://www.threads.net/post/${postCode}`;
-
-    out.push({
-      platform: "threads",
-      reviewer_name: username || null,
-      reviewer_profile_url: username ? `https://www.threads.net/@${username}` : null,
-      source_url: sourceUrl,
-      text: body.slice(0, 3000),
-      published_at: reviewedAt,
-    });
-  }
-  return out;
+  const { searchThreadsPublicPosts } = await import("./public-social-scrapers.server");
+  const posts = await searchThreadsPublicPosts(keyword, { limit: opts.limit ?? 20 });
+  return posts.map((post): RawReview => ({
+    platform: "threads",
+    reviewer_name: post.username || post.fullName,
+    reviewer_profile_url: post.username ? `https://www.threads.com/@${post.username}` : null,
+    source_url: post.url,
+    text: post.text,
+    published_at: post.createdAt,
+  }));
 }
 
 async function threads(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  const apply48HourFilter = opts.apply48HourFilter ?? true;
-  try {
-    const cliReviews = await scrapeThreadsReviews(c.name, { limit: apply48HourFilter ? 15 : 50 });
-    if (cliReviews.length > 0) return cliReviews;
-  } catch {
-    /* threads-scraper unavailable or blocked; fall back to Jirosearch */
-  }
-  return scrapeJirosearch(c.name, ["threads"], {
-    domain: c.domain,
-    intent: opts.intent,
-    apply48HourFilter: opts.apply48HourFilter ?? true,
+  const posts = await scrapeThreadsReviews(c.name, {
+    limit: opts.apply48HourFilter === false ? 30 : 20,
   });
+  if (!posts.length) throw new NoMatch("no public Threads keyword-search posts");
+  return posts;
 }
 
 const SOURCES: Record<
@@ -1938,7 +1971,7 @@ export async function scrapePlatform(
 ): Promise<SourceResult> {
   const apply48HourFilter = opts.apply48HourFilter ?? true;
   try {
-    if (JIROSEARCH_PLATFORM_SET.has(platform) && platform !== "threads" && !hasJirosearchConfig()) {
+    if (JIROSEARCH_PLATFORM_SET.has(platform) && platform !== "threads" && platform !== "linkedin" && !hasJirosearchConfig()) {
       return { status: "no_key", reviews: [] };
     }
     const all = await SOURCES[platform](c, opts);

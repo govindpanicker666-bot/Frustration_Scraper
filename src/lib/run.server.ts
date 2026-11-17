@@ -79,7 +79,6 @@ async function findContactBounded(
 }
 
 const JIROSEARCH_DIRECT_PLATFORMS = new Set<Platform>([
-  "linkedin",
   "pinterest",
   "tiktok",
 ]);
