@@ -13,7 +13,7 @@ export interface LinkedInPublicPost {
 export interface ThreadsPublicPost {
   url: string; code: string; text: string; createdAt: string; username: string | null; fullName: string | null;
 }
-type LinkedInSearchHit = SearchResult;
+interface LinkedInSearchHit extends SearchResult { publishedAt?: string }
 
 async function runPython(script: string, args: string[], timeoutMs: number): Promise<string> {
   try {
@@ -150,42 +150,107 @@ export function isLinkedInPostWithin48Hours(publishedAt: string, now: number): b
   return Number.isFinite(timestamp) && age >= -5 * 60 * 1000 && age <= 48 * 60 * 60 * 1000;
 }
 
+function stripSearchMarkup(value: string): string {
+  return decodeSearchHtml(value.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
+}
+
+function parseGoogleLinkedInResults(html: string): LinkedInSearchHit[] {
+  const results: LinkedInSearchHit[] = [];
+  const blocks = html.split(/<div\b[^>]*class=["'][^"']*\bMjjYud\b[^"']*["'][^>]*>/i).slice(1);
+  const candidates = blocks.length ? blocks : [html];
+
+  for (const block of candidates) {
+    const anchor = block.match(
+      /<a\b[^>]*href=(["'])(.*?)\1[^>]*>[\s\S]*?<h3\b[^>]*>([\s\S]*?)<\/h3>[\s\S]*?<\/a>/i,
+    );
+    if (!anchor?.[2] || !anchor[3]) continue;
+
+    const snippetMatch = block.match(
+      /<(?:div|span)\b[^>]*class=(["'])[^"']*(?:VwiC3b|IsZvec|aCOpRe|s3v9rd|yXK7lf)[^"']*\1[^>]*>([\s\S]*?)<\/(?:div|span)>/i,
+    );
+    const title = stripSearchMarkup(anchor[3]);
+    const snippet = snippetMatch?.[2] ? stripSearchMarkup(snippetMatch[2]) : "";
+    const cardText = stripSearchMarkup(block);
+    const publishedAt = parseLinkedInSearchDate(cardText);
+
+    results.push({
+      url: decodeSearchHtml(anchor[2]),
+      title,
+      snippet,
+      ...(publishedAt ? { publishedAt } : {}),
+    });
+  }
+  return results;
+}
+
+function dateForGoogleSearch(value: string): string {
+  const [year, month, day] = value.split("-");
+  return month + "/" + day + "/" + year;
+}
+
 async function searchLinkedInIndex(
   query: string,
   recent: boolean,
+  startDate: string,
+  endDate: string,
 ): Promise<{ results: LinkedInSearchHit[]; errors: string[]; successfulProviders: number }> {
   const headers = {
     "User-Agent": LINKEDIN_SEARCH_UA,
     "Accept-Language": "en-US,en;q=0.9",
   };
+
+  const googleUrl = new URL("https://www.google.com/search");
+  googleUrl.searchParams.set("q", query);
+  googleUrl.searchParams.set("num", "20");
+  if (recent) {
+    googleUrl.searchParams.set(
+      "tbs",
+      "cdr:1,cd_min:" + dateForGoogleSearch(startDate) + ",cd_max:" + dateForGoogleSearch(endDate),
+    );
+  }
+
   const ddgUrl = new URL("https://html.duckduckgo.com/html/");
   ddgUrl.searchParams.set("q", query);
   if (recent) ddgUrl.searchParams.set("df", "w");
+
   const bingUrl = new URL("https://www.bing.com/search");
   bingUrl.searchParams.set("format", "rss");
   bingUrl.searchParams.set("q", query);
   if (recent) bingUrl.searchParams.set("filters", 'ex1:"ez2"');
-  const [ddg, bing] = await Promise.allSettled([
-    fetch(ddgUrl, {headers, signal:AbortSignal.timeout(9000)}).then(async response => {
+
+  const attempts = await Promise.allSettled([
+    fetch(googleUrl, {headers, signal:AbortSignal.timeout(12_000)}).then(async response => {
+      if (!response.ok) throw new Error("Google HTTP " + response.status);
+      const html = await response.text();
+      if (/unusual traffic|sorry\/index|our systems have detected/i.test(html)) {
+        throw new Error("Google returned an automated-traffic challenge");
+      }
+      return parseGoogleLinkedInResults(html);
+    }),
+    fetch(ddgUrl, {headers, signal:AbortSignal.timeout(9_000)}).then(async response => {
       if (!response.ok) throw new Error("DuckDuckGo HTTP " + response.status);
       return parseDdgHtml(await response.text());
     }),
-    fetch(bingUrl, {headers, signal:AbortSignal.timeout(9000)}).then(async response => {
+    fetch(bingUrl, {headers, signal:AbortSignal.timeout(9_000)}).then(async response => {
       if (!response.ok) throw new Error("Bing HTTP " + response.status);
       return parseBingRss(await response.text());
     }),
   ]);
+
   const results: LinkedInSearchHit[] = [];
   const errors: string[] = [];
   let successfulProviders = 0;
-  for (const result of [ddg, bing]) {
-    if (result.status === "fulfilled") {
+  const providerNames = ["Google", "DuckDuckGo", "Bing"];
+  attempts.forEach((attempt, index) => {
+    if (attempt.status === "fulfilled") {
       successfulProviders++;
-      results.push(...result.value);
+      results.push(...attempt.value);
     } else {
-      errors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
+      const reason = attempt.reason instanceof Error ? attempt.reason.message : String(attempt.reason);
+      errors.push(providerNames[index] + ": " + reason);
     }
-  }
+  });
+
   return {results, errors, successfulProviders};
 }
 
@@ -265,7 +330,7 @@ export async function searchAndScrapeLinkedInPosts(
     "site:linkedin.com/posts " + name + dateClauses,
     "site:linkedin.com/feed/update " + name + dateClauses,
   ];
-  const batches = await Promise.all(queries.map(query => searchLinkedInIndex(query, recent)));
+  const batches = await Promise.all(queries.map(query => searchLinkedInIndex(query, recent, startDate, endDate)));
   const successfulProviders = batches.reduce((total, batch) => total + batch.successfulProviders, 0);
   const providerErrors = batches.flatMap(batch => batch.errors);
   if (successfulProviders === 0) {
@@ -294,7 +359,7 @@ export async function searchAndScrapeLinkedInPosts(
       unreadablePreview++;
       continue;
     }
-    const publishedAt = parseLinkedInSearchDate(snippet + " " + hit.title, now) || activityDate(url);
+    const publishedAt = parseLinkedInSearchDate(snippet + " " + hit.title, now) || hit.publishedAt || activityDate(url);
     if (recent && !publishedAt) {
       undated++;
       continue;
