@@ -1,6 +1,12 @@
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { PLATFORMS } from "./pipeline";
-import { scrapeJirosearch, scrapePlatform } from "./scrapers.server";
+import {
+  mapSocialFetchFacebookPost,
+  mapSocialFetchInstagramPosts,
+  mapSocialFetchRedditPosts,
+  scrapeJirosearch,
+  scrapePlatform,
+} from "./scrapers.server";
 
 describe("scrapeJirosearch and social platform routing", () => {
   const originalJiroUrl = process.env["JIRO_SEARCH_URL"];
@@ -29,7 +35,7 @@ describe("scrapeJirosearch and social platform routing", () => {
     }
   });
 
-  it("includes all Jirosearch social platforms in PLATFORMS", () => {
+  it("keeps the replaced and unaffected platform IDs in the supported platform list", () => {
     for (const id of [
       "instagram",
       "linkedin",
@@ -44,12 +50,27 @@ describe("scrapeJirosearch and social platform routing", () => {
     }
   });
 
-  it("returns no_key status when JIRO_SEARCH_URL and legacy Jirosearch config are unset", async () => {
+  it("does not require Jirosearch configuration for X, Instagram or Facebook", async () => {
     delete process.env["JIRO_SEARCH_URL"];
     delete process.env["JIROSEARCH_API_URL"];
     delete process.env["JIROSEARCH_API_KEY"];
-    const res = await scrapePlatform({ name: "Acme", domain: "acme.com" }, "instagram");
-    expect(res).toEqual({ status: "no_key", reviews: [] });
+    const homepageFetch = vi.fn().mockResolvedValue(
+      new Response("<html><body>No linked social accounts</body></html>", { status: 200 }),
+    );
+    vi.stubGlobal("fetch", homepageFetch);
+
+    const instagram = await scrapePlatform(
+      { name: "Acme", domain: "acme.com" },
+      "instagram",
+    );
+    const facebook = await scrapePlatform(
+      { name: "Acme", domain: "acme.com" },
+      "facebook",
+    );
+    expect(instagram.status).toBe("no_match");
+    expect(facebook.status).toBe("no_match");
+    expect(instagram.status).not.toBe("no_key");
+    expect(facebook.status).not.toBe("no_key");
   });
 
   it("sends separate /social/search requests per platform with { query, platform, limit: 10 } and maps results", async () => {
@@ -58,9 +79,7 @@ describe("scrapeJirosearch and social platform routing", () => {
     const nowIso = new Date().toISOString();
 
     const urlByPlatform: Record<string, string> = {
-      x: "https://x.com/jane_founder/status/123456",
-      instagram: "https://www.instagram.com/p/abc123/",
-      facebook: "https://www.facebook.com/alex/posts/123",
+      youtube: "https://www.youtube.com/watch?v=abc123",
       pinterest: "https://www.pinterest.com/pin/123456/",
       linkedin: "https://www.linkedin.com/posts/sam-lee-1",
       tiktok: "https://www.tiktok.com/@alex/video/123456",
@@ -72,7 +91,7 @@ describe("scrapeJirosearch and social platform routing", () => {
         platform?: string;
         limit?: number;
       };
-      const target = sent.platform === "twitter" ? "x" : sent.platform ?? "x";
+      const target = sent.platform ?? "linkedin";
       return new Response(
         JSON.stringify({
           results: [
@@ -90,7 +109,7 @@ describe("scrapeJirosearch and social platform routing", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const platforms = ["x", "instagram", "facebook", "pinterest", "linkedin", "tiktok"];
+    const platforms = ["youtube", "pinterest", "linkedin", "tiktok"];
     const reviews = await scrapeJirosearch("Acme", platforms);
 
     expect(fetchMock).toHaveBeenCalledTimes(platforms.length);
@@ -101,7 +120,7 @@ describe("scrapeJirosearch and social platform routing", () => {
           method: "POST",
           body: JSON.stringify({
             query: "Acme",
-            platform: p === "x" ? "twitter" : p,
+            platform: p,
             limit: 10,
           }),
         }),
@@ -109,15 +128,13 @@ describe("scrapeJirosearch and social platform routing", () => {
     }
 
     expect(reviews).toHaveLength(platforms.length);
-    expect(reviews[0]).toEqual({
-      platform: "x",
-      reviewer_name: "@jane_founder",
-      reviewer_profile_url: null,
-      source_url: "https://x.com/jane_founder/status/123456",
-      text: "Support frustration. Acme issue reported on x.",
+    expect(reviews[0]).toMatchObject({
+      platform: "youtube",
+      reviewer_name: "Alex Rivera",
+      source_url: "https://www.youtube.com/watch?v=abc123",
       published_at: nowIso,
     });
-    expect(reviews[4]).toMatchObject({
+    expect(reviews[2]).toMatchObject({
       platform: "linkedin",
       reviewer_name: "Alex Rivera",
       source_url: "https://www.linkedin.com/posts/sam-lee-1",
@@ -131,10 +148,10 @@ describe("scrapeJirosearch and social platform routing", () => {
 
     const fetchMock = vi.fn().mockImplementation(async (_url, init) => {
       const sent = JSON.parse(String(init?.body ?? "{}")) as { platform?: string };
-      if (sent.platform === "instagram") {
+      if (sent.platform === "youtube") {
         return new Response("Forbidden", { status: 403 });
       }
-      if (sent.platform === "facebook") {
+      if (sent.platform === "tiktok") {
         throw new Error("Network reset");
       }
       return new Response(
@@ -154,10 +171,10 @@ describe("scrapeJirosearch and social platform routing", () => {
     });
     vi.stubGlobal("fetch", fetchMock);
 
-    const reviews = await scrapeJirosearch("Acme", ["instagram", "linkedin", "facebook", "x"]);
+    const reviews = await scrapeJirosearch("Acme", ["youtube", "linkedin", "tiktok", "pinterest"]);
     expect(fetchMock).toHaveBeenCalledTimes(4);
     expect(reviews).toHaveLength(2);
-    expect(reviews.map((r) => r.platform)).toEqual(["linkedin", "x"]);
+    expect(reviews.map((r) => r.platform)).toEqual(["linkedin", "pinterest"]);
   });
 
   it("handles sleeping or failing Jirosearch microservice gracefully by returning an empty array", async () => {
@@ -167,10 +184,10 @@ describe("scrapeJirosearch and social platform routing", () => {
       "fetch",
       vi.fn().mockResolvedValue(new Response("Service Unavailable", { status: 503 })),
     );
-    await expect(scrapeJirosearch("Acme", ["x", "linkedin"])).resolves.toEqual([]);
+    await expect(scrapeJirosearch("Acme", ["youtube", "linkedin"])).resolves.toEqual([]);
 
     vi.stubGlobal("fetch", vi.fn().mockRejectedValue(new Error("fetch failed / timeout")));
-    await expect(scrapeJirosearch("Acme", ["instagram", "facebook"])).resolves.toEqual([]);
+    await expect(scrapeJirosearch("Acme", ["tiktok", "pinterest"])).resolves.toEqual([]);
 
     delete process.env["JIRO_SEARCH_URL"];
     delete process.env["JIROSEARCH_API_KEY"];
@@ -181,23 +198,17 @@ describe("scrapeJirosearch and social platform routing", () => {
     process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
     const nowIso = new Date().toISOString();
     const urlByPlatform: Record<string, string> = {
-      x: "https://x.com/alex_rivera/status/123456",
       youtube: "https://www.youtube.com/watch?v=abc123",
       linkedin: "https://www.linkedin.com/posts/alex-rivera-1",
-      instagram: "https://www.instagram.com/p/abc123/",
       tiktok: "https://www.tiktok.com/@alex/video/123456",
-      facebook: "https://www.facebook.com/alex/posts/123456",
       telegram: "https://t.me/saaschat/123",
       pinterest: "https://www.pinterest.com/pin/123456/",
     };
 
     const platformOrder = [
-      "x",
       "youtube",
       "linkedin",
-      "instagram",
       "tiktok",
-      "facebook",
       "telegram",
       "pinterest",
     ] as const;
@@ -213,9 +224,8 @@ describe("scrapeJirosearch and social platform routing", () => {
       expect(typeof sent.platform).toBe("string");
       expect(sent.limit).toBe(10);
 
-      const target =
-        sent.platform === "twitter" ? "x" : sent.platform ?? platformOrder[callIdx++] ?? "x";
-      expect(sent.platform).toBe(target === "x" ? "twitter" : target);
+      const target = sent.platform ?? platformOrder[callIdx++] ?? "linkedin";
+      expect(sent.platform).toBe(target);
       return new Response(
         JSON.stringify({
           results: [
@@ -241,6 +251,60 @@ describe("scrapeJirosearch and social platform routing", () => {
     }
   });
 
+
+  it("normalizes SocialFetch Reddit search results into the existing RawReview shape", () => {
+    const mapped = mapSocialFetchRedditPosts({
+      posts: [{
+        id: "abc123",
+        author: "jane_doe",
+        title: "Acme support never responds",
+        selftext: "I have waited three weeks for a reply.",
+        permalink: "/r/SaaS/comments/abc123/acme_support/",
+        created_utc: 1_800_000_000,
+      }],
+    });
+    expect(mapped).toHaveLength(1);
+    expect(mapped[0]).toMatchObject({
+      platform: "reddit",
+      reviewer_name: "jane_doe",
+      reviewer_profile_url: "https://www.reddit.com/user/jane_doe/",
+      source_url: "https://www.reddit.com/r/SaaS/comments/abc123/acme_support/",
+      text: "Acme support never responds. I have waited three weeks for a reply.",
+      published_at: new Date(1_800_000_000 * 1000).toISOString(),
+    });
+  });
+
+  it("normalizes SocialFetch Instagram recent posts from a known public profile", () => {
+    const mapped = mapSocialFetchInstagramPosts({
+      username: "acme",
+      recent: [{
+        shortcode: "ABC123",
+        url: "https://www.instagram.com/p/ABC123/",
+        caption: "Acme app keeps crashing after the latest update.",
+        taken_at: 1_800_000_000,
+      }],
+    }, "acme");
+    expect(mapped).toHaveLength(1);
+    expect(mapped[0]).toMatchObject({
+      platform: "instagram",
+      reviewer_name: "@acme",
+      reviewer_profile_url: "https://www.instagram.com/acme/",
+      source_url: "https://www.instagram.com/p/ABC123/",
+      published_at: new Date(1_800_000_000 * 1000).toISOString(),
+    });
+  });
+
+  it("does not invent a Facebook post date when SocialFetch oEmbed does not return one", () => {
+    const mapped = mapSocialFetchFacebookPost({
+      url: "https://www.facebook.com/acme/posts/123",
+      title: "Acme service review",
+      author: "Acme",
+    });
+    expect(mapped).toHaveLength(1);
+    expect(mapped[0]?.platform).toBe("facebook");
+    expect(mapped[0]?.published_at).toBe("");
+  });
+
   it("parses relative publication dates without inventing a date for unknown snippets", async () => {
     const { parseSnippetDate } = await import("./scrapers.server");
     const yearsOld = parseSnippetDate("Published 4 years ago");
@@ -251,21 +315,20 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(parseSnippetDate("No publication date shown")).toBe("");
   });
 
-  it("filters old Jirosearch social posts through the same 48-hour gate", async () => {
-    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
+  it("uses X Lookup for latest keyword search and keeps the shared 48-hour gate", async () => {
+    delete process.env["JIRO_SEARCH_URL"];
     const oldDate = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
-          results: [
-            {
-              source: "x",
-              text: "Acme support has been frustrating.",
-              reviewerName: "Old Poster",
-              createdAt: oldDate,
-              url: "https://x.com/oldposter/status/123456",
-            },
-          ],
+          resource: "search",
+          posts: [{
+            id: "1234567890123456789",
+            url: "https://x.com/oldposter/status/1234567890123456789",
+            text: "Acme support has been frustrating.",
+            created_at: oldDate,
+            author: { screen_name: "oldposter", url: "https://x.com/oldposter" },
+          }],
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       ),
@@ -276,31 +339,28 @@ describe("scrapeJirosearch and social platform routing", () => {
 
     expect(res.status).toBe("ok");
     expect(res.reviews).toHaveLength(0);
-    const sentBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as {
-      query?: string;
-      platform?: string;
-      limit?: number;
-    };
-    expect(sentBody.query).toContain("after:");
-    expect(sentBody.platform).toBe("x");
-    expect(sentBody.limit).toBe(10);
+    const requestUrl = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(requestUrl.hostname).toBe("x-lookup.mynameistito.com");
+    expect(requestUrl.pathname).toBe("/search");
+    expect(requestUrl.searchParams.get("q")).toContain("since:");
+    expect(requestUrl.searchParams.get("feed")).toBe("latest");
+    expect(requestUrl.searchParams.get("format")).toBe("json");
   });
 
-  it("keeps the existing historical mode when the 48-hour filter is explicitly disabled", async () => {
-    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
+  it("keeps historical X Lookup results when the 48-hour filter is explicitly disabled", async () => {
+    delete process.env["JIRO_SEARCH_URL"];
     const oldDate = new Date(Date.now() - 72 * 60 * 60 * 1000).toISOString();
     const fetchMock = vi.fn().mockResolvedValue(
       new Response(
         JSON.stringify({
-          results: [
-            {
-              source: "x",
-              text: "Acme support has been frustrating.",
-              reviewerName: "Historical Poster",
-              createdAt: oldDate,
-              url: "https://x.com/historical/status/123456",
-            },
-          ],
+          resource: "search",
+          posts: [{
+            id: "1234567890123456789",
+            text: "Acme support has been frustrating.",
+            created_at: oldDate,
+            url: "https://x.com/historical/status/1234567890123456789",
+            author: { screen_name: "historical" },
+          }],
         }),
         { status: 200, headers: { "Content-Type": "application/json" } },
       ),
@@ -313,31 +373,25 @@ describe("scrapeJirosearch and social platform routing", () => {
 
     expect(res.status).toBe("ok");
     expect(res.reviews).toHaveLength(1);
-    const sentBody = JSON.parse(String(fetchMock.mock.calls[0]?.[1]?.body ?? "{}")) as {
-      query?: string;
-      platform?: string;
-      limit?: number;
-    };
-    expect(sentBody.query).not.toContain("after:");
-    expect(sentBody.platform).toBe("x");
-    expect(sentBody.limit).toBe(10);
+    const requestUrl = new URL(String(fetchMock.mock.calls[0]?.[0]));
+    expect(requestUrl.searchParams.get("q")).not.toContain("since:");
+    expect(requestUrl.searchParams.get("feed")).toBe("latest");
   });
 
-  it("recovers a missing social-post date from publication metadata before filtering", async () => {
-    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
+  it("recovers a missing X post date from publication metadata before filtering", async () => {
+    delete process.env["JIRO_SEARCH_URL"];
     const publishedAt = new Date(Date.now() - 60 * 60 * 1000).toISOString();
     const fetchMock = vi.fn().mockImplementation(async (url: string | URL | Request) => {
-      if (String(url).includes("jiro-search-api-xyz.onrender.com")) {
+      if (String(url).includes("x-lookup.mynameistito.com")) {
         return new Response(
           JSON.stringify({
-            results: [
-              {
-                source: "x",
-                text: "Acme support has been frustrating.",
-                reviewerName: "Recent Poster",
-                url: "https://www.linkedin.com/posts/recent-1",
-              },
-            ],
+            resource: "search",
+            posts: [{
+              id: "not-a-snowflake",
+              text: "Acme support has been frustrating.",
+              author: { screen_name: "recentposter" },
+              url: "https://www.linkedin.com/posts/recent-1",
+            }],
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
@@ -357,20 +411,19 @@ describe("scrapeJirosearch and social platform routing", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
   });
 
-  it("rejects undated posts when publication metadata cannot be recovered", async () => {
-    process.env["JIRO_SEARCH_URL"] = "https://jiro-search-api-xyz.onrender.com";
+  it("rejects undated X posts when publication metadata cannot be recovered", async () => {
+    delete process.env["JIRO_SEARCH_URL"];
     const fetchMock = vi.fn().mockImplementation(async (url: string | URL | Request) => {
-      if (String(url).includes("jiro-search-api-xyz.onrender.com")) {
+      if (String(url).includes("x-lookup.mynameistito.com")) {
         return new Response(
           JSON.stringify({
-            results: [
-              {
-                source: "x",
-                text: "Acme support has been frustrating.",
-                reviewerName: "Unknown Date Poster",
-                url: "https://www.linkedin.com/posts/unknown-1",
-              },
-            ],
+            resource: "search",
+            posts: [{
+              id: "not-a-snowflake",
+              text: "Acme support has been frustrating.",
+              author: { screen_name: "undatedposter" },
+              url: "https://www.linkedin.com/posts/unknown-1",
+            }],
           }),
           { status: 200, headers: { "Content-Type": "application/json" } },
         );
