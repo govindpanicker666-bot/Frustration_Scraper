@@ -4,6 +4,7 @@ import {
   normalizeLinkedInPostUrl,
   normalizeLinkedInScrapedPosts,
   normalizeThreadsSearchPosts,
+  parseGoogleLinkedInResults,
   parseLinkedInSearchDate,
 } from "./public-social-scrapers.server";
 
@@ -18,6 +19,23 @@ describe("public social scraper normalizers", () => {
       "https://www.linkedin.com/posts/alex_topic-activity-123",
     );
   });
+  it("extracts a recent LinkedIn post from a Google search result card", () => {
+    const html = [
+      '<div class="MjjYud">',
+      '<a href="/url?q=https%3A%2F%2Fwww.linkedin.com%2Fposts%2Falex_topic-activity-123">',
+      "<h3>Apollo launch update | LinkedIn</h3></a>",
+      '<div class="VwiC3b">Alex Example · 2h · Sharing what changed in our product this week.</div>',
+      "</div>",
+    ].join("");
+    const hits = parseGoogleLinkedInResults(html);
+    expect(hits).toHaveLength(1);
+    expect(hits[0]?.title).toContain("Apollo launch update");
+    expect(normalizeLinkedInPostUrl(hits[0]?.url)).toBe(
+      "https://www.linkedin.com/posts/alex_topic-activity-123",
+    );
+    expect(hits[0]?.publishedAt).toBeTruthy();
+  });
+
   it("retains the complete LinkedIn post body, author and timestamp", () => {
     const body = "A complete public post body. ".repeat(300);
     const posts = normalizeLinkedInScrapedPosts({ posts: [{
