@@ -1,0 +1,1850 @@
+#!/usr/bin/env python3
+"""
+socialfetch — free, no-auth, no-account access to public social media data.
+
+One CLI, many providers. No API keys, no logins, no paid tiers.
+Python stdlib only (yt-dlp optional for YouTube downloads).
+
+USAGE
+    socialfetch <url>                        auto-detect the platform from a URL
+    socialfetch <provider> <action> [args]   explicit control
+    socialfetch manifest                     machine-readable capability list (for agents)
+    socialfetch status                       which providers work from THIS host?
+    socialfetch setup                        install optional deps (yt-dlp, ffmpeg)
+
+EXAMPLES
+    socialfetch https://x.com/jack/status/20
+    socialfetch https://t.me/telegram
+    socialfetch https://www.instagram.com/nasa/
+    socialfetch https://youtube.com/watch?v=dQw4w9WgXcQ
+    socialfetch https://www.tiktok.com/@tiktok/video/7106594312292453675
+    socialfetch https://www.facebook.com/<page>/posts/<id>
+    socialfetch fb post https://www.facebook.com/<page>/posts/<id>
+    socialfetch fb video https://www.facebook.com/<page>/videos/<id>
+    socialfetch li profile williamhgates
+    socialfetch li company linkedin
+    socialfetch tg channel telegram --media video --limit 10
+    socialfetch tg search telegram "pricing"
+    socialfetch tg download https://t.me/telegram/441 -o ./dl
+    socialfetch hn search "claude code" --limit 3
+    socialfetch yt download <url> --mp3 -o ./music
+
+OUTPUT
+    --json   uniform envelope: {"provider","ok","data","error"} (flags work anywhere)
+             exit code 0 = ok, 1 = error, 2 = bad usage.
+
+PROVIDERS
+    x  X/Twitter   ig  Instagram   yt  YouTube    tg  Telegram
+    reddit         bsky Bluesky    masto Mastodon lemmy
+    hn HackerNews  tiktok TikTok   vimeo Vimeo    feed  RSS/Atom
+    fb Facebook (public posts & videos by URL, oEmbed)
+    li LinkedIn (public profile/company/post metadata)
+"""
+
+import argparse
+import html as htmlmod
+import json
+import os
+import re
+import shutil
+import subprocess
+import sys
+import time
+import urllib.parse
+import urllib.request
+import xml.etree.ElementTree as ET
+
+VERSION = "1.6.0"
+DEFAULT_UA = ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+              "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36")
+IG_APP_ID = "936619743392459"  # Instagram web app id, required for anonymous reads
+
+
+class ToolError(Exception):
+    """Provider-level error; message shown to the user, exit code 1."""
+
+
+# ----------------------------------------------------------------------------
+# HTTP helpers
+# ----------------------------------------------------------------------------
+
+def _request(url, timeout=20, ua=DEFAULT_UA, extra_headers=None):
+    req = urllib.request.Request(url)
+    req.add_header("User-Agent", ua)
+    req.add_header("Accept", "application/json, text/plain, */*")
+    for k, v in (extra_headers or {}).items():
+        req.add_header(k, v)
+    try:
+        with urllib.request.urlopen(req, timeout=timeout) as r:
+            return r.status, r.read().decode("utf-8", "replace")
+    except urllib.error.HTTPError as e:
+        return e.code, e.read().decode("utf-8", "replace")
+    except Exception as e:  # noqa: BLE001
+        return None, str(getattr(e, "reason", e))
+
+
+def _is_html(body):
+    if not body:
+        return False
+    b = body[:600].lstrip().lower()
+    return b.startswith(("<!doctype html", "<html", "<body", "<head"))
+
+
+def _get_json(url, args, extra_headers=None):
+    status, body = _request(url, args.timeout, args.ua, extra_headers)
+    if status is None:
+        raise ToolError(f"network error: {body}")
+    if status == 429:
+        raise ToolError("rate limited (HTTP 429) — wait and retry")
+    if _is_html(body):
+        raise ToolError(
+            f"request blocked (HTTP {status}). Datacenter/cloud IPs are often blocked; "
+            f"the same request usually works from a home IP or proxy.")
+    try:
+        return json.loads(body)
+    except json.JSONDecodeError:
+        raise ToolError(f"non-JSON response (HTTP {status})")
+
+
+# ----------------------------------------------------------------------------
+# Formatting helpers
+# ----------------------------------------------------------------------------
+
+def _friendly(n):
+    if n is None:
+        return "?"
+    try:
+        n = int(n)
+    except (TypeError, ValueError):
+        return str(n)
+    if n >= 1_000_000:
+        return f"{n/1_000_000:.1f}M"
+    if n >= 1_000:
+        return f"{n/1_000:.1f}K"
+    return str(n)
+
+
+def _parse_count(s):
+    """'9.69M' -> 9690000, '1.35K' -> 1350, '123' -> 123."""
+    if not s:
+        return None
+    m = re.match(r"^([\d.]+)\s*([KMBkmb])?$", s.strip().replace(",", ""))
+    if not m:
+        return None
+    mult = {"": 1, "K": 1_000, "M": 1_000_000, "B": 1_000_000_000}
+    return int(float(m.group(1)) * mult[(m.group(2) or "").upper()])
+
+
+def _fmt_dur(sec):
+    if sec is None:
+        return "?"
+    sec = int(sec)
+    h, rem = divmod(sec, 3600)
+    m, s = divmod(rem, 60)
+    return f"{h}:{m:02d}:{s:02d}" if h else f"{m}:{s:02d}"
+
+
+def _strip_html(s):
+    return htmlmod.unescape(re.sub(r"<[^>]+>", "", s or "")) if s else ""
+
+
+# ----------------------------------------------------------------------------
+# Output
+# ----------------------------------------------------------------------------
+
+def _emit(args, provider, data=None, error=None):
+    """Uniform output: JSON envelope for agents, compact text for humans."""
+    if args.json:
+        print(json.dumps({"provider": provider, "ok": error is None,
+                          "data": data, "error": error},
+                         indent=2, ensure_ascii=False))
+        return 0 if error is None else 1
+    if error:
+        print(f"error: {error}", file=sys.stderr)
+        return 1
+    _render(provider, data)
+    return 0
+
+
+def _render(provider, d):
+    if provider == "reddit" and "post" in (d or {}):
+        return _render_reddit_post(d)
+    if provider == "tg" and "message" in (d or {}):
+        return _render_tg_message(d["message"])
+    if provider == "status":
+        for r in d.get("providers", []):
+            print(f"[{'OK ' if r['ok'] else 'FAIL'}] {r['provider']:<10} http={r['http']}")
+        return
+    if provider == "manifest":
+        print(f"socialfetch {d['version']} — {d['usage']}")
+        for p in d["providers"]:
+            print(f"\n{p['name']}  —  {p['description']}")
+            for a in p["actions"]:
+                print(f"    socialfetch {p['name']} {a}")
+        return
+    if provider == "setup":
+        for line in d["done"]:
+            print(line)
+        return
+    renderers = {
+        "x": _render_x, "reddit": _render_list, "bsky": _render_bsky,
+        "masto": _render_masto, "lemmy": _render_lemmy, "hn": _render_hn,
+        "ig": _render_ig, "yt": _render_yt, "tg": _render_tg, "li": _render_li,
+        "tiktok": _render_embed, "vimeo": _render_embed, "feed": _render_list,
+    }
+    renderers.get(provider, _render_generic)(d)
+
+
+def _render_tg_message(m):
+    print(f"[{m['id']}] @{m['channel']} · {m.get('date','')}")
+    if m.get("author"):
+        print("author:", m["author"])
+    print(m.get("text") or "(no text)")
+    if m.get("views") is not None:
+        print(f"views: {_friendly(m['views'])}")
+    if m.get("file"):
+        print(f"file: {m['file'].get('name')} ({m['file'].get('size') or '?'})")
+    if m.get("media"):
+        print(f"media[{m.get('media_type')}]:")
+        for u in m["media"]:
+            print("  ", _short(u))
+    print(m.get("url"))
+
+
+def _render_generic(d):
+    print(json.dumps(d, indent=2, ensure_ascii=False))
+
+
+def _short(url, n=70):
+    """Truncate long media URLs for human output (JSON keeps the full value)."""
+    if url and len(url) > n:
+        return url[:n] + "…"
+    return url
+
+
+def _render_x(d):
+    if "text" in d:  # post
+        print(f"@{d.get('handle')} ({d.get('author')}) · {d.get('created_at','')}")
+        print(_strip_html(d.get("text")))
+        m = d.get("metrics") or {}
+        print(f"♥{_friendly(m.get('likes'))} ↻{_friendly(m.get('retweets'))} "
+              f"💬{_friendly(m.get('replies'))} ◉{_friendly(m.get('views'))}")
+        for u in d.get("media") or []:
+            print("media:", _short(u))
+        print(d.get("url"))
+    else:  # profile
+        print(f"{d.get('name')} @{d.get('handle')}")
+        print(_strip_html(d.get("description")) or "(no bio)")
+        print(f"followers {_friendly(d.get('followers'))} · following "
+              f"{_friendly(d.get('following'))} · posts {_friendly(d.get('tweets'))}")
+
+
+def _render_list(d):
+    items = d.get("posts") or d.get("hits") or d.get("results") or d.get("entries") or []
+    for it in items:
+        title = _strip_html(it.get("title") or it.get("text") or it.get("name"))
+        author = it.get("author") or it.get("channel") or it.get("uploader") or ""
+        url = it.get("url") or it.get("webpage_url") or it.get("permalink") or it.get("link")
+        if not url and it.get("id"):
+            url = f"https://youtu.be/{it['id']}"
+        meta = []
+        for k, label in (("score", "♥"), ("points", "♥"), ("num_comments", "💬"),
+                         ("view_count", "views "), ("likes", "♥")):
+            if it.get(k) is not None:
+                meta.append(f"{label}{_friendly(it[k])}")
+        if it.get("duration") is not None:
+            meta.append(_fmt_dur(it.get("duration")))
+        print(f"▸ {title}")
+        tail = " · ".join([x for x in [author, " ".join(meta), url] if x])
+        if tail:
+            print(f"  {tail}")
+        print()
+
+
+def _render_bsky(d):
+    if "handle" in d:  # profile
+        print(f"{d.get('displayName')} @{d.get('handle')}")
+        print(d.get("description") or "(no bio)")
+        print(f"followers {_friendly(d.get('followers'))} · "
+              f"posts {_friendly(d.get('posts'))}")
+        return
+    for p in d.get("posts") or []:
+        a = p.get("author", {})
+        rec = p.get("record", {})
+        print(f"@{a.get('handle')} ({a.get('displayName')}) · {rec.get('createdAt','')}")
+        print("  " + (rec.get("text") or "").replace("\n", "\n  "))
+        print(f"  ♥{_friendly(p.get('likeCount'))} 💬{_friendly(p.get('replyCount'))} "
+              f"↻{_friendly(p.get('repostCount'))}")
+        print()
+
+
+def _render_masto(d):
+    acc = d.get("account")
+    if acc:
+        print(f"{acc.get('display_name')} @{acc.get('acct')}")
+        print(f"followers {_friendly(acc.get('followers_count'))} · "
+              f"posts {_friendly(acc.get('statuses_count'))}")
+        for s in d.get("statuses") or []:
+            txt = _strip_html(s.get("content"))
+            if not txt:
+                continue
+            print(f"· {txt[:400]}")
+            print(f"  ♥{_friendly(s.get('favourites_count'))} "
+                  f"↻{_friendly(s.get('reblogs_count'))} · {s.get('url')}")
+    else:  # search
+        for a in d.get("accounts") or []:
+            print(f"@{a.get('acct')} — {a.get('display_name')} "
+                  f"(followers {_friendly(a.get('followers_count'))})")
+        for t in d.get("hashtags") or []:
+            print("#" + t.get("name"))
+
+
+def _render_lemmy(d):
+    for p in d.get("posts") or []:
+        com = p.get("community", {})
+        c = p.get("counts", {})
+        print(f"[{com.get('name')}] {p.get('name')}")
+        print(f"  ♥{_friendly(c.get('score'))} 💬{_friendly(c.get('comments'))} "
+              f"{p.get('url') or ''}")
+    cv = d.get("community_view")
+    if cv:
+        com = cv.get("community", {})
+        print(f"!{com.get('name')}")
+        print(_strip_html(com.get("description"))[:400])
+
+
+def _render_hn(d):
+    if d.get("user"):
+        u = d["user"]
+        print(f"user: {u.get('username')} · karma {_friendly(u.get('karma'))}")
+        print(_strip_html(u.get("about"))[:400])
+        return
+    for h in d.get("hits") or []:
+        title = _strip_html(h.get("title") or h.get("story_title"))
+        url = h.get("url") or f"https://news.ycombinator.com/item?id={h.get('objectID')}"
+        print(f"▸ {title}")
+        print(f"  by {h.get('author')} · ♥{_friendly(h.get('points'))} "
+              f"💬{_friendly(h.get('num_comments'))} · {url}")
+
+
+def _render_ig(d):
+    if "recent" in d:  # profile
+        print(f"{d.get('full_name') or d.get('username')} @{d.get('username')}"
+              + (" ✓" if d.get("verified") else ""))
+        print(_strip_html(d.get("biography")) or "(no bio)")
+        print(f"followers {_friendly(d.get('followers'))} · posts {_friendly(d.get('posts'))}")
+        for p in d.get("recent") or []:
+            print(f"📷 {p['shortcode']} ♥{_friendly(p.get('likes'))} "
+                  f"💬{_friendly(p.get('comments'))} · {p.get('url')}")
+            if p.get("caption"):
+                print("   " + _strip_html(p["caption"])[:300].replace("\n", "\n   "))
+    else:  # single post
+        print(f"@{d.get('author')} ♥{_friendly(d.get('likes'))} 💬{_friendly(d.get('comments'))}")
+        print(_strip_html(d.get("caption")) or "(no caption)")
+        for u in d.get("media") or []:
+            print("media:", _short(u))
+        print(d.get("url"))
+
+
+def _render_yt(d):
+    if "entries" in d:  # playlist
+        print(f"playlist: {d.get('title') or d.get('id')} ({len(d.get('entries') or [])} items)")
+        for e in d.get("entries") or []:
+            print(f"  [{e.get('id')}] {e.get('title')} ({_fmt_dur(e.get('duration'))})")
+        return
+    if "downloaded" in d:
+        for f in d["downloaded"]:
+            print("saved:", f)
+        return
+    if "results" in d:
+        _render_list(d)
+        return
+    print(f"▸ {d.get('title')}")
+    print(f"  {d.get('channel') or d.get('uploader')} · {_fmt_dur(d.get('duration'))} · "
+          f"views {_friendly(d.get('view_count'))} · {d.get('upload_date')}")
+    print(f"  {d.get('webpage_url')}")
+
+
+def _render_tg(d):
+    if "downloaded" in d:
+        ok = [x for x in d["downloaded"] if isinstance(x, str)]
+        print(f"downloaded {len(ok)} file(s) -> {d.get('dir')}")
+        for x in d["downloaded"]:
+            if isinstance(x, str):
+                print("  ", x)
+            else:
+                print("  error:", (x.get("url") or "")[:50], "-", x.get("error"))
+        if d.get("skipped_files_no_direct_url"):
+            print(f"skipped {d['skipped_files_no_direct_url']} document(s) — "
+                  "files expose no direct URL on the public preview")
+        return
+    if "message" in d:
+        _render_tg_message(d["message"])
+        return
+    if "channel" not in d:
+        _render_generic(d)
+        return
+    ch = d.get("channel") or {}
+    print(f"{ch.get('title') or ''} @{ch.get('username') or d.get('channel')}"
+          + (" ✔" if ch.get("verified") else ""))
+    if ch.get("subscribers_raw"):
+        print(f"subscribers: {ch['subscribers_raw']}")
+    if ch.get("description"):
+        print(_strip_html(ch["description"])[:300])
+    for m in d.get("messages") or []:
+        head = f"[{m['id']}]"
+        if m.get("date"):
+            head += f" {m['date'][:16].replace('T', ' ')}"
+        if m.get("views") is not None:
+            head += f" · {_friendly(m['views'])} views"
+        print(head)
+        if m.get("text"):
+            print("  " + m["text"].replace("\n", "\n  ")[:400])
+        if m.get("file"):
+            print(f"  file: {m['file'].get('name')} ({m['file'].get('size') or '?'})")
+        if m.get("media"):
+            print(f"  media[{m.get('media_type')}]: " + " ".join(_short(x) for x in m["media"][:3]))
+    if d.get("filtered"):
+        print(f"filtered: {d.get('matched', 0)} matched / {d.get('scanned', 0)} scanned")
+    if d.get("next_cursor"):
+        print(f"older: socialfetch tg channel {d['channel'].get('username')} "
+              f"--before {d['next_cursor']}")
+
+
+def _render_embed(d):
+    print(f"▸ {d.get('title')}")
+    print(f"  {d.get('author')} ({d.get('author_url')})")
+    if d.get("duration_s") is not None:
+        print(f"  {_fmt_dur(d['duration_s'])} · {d.get('upload_date')}")
+    print(f"  {d.get('url')}")
+
+
+def _render_li(d):
+    if "followers" in d or "founded" in d:  # company
+        print(f"{d.get('name') or d.get('handle')} · {d.get('url')}")
+        if d.get("followers") is not None:
+            print(f"  followers: {_friendly(d['followers'])}")
+        if d.get("founded"):
+            print(f"  founded: {d['founded']}")
+        if d.get("about"):
+            print("  " + _strip_html(d["about"])[:300])
+        return
+    if "headline" in d:  # profile
+        print(f"{d.get('name') or d.get('handle')} · {d.get('url')}")
+        if d.get("headline"):
+            print(f"  headline: {d['headline']}")
+        if d.get("about"):
+            print("  " + _strip_html(d["about"])[:300])
+        if d.get("experience"):
+            print(f"  experience: {d['experience']}")
+        if d.get("education"):
+            print(f"  education: {d['education']}")
+        if d.get("location"):
+            print(f"  location: {d['location']}")
+        if d.get("connections") is not None:
+            print(f"  connections: {_friendly(d['connections'])}")
+        return
+    _render_generic(d)
+
+
+# ----------------------------------------------------------------------------
+# X / Twitter — FixTweet + vxTwitter (open source, no auth)
+# ----------------------------------------------------------------------------
+
+def _extract_tweet_id(s):
+    m = re.search(r"/status/(\d+)", s.strip())
+    if m:
+        return m.group(1)
+    return s.strip() if s.strip().isdigit() else None
+
+
+def x_post(args):
+    tid = _extract_tweet_id(args.target)
+    if not tid:
+        raise ToolError("pass a tweet id or URL like https://x.com/user/status/123")
+    try:
+        t = _get_json(f"https://api.fxtwitter.com/status/{tid}", args)["tweet"]
+        return {
+            "id": t.get("id"), "url": t.get("url"), "author": t.get("author", {}).get("name"),
+            "handle": t.get("author", {}).get("screen_name"), "text": t.get("text"),
+            "created_at": t.get("created_at"),
+            "metrics": {"likes": t.get("likes"), "retweets": t.get("retweets"),
+                        "replies": t.get("replies"), "views": t.get("views")},
+            "media": [m.get("url") for m in (t.get("media", {}).get("all") or []) if m.get("url")],
+            "hashtags": t.get("hashtags") or [],
+        }
+    except ToolError:
+        d = _get_json(f"https://api.vxtwitter.com/Twitter/status/{tid}", args)
+        if "text" not in d:
+            raise ToolError(f"tweet {tid} not found")
+        return {
+            "id": d.get("tweetID"), "url": d.get("tweetURL"), "author": d.get("user_name"),
+            "handle": d.get("user_name"), "text": d.get("text"), "created_at": d.get("date"),
+            "metrics": {"likes": d.get("likes"), "retweets": d.get("retweets"),
+                        "replies": d.get("replies")},
+            "media": d.get("mediaURLs") or [],
+        }
+
+
+def x_user(args):
+    handle = args.target.lstrip("@")
+    try:
+        u = _get_json(f"https://api.fxtwitter.com/{handle}", args)["user"]
+        return {
+            "name": u.get("name"), "handle": u.get("screen_name"),
+            "description": u.get("description"), "followers": u.get("followers"),
+            "following": u.get("following"), "tweets": u.get("tweets"),
+            "likes": u.get("likes"), "avatar": u.get("avatar_url"),
+            "verified": (u.get("verification") or {}).get("verified"),
+            "protected": u.get("protected"), "joined": u.get("joined"),
+        }
+    except (ToolError, KeyError):
+        d = _get_json(f"https://api.vxtwitter.com/{handle}", args)
+        if "screen_name" not in d:
+            raise ToolError(f"user {handle} not found")
+        return {
+            "name": d.get("name"), "handle": d.get("screen_name"),
+            "description": d.get("description"), "followers": d.get("followers_count"),
+            "following": d.get("following_count"), "tweets": d.get("tweet_count"),
+            "avatar": d.get("profile_image_url"), "protected": d.get("protected"),
+        }
+
+
+# ----------------------------------------------------------------------------
+# Reddit — public .json endpoints (no auth; datacenter IPs may be blocked)
+# ----------------------------------------------------------------------------
+
+def _reddit(path, args):
+    try:
+        return _get_json(f"https://www.reddit.com{path}", args)
+    except ToolError as e:
+        raise ToolError(f"{e} — Reddit blocks datacenter IPs; try a home connection or proxy")
+
+
+def reddit(args):
+    limit = args.limit + 2
+    if args.action == "sub":
+        data = _reddit(f"/r/{args.target}/{args.sort}.json?limit={limit}", args)
+        posts = [c["data"] for c in data["data"]["children"][:args.limit]]
+        return {"posts": posts}
+    if args.action == "user":
+        data = _reddit(f"/user/{args.target}/submitted.json?limit={limit}", args)
+        return {"posts": [c["data"] for c in data["data"]["children"][:args.limit]]}
+    if args.action == "search":
+        q = urllib.parse.quote(args.query)
+        data = _reddit(f"/search.json?q={q}&limit={limit}&sort=new", args)
+        return {"posts": [c["data"] for c in data["data"]["children"][:args.limit]]}
+    # post + comments
+    data = _reddit(f"/comments/{args.target}.json?limit=10", args)
+    try:
+        return {"post": data[0]["data"]["children"][0]["data"],
+                "comments": [c["data"] for c in data[1]["data"]["children"][:args.limit]]}
+    except (IndexError, KeyError):
+        raise ToolError("could not parse post")
+
+
+def _render_reddit_post(d):
+    p = d["post"]
+    print(f"[{p.get('subreddit')}] {_strip_html(p.get('title'))}")
+    print(f"u/{p.get('author')} ♥{_friendly(p.get('score'))} 💬{_friendly(p.get('num_comments'))}")
+    print(_strip_html(p.get("selftext"))[:2000] or "(link post)")
+
+
+# ----------------------------------------------------------------------------
+# Bluesky — public AT Proto API (no auth)
+# ----------------------------------------------------------------------------
+
+def bsky(args):
+    base = "https://public.api.bsky.app/xrpc"
+    if args.action == "user":
+        q = urllib.parse.quote(args.target)
+        d = _get_json(f"{base}/app.bsky.actor.getProfile?actor={q}", args)
+        return {"handle": d.get("handle"), "did": d.get("did"),
+                "displayName": d.get("displayName"), "description": d.get("description"),
+                "followers": d.get("followersCount"), "following": d.get("followsCount"),
+                "posts": d.get("postsCount"), "avatar": d.get("avatar")}
+    q = urllib.parse.quote(args.query)
+    d = _get_json(f"{base}/app.bsky.feed.searchPosts?q={q}&limit={args.limit}", args)
+    return {"posts": d.get("posts", [])}
+
+
+# ----------------------------------------------------------------------------
+# Mastodon — instance public API (no auth)
+# ----------------------------------------------------------------------------
+
+def _masto_account(inst, target, args):
+    target = target.lstrip("@")
+    if "/@" in target:
+        target = target.split("/@", 1)[1]
+    user, _, domain = target.partition("@")
+    if domain:
+        inst = f"https://{domain}"
+    acct = urllib.parse.quote(user)
+    try:
+        d = _get_json(f"{inst}/api/v1/accounts/lookup?acct={acct}", args)
+        if d.get("id"):
+            return inst, d
+    except ToolError:
+        pass
+    d = _get_json(f"{inst}/api/v2/search?q={acct}&type=accounts&limit=1", args)
+    if not d.get("accounts"):
+        raise ToolError(f"account not found on {inst}")
+    return inst, d["accounts"][0]
+
+
+def masto(args):
+    inst = args.instance.rstrip("/")
+    if args.action == "search":
+        q = urllib.parse.quote(args.query)
+        return _get_json(f"{inst}/api/v2/search?q={q}&limit={args.limit}", args)
+    inst, acc = _masto_account(inst, args.target, args)
+    statuses = []
+    try:
+        statuses = _get_json(f"{inst}/api/v1/accounts/{acc['id']}/statuses?limit={args.limit}", args)
+    except ToolError:
+        pass
+    return {"instance": inst, "account": acc, "statuses": statuses}
+
+
+# ----------------------------------------------------------------------------
+# Lemmy — instance public API (no auth)
+# ----------------------------------------------------------------------------
+
+def lemmy(args):
+    inst = args.instance.rstrip("/")
+    if args.action == "search":
+        q = urllib.parse.quote(args.query)
+        d = _get_json(f"{inst}/api/v3/search?q={q}&type_={args.type_}&limit={args.limit}", args)
+        posts = []
+        for p in d.get("posts", []):
+            post = p.get("post") or {}
+            posts.append({"name": post.get("name"), "url": post.get("url"),
+                          "community": p.get("community"), "counts": p.get("counts")})
+        return {"posts": posts}
+    name = args.target.lstrip("!")
+    d = _get_json(f"{inst}/api/v3/community?name={urllib.parse.quote(name)}", args)
+    if not d.get("community_view"):
+        raise ToolError(f"community not found on {inst}")
+    return {"community_view": d["community_view"]}
+
+
+# ----------------------------------------------------------------------------
+# Hacker News — Algolia (free)
+# ----------------------------------------------------------------------------
+
+def hn(args):
+    if args.action == "user":
+        d = _get_json(f"https://hn.algolia.com/api/v1/users/{urllib.parse.quote(args.target)}", args)
+        return {"user": d}
+    if args.action == "front":
+        d = _get_json(f"https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage={args.limit}", args)
+    else:
+        q = urllib.parse.quote(args.query)
+        tags = f"&tags={urllib.parse.quote(args.tags)}" if args.tags else ""
+        d = _get_json(f"https://hn.algolia.com/api/v1/search?query={q}&hitsPerPage={args.limit}{tags}", args)
+    return {"hits": d.get("hits", [])}
+
+
+# ----------------------------------------------------------------------------
+# Instagram — anonymous mobile-feed + web_profile_info endpoints (no auth)
+# ----------------------------------------------------------------------------
+
+def _ig_get(url, args):
+    return _get_json(url, args, {"x-ig-app-id": IG_APP_ID})
+
+
+def _ig_urls(item):
+    urls, kind = [], "image"
+    if item.get("video_versions"):
+        kind, urls = "video", [v.get("url") for v in item["video_versions"] if v.get("url")]
+    if item.get("carousel_media"):
+        kind = "carousel"
+        urls = []
+        for m in item["carousel_media"]:
+            u = (m.get("video_versions") or [{}])[0].get("url") or \
+                ((m.get("image_versions2") or {}).get("candidates") or [{}])[0].get("url") or \
+                m.get("display_uri")
+            if u:
+                urls.append(u)
+    if not urls:
+        cand = (item.get("image_versions2") or {}).get("candidates") or []
+        urls = [cand[0].get("url")] if cand else [item.get("display_uri")]
+    return kind, [u for u in urls if u]
+
+
+def _ig_item(it):
+    kind, urls = _ig_urls(it)
+    cap = it.get("caption") or {}
+    return {
+        "id": it.get("pk"), "shortcode": it.get("code"),
+        "url": f"https://www.instagram.com/p/{it.get('code')}/" if it.get("code") else None,
+        "type": kind, "caption": cap.get("text"), "taken_at": it.get("taken_at"),
+        "likes": it.get("like_count"), "comments": it.get("comment_count"), "media": urls,
+    }
+
+
+def _ig_feed(user, args, max_id=None):
+    qs = {"count": "12"}
+    if max_id:
+        qs["max_id"] = max_id
+    url = f"https://www.instagram.com/api/v1/feed/user/{user}/username/?" + urllib.parse.urlencode(qs)
+    return _ig_get(url, args)
+
+
+def ig_user(args):
+    handle = args.target.lstrip("@")
+    out = {"username": handle, "recent": []}
+    try:
+        u = _ig_get(
+            f"https://www.instagram.com/api/v1/users/web_profile_info/?username={urllib.parse.quote(handle)}",
+            args)["data"]["user"]
+        out.update({
+            "username": u.get("username"), "full_name": u.get("full_name"),
+            "biography": u.get("biography"),
+            "followers": (u.get("edge_followed_by") or {}).get("count"),
+            "following": (u.get("edge_follow") or {}).get("count"),
+            "posts": (u.get("edge_owner_to_timeline_media") or {}).get("count"),
+            "avatar": u.get("profile_pic_url_hd"), "verified": u.get("is_verified"),
+            "private": u.get("is_private"),
+        })
+    except ToolError:
+        pass  # profile endpoint throttled; posts feed below still works
+    try:
+        fd = _ig_feed(handle, args)
+        out["recent"] = [_ig_item(i) for i in (fd.get("items") or [])][:args.limit]
+    except ToolError:
+        pass
+    if not out.get("full_name") and not out["recent"]:
+        raise ToolError(f"could not load @{handle} (rate-limited, private, or blocked)")
+    return out
+
+
+def ig_post(args):
+    m = re.search(r"instagram\.com/([^/?#]+)/(?:p|reel|tv)/([A-Za-z0-9_-]+)", args.target.strip())
+    if not m:
+        raise ToolError("pass the full post URL: https://www.instagram.com/<user>/p/<code>/")
+    user, code = m.group(1), m.group(2)
+    max_id = None
+    for _ in range(5):
+        fd = _ig_feed(user, args, max_id)
+        for it in fd.get("items") or []:
+            if it.get("code") == code:
+                d = _ig_item(it)
+                d["author"] = user
+                return d
+        max_id = fd.get("next_max_id")
+        if not fd.get("more_available") or not max_id:
+            break
+    raise ToolError("post not in the recent feed (older posts may need login)")
+
+
+# ----------------------------------------------------------------------------
+# YouTube — yt-dlp
+# ----------------------------------------------------------------------------
+
+def _ytdlp():
+    return shutil.which("yt-dlp") or shutil.which("ytdlp")
+
+
+def _need_ytdlp():
+    if not _ytdlp():
+        raise ToolError("yt-dlp not found — run `socialfetch setup` (or pip install yt-dlp)")
+
+
+def _run_ytdlp(cmd):
+    return subprocess.run(cmd, capture_output=True, text=True)
+
+
+def yt_info(args):
+    _need_ytdlp()
+    url = args.target
+    if re.search(r"youtube\.com/(@[\w.-]+|channel/[\w-]+|c/[\w-]+)/?$", url):
+        url = url.rstrip("/") + "/videos"
+    if "list=" in url or "/playlist" in url or "/videos" in url:
+        cmd = [_ytdlp(), "--flat-playlist", "--dump-single-json", "--skip-download", "--no-warnings", url]
+    else:
+        cmd = [_ytdlp(), "--dump-single-json", "--skip-download", "--no-warnings", "--no-playlist", url]
+    proc = _run_ytdlp(cmd)
+    if proc.returncode != 0:
+        raise ToolError((proc.stderr or "").strip().splitlines()[-1][:300])
+    return json.loads(proc.stdout)
+
+
+def yt_search(args):
+    _need_ytdlp()
+    proc = _run_ytdlp([_ytdlp(), "--dump-json", "--skip-download", "--no-warnings",
+                       f"ytsearch{args.limit}:{args.query}"])
+    results = [json.loads(l) for l in proc.stdout.splitlines()
+               if l.strip().startswith("{")]
+    return {"results": results}
+
+
+def yt_download(args):
+    _need_ytdlp()
+    outdir = args.out or "."
+    os.makedirs(outdir, exist_ok=True)
+    tmpl = os.path.join(outdir, "%(title).180B [%(id)s].%(ext)s")
+    cmd = [_ytdlp(), "--newline", "--no-warnings", "--print", "after_move:filepath", "-o", tmpl]
+    if args.audio:
+        cmd += ["-f", "bestaudio[ext=m4a]/bestaudio"]
+    elif args.mp3:
+        cmd += ["-x", "--audio-format", "mp3", "--audio-quality", "0"]
+    elif args.format:
+        cmd += ["-f", args.format]
+    else:
+        cmd += ["-f", "bestvideo*+bestaudio/best"]
+    if args.subs:
+        cmd += ["--write-subs", "--write-auto-subs", "--sub-langs", "all,-live_chat"]
+    if not args.playlist:
+        cmd += ["--no-playlist"]
+    if args.items:
+        cmd += ["--playlist-items", args.items]
+    cmd += [args.target]
+    proc = _run_ytdlp(cmd)
+    if proc.returncode != 0:
+        raise ToolError((proc.stderr or "").strip().splitlines()[-1][:300])
+    files = [l.strip() for l in proc.stdout.splitlines() if l.strip() and not l.startswith("[")]
+    return {"downloaded": files}
+
+
+# ----------------------------------------------------------------------------
+# Telegram — public web preview t.me/s/<channel> (no login)
+# ----------------------------------------------------------------------------
+
+TG_BASE = "https://t.me"
+
+
+def _tg_parts(target):
+    t = target.strip()
+    t = re.sub(r"^https?://(www\.)?", "", t)
+    t = re.sub(r"^(t\.me|telegram\.me)/", "", t)
+    t = t.lstrip("@").split("?")[0].split("#")[0].rstrip("/")
+    if t.startswith("s/"):
+        t = t[2:]
+    channel, _, post = t.partition("/")
+    return channel or None, post or None
+
+
+def _tg_fetch(url, args):
+    status, body = _request(url, args.timeout, args.ua)
+    if status in (301, 302):
+        raise ToolError("no public preview (HTTP 302). Public GROUPS need a logged-in "
+                        "client (Telethon); only public CHANNELS work without login.")
+    if status != 200:
+        raise ToolError(f"could not fetch {url} (HTTP {status})")
+    if not re.search(r"tgme_(widget_message|header|page)", body):
+        raise ToolError("unexpected response from Telegram (challenge/error page)")
+    return body
+
+
+def _tg_meta(html):
+    meta = {}
+    m = re.search(r'tgme_header_title"><span dir="auto">([^<]*)</span>', html)
+    if m:
+        meta["title"] = htmlmod.unescape(m.group(1))
+    m = re.search(r'tgme_header_counter">([^<]*)<', html)
+    if m:
+        meta["subscribers_raw"] = htmlmod.unescape(m.group(1)).strip()
+        meta["subscribers"] = _parse_count(meta["subscribers_raw"])
+    m = re.search(r'tgme_header_description[^>]*>(.*?)</div>', html, re.S)
+    if m:
+        meta["description"] = _tg_plain(m.group(1)).strip() or None
+    meta["verified"] = "verified-icon" in html
+    return meta
+
+
+def _tg_plain(html):
+    txt = re.sub(r"<br\s*/?>", "\n", html or "")
+    txt = re.sub(r"</p>", "\n", txt)
+    return htmlmod.unescape(re.sub(r"<[^>]+>", "", txt)).strip()
+
+
+def _tg_block(block):
+    m = re.search(r'data-post="([^"]+)"', block)
+    if not m:
+        return None
+    channel, _, pid = m.group(1).partition("/")
+    msg = {"id": int(pid), "channel": channel, "url": f"https://t.me/{channel}/{pid}"}
+    m = re.search(r'class="tgme_widget_message_text[^"]*"[^>]*>(.*?)</div>', block, re.S)
+    if m:
+        raw = m.group(1)
+        msg["text"] = _tg_plain(raw)
+        msg["links"] = [l for l in re.findall(r'href="([^"]+)"', raw)
+                        if l and not l.startswith("?") and l != "#"]
+    m = re.search(r'tgme_widget_message_views">([^<]*)<', block)
+    if m:
+        msg["views"] = _parse_count(m.group(1))
+    m = re.search(r'<time datetime="([^"]+)"', block)
+    if m:
+        msg["date"] = m.group(1)
+    media = []
+    if "tgme_widget_message_video_player" in block:
+        msg["media_type"] = "video"
+        m = re.search(r'tgme_widget_message_video_thumb[^>]*background-image:url\(([^)]+)\)', block)
+        if m:
+            media.append(m.group(1).strip("'\" "))
+        for src in re.findall(r'<video[^>]+src="([^"]+)"', block):
+            if src not in media:
+                media.append(src)
+    if "tgme_widget_message_roundvideo" in block:
+        msg["media_type"] = msg.get("media_type", "round")
+        for src in re.findall(r'<video[^>]+src="([^"]+)"', block):
+            if src not in media:
+                media.append(src)
+    if "tgme_widget_message_photo_wrap" in block:
+        msg["media_type"] = msg.get("media_type", "photo")
+        for m in re.finditer(r'tgme_widget_message_photo_wrap[^>]*background-image:url\(([^)]+)\)', block):
+            u = m.group(1).strip("'\" ")
+            if u not in media:
+                media.append(u)
+    if "tgme_widget_message_sticker" in block:
+        msg["media_type"] = msg.get("media_type", "sticker")
+        m = re.search(r'tgme_widget_message_sticker[^>]*data-webp="([^"]+)"', block) or \
+            re.search(r'tgme_widget_message_sticker[^>]*style="[^"]*url\(([^)]+)\)', block)
+        if m:
+            media.append(m.group(1).strip("'\" "))
+    if re.search(r'class="[^"]*tgme_widget_message_document(?: |")', block):
+        msg["media_type"] = msg.get("media_type", "file")
+        m = re.search(r'tgme_widget_message_document_title[^>]*>([^<]*)<', block)
+        fname = htmlmod.unescape(m.group(1)).strip() if m else None
+        m = re.search(r'tgme_widget_message_document_extra[^>]*>([^<]*)<', block)
+        fsize = htmlmod.unescape(m.group(1)).strip() if m else None
+        msg["file"] = {"name": fname, "size": fsize}
+    if "<audio" in block and "media_type" not in msg:
+        msg["media_type"] = "audio"
+        for src in re.findall(r'<audio[^>]+src="([^"]+)"', block):
+            media.append(src)
+    if "tgme_widget_message_poll" in block and "media_type" not in msg:
+        msg["media_type"] = "poll"
+    if "tgme_widget_message_location_wrap" in block and "media_type" not in msg:
+        msg["media_type"] = "location"
+    for bg in re.findall(r"background-image:url\(([^)]+)\)", block):
+        bg = bg.strip("'\" ")
+        if bg not in media:
+            media.append(bg)
+    if media:
+        msg["media"] = media
+    if "media_type" not in msg:
+        wrap = re.search(r'class="tgme_widget_message ([^"]*?)"', block)
+        cls = wrap.group(1) if wrap else ""
+        msg["media_type"] = "unsupported" if "text_not_supported" in cls else "text"
+    m = re.search(r'tgme_widget_message_link_preview" href="([^"]+)"', block)
+    if m:
+        prev = {"url": m.group(1)}
+        m2 = re.search(r'link_preview_site_name[^>]*>([^<]*)<', block)
+        if m2:
+            prev["site"] = htmlmod.unescape(m2.group(1)).strip()
+        m2 = re.search(r'link_preview_title[^>]*>([^<]*)<', block)
+        if m2:
+            prev["title"] = htmlmod.unescape(m2.group(1)).strip()
+        msg["link_preview"] = prev
+    m = re.search(r'tgme_widget_message_owner_name[^>]*>([^<]*)<', block)
+    if m:
+        msg["author"] = htmlmod.unescape(m.group(1)).strip()
+    return msg
+
+
+def _tg_page(html):
+    msgs, cursor = [], None
+    for block in re.split(r'<div class="tgme_widget_message_wrap js-widget_message_wrap">', html)[1:]:
+        m = _tg_block(block)
+        if m:
+            msgs.append(m)
+    m = re.search(r'data-before="(\d+)"', html)
+    if m:
+        cursor = int(m.group(1))
+    return msgs, cursor
+
+
+TG_MEDIA_ALIASES = {
+    "photo": "photo", "image": "photo", "images": "photo", "pic": "photo", "pics": "photo",
+    "video": "video", "videos": "video", "gif": "video", "gifs": "video",
+    "round": "round", "round_video": "round",
+    "audio": "audio", "voice": "audio", "voice_message": "audio",
+    "sticker": "sticker", "stickers": "sticker",
+    "file": "file", "files": "file", "document": "file", "doc": "file", "docs": "file",
+    "poll": "poll", "polls": "poll",
+    "location": "location", "geo": "location",
+    "link": "link", "links": "link", "preview": "link",
+    "text": "text", "texts": "text", "none": "text",
+    "any": "any", "media": "any", "all": "any", "has_media": "any",
+}
+
+
+def _tg_media_norm(s):
+    key = (s or "").strip().lower().replace("-", "_").replace(" ", "_")
+    norm = TG_MEDIA_ALIASES.get(key)
+    if not norm:
+        raise ToolError(
+            f"unknown --media type '{s}'. Valid: photo, video, round, audio/voice, "
+            "sticker, file/document, poll, location, link, text, any/media")
+    return norm
+
+
+def _tg_match(m, args):
+    """Client-side filter over parsed t.me/s messages (media type, file ext,
+    text query, author). The web preview has no server-side search, so filters
+    run over the paginated messages we already fetched."""
+    if args.query and args.query.lower() not in (m.get("text") or "").lower():
+        return False
+    if args.author and args.author.lower() not in (m.get("author") or "").lower():
+        return False
+    mt = m.get("media_type") or "text"
+    if args.media:
+        want = _tg_media_norm(args.media)
+        if want == "any":
+            if mt == "text":
+                return False
+        elif want == "link":
+            if not m.get("link_preview"):
+                return False
+        elif mt != want:
+            return False
+    if args.has_media and mt == "text":
+        return False
+    if args.ext:
+        fname = ((m.get("file") or {}).get("name") or "").lower()
+        if not fname.endswith("." + args.ext.lower().lstrip(".")):
+            return False
+    return True
+
+
+def tg_channel(args):
+    channel, _ = _tg_parts(args.target)
+    if not channel:
+        raise ToolError("give a channel name, @handle, or t.me link")
+    filtered = bool(args.media or args.has_media or args.ext or args.query or args.author)
+    html = _tg_fetch(f"{TG_BASE}/s/{channel}", args)
+    meta = _tg_meta(html)
+    messages, cursor = _tg_page(html)
+    if getattr(args, "before", None) or getattr(args, "after", None):
+        q = "before" if getattr(args, "before", None) else "after"
+        v = getattr(args, "before", None) or getattr(args, "after", None)
+        html = _tg_fetch(f"{TG_BASE}/s/{channel}?{q}={v}", args)
+        messages, cursor = _tg_page(html)
+    else:
+        cap = args.max
+        if filtered and not cap:
+            cap = max(args.limit * 10, 100)  # scan budget when filtering
+        if cap:
+            while len(messages) < cap and cursor:
+                html = _tg_fetch(f"{TG_BASE}/s/{channel}?before={cursor}", args)
+                page, cursor = _tg_page(html)
+                if not page:
+                    break
+                seen = {x["id"] for x in messages}
+                messages += [x for x in page if x["id"] not in seen]
+                time.sleep(0.4)
+                if filtered and sum(1 for m in messages if _tg_match(m, args)) >= args.limit:
+                    break
+    if not messages and not meta.get("title") and not meta.get("subscribers_raw"):
+        raise ToolError(f"no public message preview for @{channel}. Groups don't expose "
+                        "messages to logged-out visitors; only public channels do.")
+    meta["username"] = channel
+    if filtered:
+        matched = [m for m in messages if _tg_match(m, args)]
+        return {"channel": meta, "messages": matched[:args.limit],
+                "next_cursor": cursor, "filtered": True,
+                "scanned": len(messages), "matched": len(matched)}
+    n = args.max or args.limit
+    return {"channel": meta, "messages": messages[:n], "next_cursor": cursor}
+
+
+def tg_post(args):
+    channel, pid = _tg_parts(args.target)
+    if not channel or not pid:
+        raise ToolError("pass a post link like https://t.me/<channel>/<id>")
+    for path in (f"{TG_BASE}/s/{channel}/{pid}?single", f"{TG_BASE}/{channel}/{pid}?embed=1"):
+        html = _tg_fetch(path, args)
+        for block in re.split(r'<div class="tgme_widget_message_wrap js-widget_message_wrap">', html)[1:]:
+            m = _tg_block(block)
+            if m and m["id"] == int(pid):
+                return {"message": m}
+    raise ToolError("post not found")
+
+
+# ----------------------------------------------------------------------------
+# Telegram — download / search / optional Bot API (token via env)
+# ----------------------------------------------------------------------------
+
+def _download_bytes(url, timeout=60, ua=DEFAULT_UA):
+    req = urllib.request.Request(url, headers={"User-Agent": ua})
+    with urllib.request.urlopen(req, timeout=timeout) as r:
+        return r.read(), r.headers.get("Content-Type", "")
+
+
+def _ext_for(ctype, url):
+    m = re.search(r"\.([a-z0-9]{2,5})(?:[?#]|$)", url.lower())
+    if m:
+        return m.group(1)
+    if "jpeg" in ctype or "jpg" in ctype:
+        return "jpg"
+    if "png" in ctype:
+        return "png"
+    if "webp" in ctype:
+        return "webp"
+    if "mp4" in ctype:
+        return "mp4"
+    if "ogg" in ctype or "opus" in ctype:
+        return "ogg"
+    if "mpeg" in ctype or "mp3" in ctype:
+        return "mp3"
+    return "bin"
+
+
+def tg_search(args):
+    """Search a channel's public preview by text — the preview has no server-side
+    search, so this paginates deeply and matches client-side (see _tg_match)."""
+    if not args.query:
+        raise ToolError("tg search needs a query: `tg search <channel> <text>`")
+    if not getattr(args, "max", None) and not getattr(args, "before", None) \
+            and not getattr(args, "after", None):
+        args.max = 500  # scan further than the default channel view
+    return tg_channel(args)
+
+
+def tg_download(args):
+    """Download the media URLs the preview exposes (photos, videos, round video,
+    audio, stickers). Documents/files expose no direct URL on t.me/s, so they are
+    counted as skipped rather than fetched."""
+    channel, pid = _tg_parts(args.target)
+    if pid:
+        items = [tg_post(args)["message"]]
+    else:
+        if not channel:
+            raise ToolError("give a post link or a channel name to download from")
+        items = tg_channel(args)["messages"]
+    if not items:
+        raise ToolError("no messages to download from")
+    outdir = args.out or "downloads"
+    os.makedirs(outdir, exist_ok=True)
+    saved, skipped_files = [], 0
+    for m in items:
+        if m.get("media_type") == "file" and not m.get("media"):
+            skipped_files += 1
+            continue
+        for i, u in enumerate(m.get("media") or []):
+            try:
+                data, ctype = _download_bytes(u, args.timeout, args.ua)
+                fname = f"{m.get('channel', 'tg')}_{m['id']}_{i}.{_ext_for(ctype, u)}"
+                path = os.path.join(outdir, fname)
+                with open(path, "wb") as fh:
+                    fh.write(data)
+                saved.append(path)
+            except Exception as e:  # noqa: BLE001
+                saved.append({"url": u, "error": str(e)})
+    return {"dir": outdir, "downloaded": saved, "skipped_files_no_direct_url": skipped_files}
+
+
+# --- optional Bot API support (read-only; token stays in your env, never a repo) ---
+
+TG_BOT_API = "https://api.telegram.org/bot"
+
+
+def _tg_bot_token():
+    tok = os.environ.get("SOCIALFETCH_TG_BOT_TOKEN")
+    if not tok:
+        raise ToolError(
+            "set the SOCIALFETCH_TG_BOT_TOKEN env var (a token from @BotFather). "
+            "A bot can fetch public chat metadata and download files it has access "
+            "to — but it CANNOT search Telegram or read channel history: the Bot API "
+            "only sees messages sent directly to the bot.")
+    return tok
+
+
+def _bot_get(args, method, params):
+    tok = _tg_bot_token()
+    qs = urllib.parse.urlencode(params)
+    url = f"{TG_BOT_API}{tok}/{method}"
+    status, body = _request(f"{url}?{qs}" if qs else url, args.timeout, args.ua)
+    if status is None:
+        raise ToolError(f"telegram bot api network error: {body}")
+    if status != 200:
+        raise ToolError(f"telegram bot api (HTTP {status})")
+    try:
+        d = json.loads(body)
+    except json.JSONDecodeError:
+        raise ToolError(f"telegram bot api returned non-JSON (HTTP {status})")
+    if not d.get("ok"):
+        raise ToolError(f"telegram bot api: {d.get('description', 'unknown error')}")
+    return d["result"]
+
+
+def tg_bot_me(args):
+    r = _bot_get(args, "getMe", {})
+    return {"id": r.get("id"), "username": r.get("username"),
+            "name": r.get("first_name"), "is_bot": r.get("is_bot"),
+            "can_join_groups": r.get("can_join_groups")}
+
+
+def tg_bot_chat(args):
+    r = _bot_get(args, "getChat", {"chat_id": args.target})
+    out = {"id": r.get("id"), "type": r.get("type"), "title": r.get("title"),
+           "username": r.get("username"), "description": r.get("description"),
+           "invite_link": r.get("invite_link")}
+    if r.get("type") == "channel":
+        try:
+            out["member_count"] = _bot_get(args, "getChatMemberCount",
+                                           {"chat_id": args.target})
+        except ToolError:
+            pass
+    return out
+
+
+def tg_bot_file(args):
+    r = _bot_get(args, "getFile", {"file_id": args.target})
+    path = r.get("file_path")
+    return {"file_id": r.get("file_id"), "size": r.get("file_size"),
+            "path": path,
+            "url": f"{TG_BOT_API}{_tg_bot_token()}/{path}" if path else None}
+
+
+def tg_bot_photo(args):
+    cid = str(args.target)
+    if cid.lstrip("-").isdigit():
+        user_id = int(cid)
+    else:
+        user_id = _bot_get(args, "getChat", {"chat_id": cid}).get("id")
+    r = _bot_get(args, "getUserProfilePhotos",
+                 {"user_id": user_id, "limit": max(1, min(100, args.limit or 5))})
+    photos = []
+    for ph in (r.get("photos") or [])[:1]:
+        for s in ph:
+            photos.append({"file_id": s.get("file_id"), "width": s.get("width"),
+                           "height": s.get("height")})
+    return {"user_id": user_id, "total_count": r.get("total_count"), "photos": photos}
+
+
+def tg_bot(args):
+    cmd = getattr(args, "botcmd", None)
+    if cmd == "me":
+        return tg_bot_me(args)
+    if cmd == "chat":
+        return tg_bot_chat(args)
+    if cmd == "file":
+        return tg_bot_file(args)
+    if cmd == "photo":
+        return tg_bot_photo(args)
+    raise ToolError("tg bot: use one of `tg bot me | chat <@u> | file <file_id> | photo <@u>`")
+
+
+# ----------------------------------------------------------------------------
+# TikTok / Vimeo — oEmbed
+# ----------------------------------------------------------------------------
+
+def _oembed(endpoint, url, args):
+    return _get_json(endpoint + "?url=" + urllib.parse.quote(url, safe=""), args)
+
+
+def tiktok(args):
+    d = _oembed("https://www.tiktok.com/oembed", args.target, args)
+    return {"title": d.get("title"), "author": d.get("author_name"),
+            "author_url": d.get("author_url"), "url": args.target}
+
+
+def vimeo(args):
+    d = _oembed("https://vimeo.com/api/oembed.json", args.target, args)
+    return {"title": d.get("title"), "author": d.get("author_name"),
+            "author_url": d.get("author_url"), "duration_s": d.get("duration"),
+            "upload_date": d.get("upload_date"), "video_id": d.get("video_id"),
+            "thumbnail": d.get("thumbnail_url"), "url": args.target}
+
+
+def fb_post(args):
+    d = _oembed("https://www.facebook.com/plugins/post/oembed.json/", args.target, args)
+    if d.get("error"):
+        raise ToolError("facebook: " + d["error"].get("message", "unknown error"))
+    return {"title": d.get("title"), "author": d.get("author_name"),
+            "author_url": d.get("author_url"), "provider": d.get("provider_name"),
+            "html": d.get("html"), "url": args.target}
+
+
+def fb_video(args):
+    d = _oembed("https://www.facebook.com/plugins/video/oembed.json/", args.target, args)
+    if d.get("error"):
+        raise ToolError("facebook: " + d["error"].get("message", "unknown error"))
+    return {"title": d.get("title"), "author": d.get("author_name"),
+            "author_url": d.get("author_url"), "width": d.get("width"),
+            "height": d.get("height"), "thumbnail": d.get("thumbnail_url"),
+            "html": d.get("html"), "url": args.target}
+
+
+def fb_page(args):
+    """Best-effort public page/profile read. Meta serves a full page with og: meta
+    to logged-out visitors from residential IPs (this is what link-preview bots and
+    kevinzg/facebook-scraper rely on); datacenter IPs usually get a login page.
+    We scrape only the stable og: metadata — not a full post list."""
+    target = args.target.strip()
+    slug = re.sub(r"^https?://(www\.|m\.|mbasic\.)?facebook\.com/", "", target)
+    slug = slug.rstrip("/").split("?")[0]
+    if not slug or "/" in slug:
+        raise ToolError("fb page wants a page/profile URL, e.g. https://www.facebook.com/nasa")
+    for host in ("https://www.facebook.com/", "https://m.facebook.com/"):
+        status, body = _request(host + slug, args.timeout, args.ua)
+        if status is None:
+            continue
+        low = body[:4000].lower()
+        looks_login = ("login" in low and ("password" in low or "login_form" in low or
+                                           "/login/" in low or "log in" in low))
+        if status in (301, 302, 400) or looks_login:
+            continue
+        if status != 200:
+            continue
+        info = {}
+        m = re.search(r"<title>([^<]*)</title>", body)
+        if m:
+            info["title"] = htmlmod.unescape(m.group(1)).strip()
+        for key, pat in (("description", r'<meta[^>]+property="og:description"[^>]+content="([^"]*)"'),
+                         ("image", r'<meta[^>]+property="og:image"[^>]+content="([^"]*)"'),
+                         ("url", r'<meta[^>]+property="og:url"[^>]+content="([^"]*)"'),
+                         ("type", r'<meta[^>]+property="og:type"[^>]+content="([^"]*)"'),
+                         ("site_name", r'<meta[^>]+property="og:site_name"[^>]+content="([^"]*)"')):
+            m = re.search(pat, body)
+            if m:
+                info[key] = htmlmod.unescape(m.group(1)).strip()
+        if info:
+            info["handle"] = slug
+            return info
+    raise ToolError(
+        "Facebook page is login-walled from this IP (Meta serves a login page to "
+        "most datacenter/cloud IPs). Public page metadata works from some residential "
+        "IPs only. fb post/video (tokenless oEmbed) remain the reliable no-auth paths.")
+
+
+# ----------------------------------------------------------------------------
+# LinkedIn — public og: metadata (profile / company / post), no login
+# ----------------------------------------------------------------------------
+
+def _li_norm(target):
+    t = (target or "").strip().lstrip("@")
+    t = re.sub(r"^https?://(www\.|m\.)?(linkedin\.com|lnkd\.in)/", "", t)
+    return t.rstrip("/").split("?")[0]
+
+
+def _li_meta(html):
+    out = {}
+    for key, attr in (("title", "og:title"), ("description", "og:description"),
+                      ("image", "og:image"), ("url", "og:url"), ("type", "og:type")):
+        m = re.search(r'<meta[^>]+property="%s"[^>]+content="([^"]*)"' % attr, html)
+        if m:
+            out[key] = htmlmod.unescape(m.group(1)).strip()
+    for key, attr in (("first_name", "profile:first_name"), ("last_name", "profile:last_name")):
+        m = re.search(r'<meta[^>]+property="%s"[^>]+content="([^"]*)"' % attr, html)
+        if m:
+            out[key] = htmlmod.unescape(m.group(1)).strip()
+    return out
+
+
+def _li_fetch(url, args):
+    status, body = _request(url, args.timeout, args.ua)
+    if status == 999:
+        raise ToolError("LinkedIn rate-limited this IP (HTTP 999). Wait and retry, "
+                        "or use a residential IP/proxy.")
+    if status in (403, 429):
+        raise ToolError(f"LinkedIn blocked this request (HTTP {status}). Datacenter/cloud "
+                        "IPs are often rate-limited; a home IP usually works.")
+    if status != 200:
+        raise ToolError(f"could not fetch {url} (HTTP {status})")
+    meta = _li_meta(body)
+    if not meta.get("title") and not meta.get("description"):
+        raise ToolError(
+            "no public metadata for that URL. LinkedIn serves og: metadata only for "
+            "PUBLIC profiles, companies and (some) posts; feeds, search, private/"
+            "connections-only profiles, comments and messages are login-walled.")
+    return meta
+
+
+def li_profile(args):
+    slug = _li_norm(args.target)
+    if not slug.startswith("in/"):
+        slug = "in/" + slug
+    meta = _li_fetch("https://www.linkedin.com/" + slug, args)
+    desc = meta.get("description") or ""
+    name = " ".join(x for x in (meta.get("first_name"), meta.get("last_name")) if x).strip()
+    if not name and meta.get("title"):
+        name = meta["title"].split(" - ", 1)[0].split(" | ", 1)[0].strip()
+    out = {"handle": slug[len("in/"):],
+           "url": meta.get("url") or ("https://www.linkedin.com/" + slug),
+           "name": name or None, "type": meta.get("type"), "image": meta.get("image")}
+    segs = re.split(r"\s*·\s*", desc)
+    out["headline"] = segs[0].strip() if segs and segs[0].strip() else None
+    fields = {}
+    first_field = None
+    for i, seg in enumerate(segs):
+        for label in ("Experience", "Education", "Location"):
+            if seg.startswith(label + ":"):
+                fields[label.lower()] = seg[len(label) + 1:].strip()
+                first_field = i if first_field is None else first_field
+                break
+    if first_field is not None and first_field > 1:
+        out["about"] = " · ".join(s for s in segs[1:first_field] if s.strip()) or None
+    out.update(fields)
+    m = re.search(r"([\d,]+)\s+connections? on LinkedIn", desc)
+    out["connections"] = int(m.group(1).replace(",", "")) if m else None
+    return out
+
+
+def li_company(args):
+    slug = _li_norm(args.target)
+    if not slug.startswith("company/"):
+        slug = "company/" + slug
+    meta = _li_fetch("https://www.linkedin.com/" + slug, args)
+    desc = meta.get("description") or ""
+    name = meta.get("title", "").split(" | ", 1)[0].strip() if meta.get("title") else None
+    out = {"handle": slug[len("company/"):],
+           "url": meta.get("url") or ("https://www.linkedin.com/" + slug),
+           "name": name or None, "type": meta.get("type"), "image": meta.get("image")}
+    m = re.search(r"([\d,]+)\s+followers? on LinkedIn", desc)
+    out["followers"] = int(m.group(1).replace(",", "")) if m else None
+    m = re.search(r"Founded in (\d{4})", desc)
+    out["founded"] = int(m.group(1)) if m else None
+    parts = desc.split("on LinkedIn.", 1)
+    out["about"] = (parts[1].strip() if len(parts) > 1 else None)
+    return out
+
+
+def li_post(args):
+    url = args.target.strip()
+    if not url.startswith("http"):
+        url = "https://www.linkedin.com/posts/" + url
+    meta = _li_fetch(url, args)
+    return {"url": meta.get("url") or url, "title": meta.get("title"),
+            "description": meta.get("description"), "image": meta.get("image"),
+            "type": meta.get("type")}
+
+
+# ----------------------------------------------------------------------------
+# feed — generic RSS/Atom
+# ----------------------------------------------------------------------------
+
+def _loc(tag):
+    return tag.split("}", 1)[1] if "}" in tag else tag
+
+
+def _first_text(el, *names):
+    for e in el.iter():
+        if _loc(e.tag) in names and e.text:
+            return e.text.strip()
+    return None
+
+
+def _feed_item(el):
+    link = None
+    for e in el.iter():
+        if _loc(e.tag) == "link":
+            if e.text and e.text.strip():
+                link = e.text.strip()
+            elif e.get("href"):
+                link = e.get("href")
+            if link:
+                break
+    return {
+        "title": _first_text(el, "title"), "link": link,
+        "published": _first_text(el, "pubDate", "published", "updated"),
+        "author": _first_text(el, "creator", "author", "name"),
+        "summary": _strip_html(_first_text(el, "description", "encoded", "summary", "content"))[:600],
+    }
+
+
+def feed(args):
+    status, body = _request(args.target, args.timeout, args.ua)
+    if status != 200:
+        raise ToolError(f"could not fetch feed (HTTP {status})")
+    try:
+        root = ET.fromstring(body)
+    except ET.ParseError as e:
+        raise ToolError(f"not valid XML: {str(e)[:200]}")
+    entries = [_feed_item(el) for el in root.iter() if _loc(el.tag) in ("item", "entry")]
+    if not entries:
+        raise ToolError("no items found in feed")
+    return {"url": args.target, "entries": entries[:args.limit]}
+
+
+# ----------------------------------------------------------------------------
+# URL auto-router
+# ----------------------------------------------------------------------------
+
+def _sub(args, **kw):
+    """Copy user flags onto a lightweight args for direct provider calls."""
+    a = _ns(**kw)
+    a.json, a.limit, a.timeout, a.ua = args.json, args.limit, args.timeout, args.ua
+    return a
+
+
+def route(args):
+    """Plan the provider/action for a URL (returns before running, so the
+    provider is known even if the call later fails)."""
+    u = args.target.strip()
+    if re.search(r"(x\.com|twitter\.com)/[^/?#]+/status/(\d+)", u):
+        return "x", x_post, {"target": u}
+    if re.search(r"(x\.com|twitter\.com)/@?([^/?#]+)/?$", u):
+        return "x", x_user, {"target": u}
+    if re.search(r"reddit\.com/r/([^/?#]+)/comments/([^/?#]+)", u):
+        return "reddit", reddit, {"action": "post",
+                                  "target": re.search(r"/comments/([^/?#]+)", u).group(1)}
+    if re.search(r"reddit\.com/r/([^/?#]+)", u):
+        return "reddit", reddit, {"action": "sub",
+                                  "target": re.search(r"reddit\.com/r/([^/?#]+)", u).group(1),
+                                  "sort": "hot"}
+    if re.search(r"reddit\.com/(u|user)/([^/?#]+)", u):
+        return "reddit", reddit, {"action": "user",
+                                  "target": re.search(r"reddit\.com/(?:u|user)/([^/?#]+)", u).group(1)}
+    if re.search(r"bsky\.app/profile/([^/?#]+)", u):
+        return "bsky", bsky, {"action": "user",
+                              "target": re.search(r"/profile/([^/?#]+)", u).group(1)}
+    if re.search(r"t\.me/(?:s/)?([^/?#]+)/(\d+)", u):
+        return "tg", tg_post, {"target": u}
+    if re.search(r"t\.me/(?:s/)?([^/?#]+)/?$", u):
+        return "tg", tg_channel, {"target": u}
+    if re.search(r"instagram\.com/([^/?#]+)/(?:p|reel|tv)/([^/?#]+)", u):
+        return "ig", ig_post, {"target": u}
+    if re.search(r"instagram\.com/([^/?#]+)/?$", u):
+        return "ig", ig_user, {"target": u}
+    if "youtube.com" in u or "youtu.be" in u:
+        return "yt", yt_info, {"target": u}
+    if "tiktok.com" in u:
+        return "tiktok", tiktok, {"target": u}
+    if "vimeo.com" in u:
+        return "vimeo", vimeo, {"target": u}
+    if re.search(r"facebook\.com/[^/?#]+/posts/[^/?#]+", u):
+        return "fb", fb_post, {"target": u}
+    if re.search(r"facebook\.com/[^/?#]+/videos/[^/?#]+", u):
+        return "fb", fb_video, {"target": u}
+    if re.search(r"facebook\.com/watch", u) or re.search(r"fb\.watch/", u):
+        return "fb", fb_video, {"target": u}
+    if re.search(r"facebook\.com|fb\.com", u):
+        return "fb", fb_page, {"target": u}
+    if re.search(r"linkedin\.com/in/[^/?#]+", u):
+        return "li", li_profile, {"target": u}
+    if re.search(r"linkedin\.com/company/[^/?#]+", u):
+        return "li", li_company, {"target": u}
+    if re.search(r"linkedin\.com/(posts|feed/update)/", u):
+        return "li", li_post, {"target": u}
+    if re.search(r"linkedin\.com", u):
+        return "li", li_profile, {"target": u}
+    m = re.search(r"https?://([^/?#]+)/@([^/?#]+)", u)
+    if m:
+        return "masto", masto, {"action": "user", "target": u,
+                                "instance": f"https://{m.group(1)}"}
+    if re.match(r"^@?[^@\s/]+@[^@\s/]+\.[a-z]{2,}$", u):
+        return "masto", masto, {"action": "user", "target": u}
+    if re.search(r"\.(xml|rss)(\?|$)|/rss|/feed", u):
+        return "feed", feed, {"target": u}
+    raise ToolError(f"cannot auto-detect '{u}'. Use an explicit command "
+                    f"(see `socialfetch --help`) or `socialfetch manifest`.")
+
+
+# ----------------------------------------------------------------------------
+# manifest / status / setup
+# ----------------------------------------------------------------------------
+
+MANIFEST = [
+    ("x", ["post <id|url>", "user <handle>"], "X/Twitter tweet or profile (FixTweet)"),
+    ("reddit", ["sub <name> [--sort hot|new|top|rising]", "user <name>", "search <q>", "post <id>"],
+     "Reddit public JSON (may block datacenter IPs)"),
+    ("bsky", ["search <q>", "user <handle>"], "Bluesky public AT Proto API"),
+    ("masto", ["search <q>", "user <@u> [--instance URL]"], "Mastodon public API"),
+    ("lemmy", ["search <q> [--type Posts|Comments]", "community <name> [--instance URL]"], "Lemmy public API"),
+    ("hn", ["search <q> [--tags story|comment]", "front", "user <name>"], "Hacker News (Algolia)"),
+    ("ig", ["user <handle>", "post <url>"], "Instagram anonymous read"),
+    ("yt", ["info <url>", "search <q>", "download <url> [--audio|--mp3|--format F|--items 1-5|--subs|--playlist] [-o DIR]"],
+     "YouTube via yt-dlp (metadata + downloads)"),
+    ("tg", ["channel <name|@handle|link> [--limit N|--max N|--before ID|--after ID|--media photo|video|file|audio|sticker|poll|--has-media|--ext pdf|--query TEXT|--author NAME]",
+            "search <channel> <text> [--media X|--ext pdf|--max N]",
+            "download <post-link|channel> [-o DIR] [--media X|--ext pdf]",
+            "post <link>",
+            "bot me|chat <@u>|file <id>|photo <@u>  (env SOCIALFETCH_TG_BOT_TOKEN)"],
+     "Telegram public channels (no login)"),
+    ("tiktok", ["<url>"], "TikTok video info by URL (oEmbed)"),
+    ("vimeo", ["<url>"], "Vimeo video info by URL (oEmbed)"),
+    ("fb", ["post <url>", "video <url>", "page <url>"],
+     "Facebook public post/video by URL (oEmbed, tokenless); page = best-effort metadata"),
+    ("li", ["profile <url|handle>", "company <url|handle>", "post <url>"],
+     "LinkedIn public profile/company/post metadata (og:, no login)"),
+    ("feed", ["<rss|atom url>"], "any RSS/Atom feed"),
+]
+
+
+def manifest(args):
+    return {
+        "tool": "socialfetch", "version": VERSION,
+        "usage": "socialfetch <url> | socialfetch <provider> <action> [flags]",
+        "flags": ["--json (uniform envelope; flags work in any position)",
+                  "--limit N (max items, default 5)", "--timeout N",
+                  "--ua STRING (or env SOCIALFETCH_UA)"],
+        "providers": [
+            {"name": n, "actions": a, "description": d} for n, a, d in MANIFEST],
+    }
+
+
+def status(args):
+    rows = [
+        ("x", "https://api.fxtwitter.com/status/20", {}),
+        ("reddit", "https://www.reddit.com/r/programming/hot.json?limit=1", {}),
+        ("bluesky", "https://public.api.bsky.app/xrpc/app.bsky.feed.searchPosts?q=a&limit=1", {}),
+        ("masto", "https://mastodon.social/api/v1/accounts/1/statuses?limit=1", {}),
+        ("lemmy", "https://lemmy.world/api/v3/search?q=a&type_=Posts&limit=1", {}),
+        ("hn", "https://hn.algolia.com/api/v1/search?tags=front_page&hitsPerPage=1", {}),
+        ("ig", "https://www.instagram.com/api/v1/feed/user/nasa/username/?count=1",
+         {"x-ig-app-id": IG_APP_ID}),
+        ("yt", "https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v=dQw4w9WgXcQ&format=json", {}),
+        ("tg", "https://t.me/s/telegram", {}),
+        ("tiktok", "https://www.tiktok.com/oembed?url=https://www.tiktok.com/@tiktok/video/7106594312292453675", {}),
+        ("vimeo", "https://vimeo.com/api/oembed.json?url=https://vimeo.com/22439234", {}),
+        ("fb", "https://www.facebook.com/plugins/post/oembed.json/?url=https://www.facebook.com/20531316728/posts/10154009990506729/", {}),
+        ("li", "https://www.linkedin.com/in/williamhgates", {}),
+    ]
+    results = []
+    for name, url, hdrs in rows:
+        code, body = _request(url, args.timeout, args.ua, hdrs)
+        ok = code == 200 and (("tgme_" in body) if name == "tg" else
+                              ("og:title" in body or "profile:first_name" in body) if name == "li" else
+                              not _is_html(body))
+        results.append({"provider": name, "ok": ok, "http": code})
+    return {"providers": results}
+
+
+def setup(args):
+    lines = ["socialfetch setup"]
+    if _ytdlp():
+        lines.append(f"yt-dlp: found ({_ytdlp()})")
+    else:
+        r = subprocess.run([sys.executable, "-m", "pip", "install", "-q", "yt-dlp"],
+                           capture_output=True, text=True)
+        lines.append("yt-dlp: " + ("installed" if r.returncode == 0 else "install failed"))
+    ff = shutil.which("ffmpeg")
+    lines.append("ffmpeg: " + (ff or "NOT found (apt-get install ffmpeg) — needed for --mp3/merged video"))
+    lines.append("all other providers: Python stdlib only, nothing to install")
+    return {"done": lines}
+
+
+# ----------------------------------------------------------------------------
+# CLI wiring
+# ----------------------------------------------------------------------------
+
+class _ns:
+    """Tiny args stand-in so the URL router can call provider funcs directly."""
+    def __init__(self, **kw):
+        self.json = False
+        self.ua = DEFAULT_UA
+        self.timeout = 20
+        self.limit = 5
+        self.action = None
+        self.query = None
+        self.sort = "hot"
+        self.instance = "https://mastodon.social"
+        self.type_ = "Posts"
+        self.tags = None
+        self.max = None
+        self.before = None
+        self.after = None
+        self.media = None
+        self.has_media = False
+        self.ext = None
+        self.query = None
+        self.author = None
+        self.audio = False
+        self.mp3 = False
+        self.format = None
+        self.playlist = True
+        self.items = None
+        self.subs = False
+        self.out = None
+        self.botcmd = None
+        self.target = None
+        for k, v in kw.items():
+            setattr(self, k, v)
+
+
+def _dispatch(args):
+    table = {
+        ("x", "post"): x_post, ("x", "user"): x_user,
+        ("reddit", "sub"): reddit, ("reddit", "user"): reddit,
+        ("reddit", "search"): reddit, ("reddit", "post"): reddit,
+        ("bsky", "search"): bsky, ("bsky", "user"): bsky,
+        ("masto", "search"): masto, ("masto", "user"): masto,
+        ("lemmy", "search"): lemmy, ("lemmy", "community"): lemmy,
+        ("hn", "search"): hn, ("hn", "front"): hn, ("hn", "user"): hn,
+        ("ig", "user"): ig_user, ("ig", "post"): ig_post,
+        ("yt", "info"): yt_info, ("yt", "search"): yt_search, ("yt", "download"): yt_download,
+        ("tg", "channel"): tg_channel, ("tg", "post"): tg_post,
+        ("tg", "search"): tg_search, ("tg", "download"): tg_download, ("tg", "bot"): tg_bot,
+        ("tiktok", None): tiktok, ("vimeo", None): vimeo, ("feed", None): feed,
+        ("fb", "post"): fb_post, ("fb", "video"): fb_video, ("fb", "page"): fb_page,
+        ("li", "profile"): li_profile, ("li", "company"): li_company, ("li", "post"): li_post,
+    }
+    fn = table.get((args.provider, getattr(args, "action", None)))
+    if not fn:
+        raise ToolError(f"unknown action '{getattr(args, 'action', None)}' for provider '{args.provider}'")
+    return args.provider, fn(args)
+
+
+def _looks_like_target(s):
+    return bool(re.match(r"^https?://", s)) or bool(
+        re.match(r"^@?[a-zA-Z0-9_.-]+(\.[a-z]{2,})?(@[^/]+)?$", s) and
+        ("." in s or s.startswith("@") or "t.me" in s))
+
+
+def build_parser():
+    common = argparse.ArgumentParser(add_help=False)
+    common.add_argument("--json", action="store_true", default=argparse.SUPPRESS)
+    common.add_argument("--ua", default=argparse.SUPPRESS)
+    common.add_argument("--timeout", type=int, default=argparse.SUPPRESS)
+    common.add_argument("--limit", type=int, default=argparse.SUPPRESS)
+
+    p = argparse.ArgumentParser(prog="socialfetch", parents=[common],
+                                description="Free, no-auth access to public social media data.",
+                                formatter_class=argparse.RawDescriptionHelpFormatter,
+                                epilog=__doc__)
+    p.add_argument("--version", action="version", version=f"socialfetch {VERSION}")
+    sub = p.add_subparsers(dest="provider")
+
+    def sp(name, help_, **kw):
+        s = sub.add_parser(name, parents=[common], help=help_, **kw)
+        return s
+
+    xp = sp("x", "X/Twitter (FixTweet)"); xa = xp.add_subparsers(dest="action", required=True)
+    xa.add_parser("post", parents=[common]).add_argument("target")
+    xa.add_parser("user", parents=[common]).add_argument("target")
+
+    rp = sp("reddit", "Reddit public JSON"); ra = rp.add_subparsers(dest="action", required=True)
+    rsub = ra.add_parser("sub", parents=[common])
+    rsub.add_argument("target")
+    rsub.add_argument("--sort", default="hot")
+    ra.add_parser("user", parents=[common]).add_argument("target")
+    ra.add_parser("search", parents=[common]).add_argument("query")
+    ra.add_parser("post", parents=[common]).add_argument("target")
+
+    bp = sp("bsky", "Bluesky public API"); ba = bp.add_subparsers(dest="action", required=True)
+    ba.add_parser("search", parents=[common]).add_argument("query")
+    ba.add_parser("user", parents=[common]).add_argument("target")
+
+    mp = sp("masto", "Mastodon public API")
+    mp.add_argument("--instance", default="https://mastodon.social")
+    ma = mp.add_subparsers(dest="action", required=True)
+    ma.add_parser("search", parents=[common]).add_argument("query")
+    ma.add_parser("user", parents=[common]).add_argument("target")
+
+    lp = sp("lemmy", "Lemmy public API")
+    lp.add_argument("--instance", default="https://lemmy.world")
+    la = lp.add_subparsers(dest="action", required=True)
+    ls = la.add_parser("search", parents=[common]); ls.add_argument("query")
+    ls.add_argument("--type", dest="type_", default="Posts")
+    la.add_parser("community", parents=[common]).add_argument("target")
+
+    hp = sp("hn", "Hacker News (Algolia)"); ha = hp.add_subparsers(dest="action", required=True)
+    hs = ha.add_parser("search", parents=[common]); hs.add_argument("query"); hs.add_argument("--tags")
+    ha.add_parser("front", parents=[common])
+    ha.add_parser("user", parents=[common]).add_argument("target")
+
+    ip = sp("ig", "Instagram anonymous read"); ia = ip.add_subparsers(dest="action", required=True)
+    ia.add_parser("user", parents=[common]).add_argument("target")
+    ia.add_parser("post", parents=[common]).add_argument("target")
+
+    yp = sp("yt", "YouTube via yt-dlp"); ya = yp.add_subparsers(dest="action", required=True)
+    ya.add_parser("info", parents=[common]).add_argument("target")
+    ya.add_parser("search", parents=[common]).add_argument("query")
+    yd = ya.add_parser("download", parents=[common]); yd.add_argument("target")
+    yd.add_argument("-o", "--out"); yd.add_argument("--audio", action="store_true")
+    yd.add_argument("--mp3", action="store_true"); yd.add_argument("--format")
+    yd.add_argument("--playlist", action="store_true", default=True)
+    yd.add_argument("--no-playlist", action="store_false", dest="playlist")
+    yd.add_argument("--items"); yd.add_argument("--subs", action="store_true")
+
+    gp = sp("tg", "Telegram public channels"); ga = gp.add_subparsers(dest="action", required=True)
+    gc = ga.add_parser("channel", parents=[common]); gc.add_argument("target")
+    gc.add_argument("--before"); gc.add_argument("--after"); gc.add_argument("--max", type=int)
+    gc.add_argument("--media", help="filter by media type: photo, video, round, "
+                                   "audio/voice, sticker, file/document, poll, location, "
+                                   "link, text, any/media")
+    gc.add_argument("--has-media", action="store_true", help="only messages with any media")
+    gc.add_argument("--ext", help="filter files by extension (e.g. pdf, zip, apk)")
+    gc.add_argument("--query", help="filter by text (case-insensitive substring)")
+    gc.add_argument("--author", help="filter by author name (case-insensitive substring)")
+    ga.add_parser("post", parents=[common]).add_argument("target")
+
+    ts = ga.add_parser("search", parents=[common],
+                       help="search a channel's public preview (client-side, deep pagination)")
+    ts.add_argument("target"); ts.add_argument("query")
+    ts.add_argument("--media"); ts.add_argument("--has-media", action="store_true")
+    ts.add_argument("--ext"); ts.add_argument("--author"); ts.add_argument("--max", type=int)
+
+    td = ga.add_parser("download", parents=[common],
+                       help="download media (photo/video/audio/sticker) from a post or channel")
+    td.add_argument("target")
+    td.add_argument("-o", "--out")
+    td.add_argument("--media"); td.add_argument("--has-media", action="store_true")
+    td.add_argument("--ext"); td.add_argument("--query"); td.add_argument("--author")
+    td.add_argument("--max", type=int)
+
+    tb = ga.add_parser("bot", parents=[common],
+                       help="optional Telegram Bot API (SOCIALFETCH_TG_BOT_TOKEN)")
+    tbx = tb.add_subparsers(dest="botcmd", required=True)
+    tbx.add_parser("me", parents=[common])
+    tbc = tbx.add_parser("chat", parents=[common]); tbc.add_argument("target")
+    tbf = tbx.add_parser("file", parents=[common]); tbf.add_argument("target")
+    tbp = tbx.add_parser("photo", parents=[common]); tbp.add_argument("target")
+
+    tp = sp("tiktok", "TikTok video by URL"); tp.add_argument("target")
+    vp = sp("vimeo", "Vimeo video by URL"); vp.add_argument("target")
+
+    fbp = sp("fb", "Facebook public post/video by URL (oEmbed)")
+    fba = fbp.add_subparsers(dest="action", required=True)
+    fba.add_parser("post", parents=[common]).add_argument("target")
+    fba.add_parser("video", parents=[common]).add_argument("target")
+    fba.add_parser("page", parents=[common]).add_argument("target")
+
+    lip = sp("li", "LinkedIn public profile/company/post (og: metadata)")
+    lia = lip.add_subparsers(dest="action", required=True)
+    lia.add_parser("profile", parents=[common]).add_argument("target")
+    lia.add_parser("company", parents=[common]).add_argument("target")
+    lia.add_parser("post", parents=[common]).add_argument("target")
+
+    fp = sp("feed", "RSS/Atom feed"); fp.add_argument("target")
+    sp("url", "auto-detect from a URL").add_argument("target")
+    sp("manifest", "capability list (JSON)")
+    sp("status", "health check")
+    sp("setup", "install optional deps")
+    return p
+
+
+def main(argv=None):
+    import os as _os
+    argv = list(sys.argv[1:] if argv is None else argv)
+    provider = "unknown"
+
+    # auto-route a bare URL / handle to `url`
+    if argv and not argv[0].startswith("-") and argv[0] not in (
+            "x", "reddit", "bsky", "masto", "lemmy", "hn", "ig", "yt", "tg",
+            "tiktok", "vimeo", "fb", "li", "feed", "url", "manifest", "status", "setup") \
+            and _looks_like_target(argv[0]):
+        argv = ["url"] + argv
+
+    parser = build_parser()
+    ns = argparse.Namespace(json=False, ua=DEFAULT_UA, timeout=20, limit=5)
+    args = parser.parse_args(argv, namespace=ns)
+    if _os.environ.get("SOCIALFETCH_UA") and args.ua == DEFAULT_UA:
+        args.ua = _os.environ["SOCIALFETCH_UA"]
+
+    try:
+        if args.provider == "url":
+            provider, fn, kw = route(args)
+            data = fn(_sub(args, **kw))
+        elif args.provider == "manifest":
+            provider, data = "manifest", manifest(args)
+        elif args.provider == "status":
+            provider, data = "status", status(args)
+        elif args.provider == "setup":
+            provider, data = "setup", setup(args)
+        else:
+            provider = args.provider
+            provider, data = _dispatch(args)
+        return _emit(args, provider, data)
+    except ToolError as e:
+        return _emit(args, provider, error=str(e))
+    except KeyError as e:
+        return _emit(args, provider, error=f"unexpected data shape ({e})")
+
+
+if __name__ == "__main__":
+    sys.exit(main())
