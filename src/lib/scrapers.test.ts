@@ -72,7 +72,7 @@ describe("scrapeJirosearch and social platform routing", () => {
         platform?: string;
         limit?: number;
       };
-      const target = sent.platform ?? "x";
+      const target = sent.platform === "twitter" ? "x" : sent.platform ?? "x";
       return new Response(
         JSON.stringify({
           results: [
@@ -101,7 +101,7 @@ describe("scrapeJirosearch and social platform routing", () => {
           method: "POST",
           body: JSON.stringify({
             query: "Acme",
-            platform: p,
+            platform: p === "x" ? "twitter" : p,
             limit: 10,
           }),
         }),
@@ -213,7 +213,9 @@ describe("scrapeJirosearch and social platform routing", () => {
       expect(typeof sent.platform).toBe("string");
       expect(sent.limit).toBe(10);
 
-      const target = sent.platform ?? platformOrder[callIdx++] ?? "x";
+      const target =
+        sent.platform === "twitter" ? "x" : sent.platform ?? platformOrder[callIdx++] ?? "x";
+      expect(sent.platform).toBe(target === "x" ? "twitter" : target);
       return new Response(
         JSON.stringify({
           results: [
