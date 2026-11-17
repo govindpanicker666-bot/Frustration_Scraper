@@ -1660,7 +1660,13 @@ async function linkedin(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
     apply48HourFilter: opts.apply48HourFilter ?? true,
     limit: 12,
   });
-  if (!posts.length) throw new NoMatch("no readable public LinkedIn posts found in search indexes");
+  if (!posts.length) {
+    throw new NoMatch(
+      opts.apply48HourFilter === false
+        ? "LinkedIn search returned no readable public post previews"
+        : "LinkedIn search returned no readable post previews with a verifiable publication time in the last 48 hours",
+    );
+  }
 
   return posts.map((post): RawReview => ({
     platform: "linkedin",

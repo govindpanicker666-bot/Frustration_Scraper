@@ -54,8 +54,8 @@ export async function testLinkedInSearch(name: string): Promise<LinkedInTestResu
     profileRaw: first,
     error: result.reviews.length ? undefined
       : result.status === "blocked"
-        ? "Free LinkedIn search or public post extraction was blocked. Try again later."
-        : "No readable public LinkedIn posts were found in the indexed results.",
+        ? "LinkedIn search providers failed or blocked the request. Check the search-provider/network response."
+        : "No readable LinkedIn post previews with a verifiable publication time were found in recent search results.",
   };
 }
 

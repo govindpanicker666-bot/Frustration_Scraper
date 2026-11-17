@@ -1,8 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
-import { webSearch } from "./search.server";
-import { linkedinAuthorFromPost } from "./pipeline";
+import { linkedinAuthorFromPost, parseBingRss, parseDdgHtml, type SearchResult } from "./pipeline";
 
 const execFileAsync = promisify(execFile);
 const SCRAPER_DIR = join(process.cwd(), "scripts", "toolzerhub");
@@ -56,6 +55,84 @@ function activityDate(url: string): string {
     return Number.isFinite(milliseconds) && !Number.isNaN(date.getTime()) ? date.toISOString() : "";
   } catch { return ""; }
 }
+const LINKEDIN_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+
+const LINKEDIN_SEARCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+
+function parseLinkedInSearchDate(value, now = Date.now()) {
+  const text = value.replace(/\s+/g, " ").trim();
+  if (!text) return "";
+  const relative = text.match(/\b(just now|moments ago|today|yesterday|\d{1,4}\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|years?)\s*ago)\b/i);
+  if (relative && relative[1]) {
+    const label = relative[1].toLowerCase();
+    if (label === "just now" || label === "moments ago" || label === "today") return new Date(now).toISOString();
+    if (label === "yesterday") return new Date(now - 36 * 60 * 60 * 1000).toISOString();
+    const amountMatch = label.match(/(\d{1,4})\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|years?)/i);
+    if (amountMatch) {
+      const amount = Number(amountMatch[1]);
+      const unit = amountMatch[2].toLowerCase();
+      const unitMs = /^(s|sec|secs|second|seconds)$/.test(unit) ? 1000
+        : /^(m|min|mins|minute|minutes)$/.test(unit) ? 60 * 1000
+        : /^(h|hr|hrs|hour|hours)$/.test(unit) ? 60 * 60 * 1000
+        : /^(d|day|days)$/.test(unit) ? 24 * 60 * 60 * 1000
+        : /^(w|week|weeks)$/.test(unit) ? 7 * 24 * 60 * 60 * 1000
+        : /^(month|months)$/.test(unit) ? 30 * 24 * 60 * 60 * 1000
+        : 365 * 24 * 60 * 60 * 1000;
+      const conservativeOffset = /^(d|day|days)$/.test(unit) ? 12 * 60 * 60 * 1000 : 0;
+      return new Date(now - amount * unitMs - conservativeOffset).toISOString();
+    }
+  }
+  const month = "(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)";
+  const absolute = text.match(new RegExp("\\b((?:20\\\\d{2}-\\\\d{1,2}-\\\\d{1,2}(?:[T ][0-9:.Z+-]+)?)|(?:" + month + "\\\\s+\\\\d{1,2}(?:,?\\\\s+20\\\\d{2})?)|(?:\\\\d{1,2}\\\\s+" + month + "(?:\\\\s+20\\\\d{2})?))\\\\b", "i"));
+  if (!absolute || !absolute[1]) return "";
+  const dateText = absolute[1];
+  const normalizedDate = /\b20\d{2}\b/.test(dateText) ? dateText : dateText + ", " + new Date(now).getUTCFullYear();
+  const parsed = new Date(normalizedDate);
+  return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString();
+}
+
+function isLinkedInPostWithin48Hours(publishedAt, now) {
+  const timestamp = Date.parse(publishedAt);
+  const age = now - timestamp;
+  return Number.isFinite(timestamp) && age >= -5 * 60 * 1000 && age <= 48 * 60 * 60 * 1000;
+}
+
+async function searchLinkedInIndex(query, recent) {
+  const headers = {
+    "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36",
+    "Accept-Language": "en-US,en;q=0.9",
+  };
+  const ddgUrl = new URL("https://html.duckduckgo.com/html/");
+  ddgUrl.searchParams.set("q", query);
+  if (recent) ddgUrl.searchParams.set("df", "w");
+  const bingUrl = new URL("https://www.bing.com/search");
+  bingUrl.searchParams.set("format", "rss");
+  bingUrl.searchParams.set("q", query);
+  if (recent) bingUrl.searchParams.set("filters", 'ex1:"ez2"');
+  const [ddg, bing] = await Promise.allSettled([
+    fetch(ddgUrl, {headers, signal:AbortSignal.timeout(9000)}).then(async response => {
+      if (!response.ok) throw new Error("DuckDuckGo HTTP " + response.status);
+      return parseDdgHtml(await response.text());
+    }),
+    fetch(bingUrl, {headers, signal:AbortSignal.timeout(9000)}).then(async response => {
+      if (!response.ok) throw new Error("Bing HTTP " + response.status);
+      return parseBingRss(await response.text());
+    }),
+  ]);
+  const results = [];
+  const errors = [];
+  let successfulProviders = 0;
+  for (const result of [ddg, bing]) {
+    if (result.status === "fulfilled") {
+      successfulProviders++;
+      results.push(...result.value);
+    } else {
+      errors.push(result.reason instanceof Error ? result.reason.message : String(result.reason));
+    }
+  }
+  return {results, errors, successfulProviders};
+}
+
 export function normalizeLinkedInScrapedPosts(payload: unknown): LinkedInPublicPost[] {
   const rows = record(payload)?.["posts"];
   if (!Array.isArray(rows)) return [];
@@ -115,33 +192,83 @@ export async function scrapeLinkedInPostUrls(urls: string[]): Promise<LinkedInPu
   const output = await runPython("scrape_linkedin_posts.py", safeUrls, Math.max(90_000, safeUrls.length * 25_000));
   return normalizeLinkedInScrapedPosts(parseJson(output));
 }
-export async function searchAndScrapeLinkedInPosts(
-  competitor: { name: string; domain: string | null },
-  options: { apply48HourFilter?: boolean; limit?: number } = {},
-): Promise<LinkedInPublicPost[]> {
-  const name = competitor.name.trim(); if (!name) return [];
+export async function searchAndScrapeLinkedInPosts(competitor, options = {}) {
+  const name = competitor.name.replace(/["']/g, "").replace(/\s+/g, " ").trim();
+  if (!name) return [];
   const recent = options.apply48HourFilter ?? true;
   const limit = Math.max(1, Math.min(15, Math.floor(options.limit ?? 12)));
-  const after = recent ? ` after:${new Date(Date.now() - 48 * 60 * 60 * 1000).toISOString().slice(0, 10)}` : "";
-  const quotedName = `"${name.replace(/"/g, "").trim()}"`;
+  const now = Date.now();
+  const startDate = new Date(now - LINKEDIN_MAX_AGE_MS).toISOString().slice(0, 10);
+  const endDate = new Date(now).toISOString().slice(0, 10);
+  const tomorrow = new Date(Date.parse(endDate + "T00:00:00.000Z") + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
+  const dateClauses = recent ? " after:" + startDate + " before:" + tomorrow : "";
   const queries = [
-    `site:linkedin.com/posts ${quotedName}${after}`,
-    `site:linkedin.com/feed/update ${quotedName}${after}`,
+    "site:linkedin.com " + name + dateClauses,
+    name + " LinkedIn posts" + dateClauses,
+    "posts about " + name + " on LinkedIn" + dateClauses,
   ];
-  if (competitor.domain) {
-    const domain = competitor.domain.toLowerCase().replace(/^www\./, "").split("/")[0];
-    if (domain && domain !== name.toLowerCase()) queries.push(`site:linkedin.com/posts "${domain}"${after}`);
+  const batches = await Promise.all(queries.map(query => searchLinkedInIndex(query, recent)));
+  const successfulProviders = batches.reduce((total, batch) => total + batch.successfulProviders, 0);
+  const providerErrors = batches.flatMap(batch => batch.errors);
+  if (successfulProviders === 0) {
+    throw new Error("LinkedIn search providers failed: " + (providerErrors.join("; ") || "no provider response"));
   }
-  const batches = await Promise.all(queries.map((query) => webSearch(query, { recent, allSources: true })));
-  const urls: string[] = []; const seen = new Set<string>();
+
+  const hitsByUrl = new Map();
   for (const batch of batches) {
-    for (const hit of batch) {
+    for (const hit of batch.results) {
       const url = normalizeLinkedInPostUrl(hit.url);
-      if (!url || seen.has(url)) continue;
-      seen.add(url); urls.push(url);
-      if (urls.length >= limit) break;
+      if (!url) continue;
+      const previous = hitsByUrl.get(url);
+      if (!previous || hit.snippet.length > previous.snippet.length) hitsByUrl.set(url, {...hit, url});
     }
-    if (urls.length >= limit) break;
   }
-  return urls.length ? scrapeLinkedInPostUrls(urls) : [];
+
+  const posts = [];
+  let undated = 0;
+  let outsideWindow = 0;
+  let unreadablePreview = 0;
+  for (const [url, hit] of hitsByUrl) {
+    const title = hit.title.replace(/\s*(?:\||[-–—])\s*LinkedIn\s*$/i, "").trim();
+    const snippet = hit.snippet.trim();
+    const body = [title, snippet].filter(Boolean).join("\n").trim();
+    if (body.length < 40) {
+      unreadablePreview++;
+      continue;
+    }
+    const publishedAt = parseLinkedInSearchDate(snippet + " " + hit.title, now) || activityDate(url);
+    if (recent && !publishedAt) {
+      undated++;
+      continue;
+    }
+    if (recent && !isLinkedInPostWithin48Hours(publishedAt, now)) {
+      outsideWindow++;
+      continue;
+    }
+    const inferred = linkedinAuthorFromPost(url);
+    const authorFromTitle = hit.title.match(/^(.{2,80}?)\s+on LinkedIn\s*:/i);
+    posts.push({
+      url,
+      text: body.slice(0, 5000),
+      publishedAt,
+      authorName: (authorFromTitle && authorFromTitle[1].trim()) || inferred?.name || null,
+      authorUrl: inferred?.profile ?? null,
+    });
+    if (posts.length >= limit) break;
+  }
+
+  console.info("[LinkedIn] Search diagnostics", {
+    competitor: name,
+    queries,
+    searchTimeWindow: recent ? {after:startDate, before:tomorrow, maxAgeHours:48} : "unrestricted",
+    successfulProviders,
+    providerErrors,
+    indexedResults: batches.reduce((total, batch) => total + batch.results.length, 0),
+    matchingPostUrls: hitsByUrl.size,
+    readablePreviews: posts.length,
+    undated,
+    outside48Hours: outsideWindow,
+    unreadablePreview,
+  });
+  return posts;
 }
