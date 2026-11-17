@@ -54,23 +54,36 @@ describe("scrapeJirosearch and social platform routing", () => {
     delete process.env["JIRO_SEARCH_URL"];
     delete process.env["JIROSEARCH_API_URL"];
     delete process.env["JIROSEARCH_API_KEY"];
-    const homepageFetch = vi.fn().mockResolvedValue(
-      new Response("<html><body>No linked social accounts</body></html>", { status: 200 }),
-    );
-    vi.stubGlobal("fetch", homepageFetch);
+    const fetchMock = vi.fn().mockImplementation(async (input: string | URL | Request) => {
+      if (String(input).includes("x-lookup.mynameistito.com")) {
+        return new Response(
+          JSON.stringify({
+            resource: "search",
+            posts: [{
+              id: "1234567890123456789",
+              url: "https://x.com/alex/status/1234567890123456789",
+              text: "Acme support is broken.",
+              created_at: new Date().toISOString(),
+              author: { screen_name: "alex" },
+            }],
+          }),
+          { status: 200, headers: { "Content-Type": "application/json" } },
+        );
+      }
+      return new Response("<html><body>No linked social accounts</body></html>", { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
 
-    const instagram = await scrapePlatform(
-      { name: "Acme", domain: "acme.com" },
-      "instagram",
-    );
-    const facebook = await scrapePlatform(
-      { name: "Acme", domain: "acme.com" },
-      "facebook",
-    );
+    const x = await scrapePlatform({ name: "Acme", domain: "acme.com" }, "x");
+    const instagram = await scrapePlatform({ name: "Acme", domain: "acme.com" }, "instagram");
+    const facebook = await scrapePlatform({ name: "Acme", domain: "acme.com" }, "facebook");
+    expect(x.status).toBe("ok");
+    expect(x.reviews).toHaveLength(1);
     expect(instagram.status).toBe("no_match");
     expect(facebook.status).toBe("no_match");
     expect(instagram.status).not.toBe("no_key");
     expect(facebook.status).not.toBe("no_key");
+    expect(fetchMock.mock.calls.some(([input]) => String(input).includes("jiro-search-api"))).toBe(false);
   });
 
   it("sends separate /social/search requests per platform with { query, platform, limit: 10 } and maps results", async () => {
