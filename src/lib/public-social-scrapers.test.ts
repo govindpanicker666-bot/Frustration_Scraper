@@ -13,13 +13,7 @@ describe("public social scraper normalizers", () => {
     expect(normalizeLinkedInPostUrl("https://www.linkedin.com/feed/update/urn:li:activity:123?utm_source=x")).toBe("https://www.linkedin.com/feed/update/urn:li:activity:123");
     expect(normalizeLinkedInPostUrl("https://linkedin.com/in/alex")).toBeNull();
     expect(normalizeLinkedInPostUrl("https://evil.example/?url=https://linkedin.com/posts/alex")).toBeNull();
-    const bingTarget = "https://www.linkedin.com/posts/alex_topic-activity-123";
-    const bingEncoded = "a1" + Buffer.from(bingTarget).toString("base64url");
-    expect(normalizeLinkedInPostUrl("https://www.bing.com/ck/a?u=" + bingEncoded)).toBe(
-      "https://www.linkedin.com/posts/alex_topic-activity-123",
-    );
-    const bingTarget = "https://www.linkedin.com/posts/alex_topic-activity-123";
-    const bingEncoded = "a1" + Buffer.from(bingTarget).toString("base64url");
+    const bingEncoded = "a1aHR0cHM6Ly93d3cubGlua2VkaW4uY29tL3Bvc3RzL2FsZXhfdG9waWMtYWN0aXZpdHktMTIz";
     expect(normalizeLinkedInPostUrl("https://www.bing.com/ck/a?u=" + bingEncoded)).toBe(
       "https://www.linkedin.com/posts/alex_topic-activity-123",
     );
@@ -39,9 +33,6 @@ describe("public social scraper normalizers", () => {
   it("parses LinkedIn result-card relative timestamps without reading ordinary post text as a date", () => {
     const now = Date.parse("2026-11-18T12:00:00.000Z");
     expect(parseLinkedInSearchDate("Duncan Lennox · 2 hours ago · 190 reactions", now)).toBe(
-      "2026-11-18T10:00:00.000Z",
-    );
-    expect(parseLinkedInSearchDate("Duncan Lennox · 2h · 190 reactions", now)).toBe(
       "2026-11-18T10:00:00.000Z",
     );
     expect(parseLinkedInSearchDate("Duncan Lennox · 2h · 190 reactions", now)).toBe(
