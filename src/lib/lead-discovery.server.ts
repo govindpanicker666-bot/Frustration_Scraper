@@ -76,19 +76,27 @@ async function runOpenLeads(name: string, company: string | null, domain: string
   }
 }
 
+type LeadWithOsint = Database["public"]["Tables"]["leads"]["Row"] & {
+  osint_contacts?: unknown;
+  osint_checked?: boolean | null;
+};
+
 async function saveLead(
   db: SupabaseClient<Database>,
   leadId: string,
-  patch: Database["public"]["Tables"]["leads"]["Update"],
+  patch: Record<string, unknown>,
 ) {
-  const { error } = await db.from("leads").update(patch).eq("id", leadId);
+  const { error } = await db.from("leads").update(
+    patch as Database["public"]["Tables"]["leads"]["Update"],
+  ).eq("id", leadId);
   if (error) throw new Error(`Failed to save lead enrichment: ${error.message}`);
 }
 
 export async function runEmailEnrichmentForLead(db: SupabaseClient<Database>, leadId: string) {
-  const { data: lead, error } = await db.from("leads").select("*").eq("id", leadId).maybeSingle();
+  const { data: rawLead, error } = await db.from("leads").select("*").eq("id", leadId).maybeSingle();
   if (error) throw new Error(error.message);
-  if (!lead) throw new Error("LEAD_NOT_FOUND");
+  if (!rawLead) throw new Error("LEAD_NOT_FOUND");
+  const lead = rawLead as LeadWithOsint;
   if (lead.email) return { email: lead.email, email_status: lead.email_status, email_enrichment: null, osint_contacts: lead.osint_contacts, osint_checked: Boolean(lead.osint_checked) };
 
   // Do not infer the reviewer domain from the competitor's domain.
@@ -129,7 +137,7 @@ export async function runEmailEnrichmentForLead(db: SupabaseClient<Database>, le
     await saveLead(db, leadId, {
       email: selected.email,
       email_status: selected.evidence === "linkook" ? "linkook" : `openleads_${selected.evidence}`,
-      osint_contacts: nextContacts as unknown as Database["public"]["Tables"]["leads"]["Update"]["osint_contacts"],
+      osint_contacts: nextContacts,
     });
   }
   return {
@@ -185,9 +193,10 @@ async function runMaigret(handle: string): Promise<string[]> {
 }
 
 export async function runMaigretProfileSearchForLead(db: SupabaseClient<Database>, leadId: string) {
-  const { data: lead, error } = await db.from("leads").select("*").eq("id", leadId).maybeSingle();
+  const { data: rawLead, error } = await db.from("leads").select("*").eq("id", leadId).maybeSingle();
   if (error) throw new Error(error.message);
-  if (!lead) throw new Error("LEAD_NOT_FOUND");
+  if (!rawLead) throw new Error("LEAD_NOT_FOUND");
+  const lead = rawLead as LeadWithOsint;
   const profileUrl = lead.reviewer_profile_url && lead.reviewer_profile_url !== lead.source_url
     ? lead.reviewer_profile_url : lead.source_url;
   const handle = extractOsintHandle(lead.reviewer_name, profileUrl);
@@ -203,7 +212,7 @@ export async function runMaigretProfileSearchForLead(db: SupabaseClient<Database
   const linkedin = mergedProfiles.linkedin ?? lead.linkedin_url ?? null;
   const firstProfile = Object.values(mergedProfiles)[0] ?? lead.reviewer_profile_url;
   await saveLead(db, leadId, {
-    osint_contacts: structured as unknown as Database["public"]["Tables"]["leads"]["Update"]["osint_contacts"],
+    osint_contacts: structured,
     linkedin_url: linkedin,
     reviewer_profile_url: firstProfile,
   });
