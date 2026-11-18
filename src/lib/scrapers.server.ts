@@ -666,15 +666,17 @@ async function mastodon(c: CompetitorCtx) {
     account: { display_name?: string; acct: string; url?: string };
   };
 
-  const nameTag = c.name.normalize("NFKD")
+  const nameTag = c.name
+    .normalize("NFKD")
     .replace(/[\u0300-\u036f]/g, "")
     .replace(/[^a-z0-9]/gi, "")
     .toLowerCase();
-  const domainTag = (c.domain ?? "")
-    .toLowerCase()
-    .replace(/^www\./, "")
-    .split(".")[0]
-    ?.replace(/[^a-z0-9]/g, "") ?? "";
+  const domainTag =
+    (c.domain ?? "")
+      .toLowerCase()
+      .replace(/^www\./, "")
+      .split(".")[0]
+      ?.replace(/[^a-z0-9]/g, "") ?? "";
   const wordTags = c.name.toLowerCase().match(/[a-z0-9]{4,}/g) ?? [];
   const tags = [...new Set([nameTag, domainTag, ...wordTags])]
     .filter((tag) => tag.length >= 4)
@@ -703,7 +705,8 @@ async function mastodon(c: CompetitorCtx) {
   const posts: RawReview[] = [];
   for (const response of responses) {
     for (const status of response.statuses) {
-      if (status.visibility && status.visibility !== "public" && status.visibility !== "unlisted") continue;
+      if (status.visibility && status.visibility !== "public" && status.visibility !== "unlisted")
+        continue;
       const sourceUrl = (status.url ?? "").trim();
       const body = stripHtml(status.content ?? "");
       if (!sourceUrl || !body || seen.has(sourceUrl)) continue;
@@ -819,7 +822,7 @@ const SOCIALFETCH_TIMEOUT_MS = 25_000;
 type JsonRecord = Record<string, unknown>;
 function asRecord(value: unknown): JsonRecord | null {
   return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? value as JsonRecord
+    ? (value as JsonRecord)
     : null;
 }
 function asString(value: unknown): string {
@@ -842,9 +845,13 @@ async function runSocialFetch(args: string[]): Promise<unknown> {
       (error, output, stderr) => {
         if (error) {
           const detail = asString(stderr).slice(0, 240);
-          reject(new Blocked(detail
-            ? `SocialFetch failed: ${detail}`
-            : `SocialFetch could not run (${error.message.slice(0, 180)})`));
+          reject(
+            new Blocked(
+              detail
+                ? `SocialFetch failed: ${detail}`
+                : `SocialFetch could not run (${error.message.slice(0, 180)})`,
+            ),
+          );
           return;
         }
         resolve(output);
@@ -859,7 +866,9 @@ async function runSocialFetch(args: string[]): Promise<unknown> {
   }
   const result = asRecord(envelope);
   if (!result || result["ok"] !== true) {
-    throw new Blocked(asString(result?.["error"]) || "SocialFetch returned an unsuccessful response");
+    throw new Blocked(
+      asString(result?.["error"]) || "SocialFetch returned an unsuccessful response",
+    );
   }
   return result["data"];
 }
@@ -884,16 +893,19 @@ export function mapSocialFetchRedditPosts(data: unknown): RawReview[] {
     const text = [title, body].filter(Boolean).join(". ").slice(0, 5000);
     if (!sourceUrl || !text) return [];
     const author = asString(post["author"]);
-    return [{
-      platform: "reddit",
-      reviewer_name: author && author !== "[deleted]" ? author : null,
-      reviewer_profile_url: author && author !== "[deleted]"
-        ? `https://www.reddit.com/user/${encodeURIComponent(author)}/`
-        : null,
-      source_url: sourceUrl,
-      text,
-      published_at: normalizePublishedDate(post["created_utc"] ?? post["created_at"]),
-    }];
+    return [
+      {
+        platform: "reddit",
+        reviewer_name: author && author !== "[deleted]" ? author : null,
+        reviewer_profile_url:
+          author && author !== "[deleted]"
+            ? `https://www.reddit.com/user/${encodeURIComponent(author)}/`
+            : null,
+        source_url: sourceUrl,
+        text,
+        published_at: normalizePublishedDate(post["created_utc"] ?? post["created_at"]),
+      },
+    ];
   });
 }
 
@@ -906,18 +918,20 @@ export function mapSocialFetchInstagramPosts(data: unknown, fallbackHandle: stri
     const post = asRecord(item);
     if (!post) return [];
     const shortcode = asString(post["shortcode"]);
-    const sourceUrl = asString(post["url"]) ||
-      (shortcode ? `https://www.instagram.com/p/${shortcode}/` : "");
+    const sourceUrl =
+      asString(post["url"]) || (shortcode ? `https://www.instagram.com/p/${shortcode}/` : "");
     const text = asString(post["caption"]);
     if (!sourceUrl || !text) return [];
-    return [{
-      platform: "instagram",
-      reviewer_name: handle ? `@${handle}` : null,
-      reviewer_profile_url: handle ? `https://www.instagram.com/${handle}/` : null,
-      source_url: sourceUrl,
-      text: text.slice(0, 5000),
-      published_at: normalizePublishedDate(post["taken_at"] ?? post["published_at"]),
-    }];
+    return [
+      {
+        platform: "instagram",
+        reviewer_name: handle ? `@${handle}` : null,
+        reviewer_profile_url: handle ? `https://www.instagram.com/${handle}/` : null,
+        source_url: sourceUrl,
+        text: text.slice(0, 5000),
+        published_at: normalizePublishedDate(post["taken_at"] ?? post["published_at"]),
+      },
+    ];
   });
 }
 
@@ -928,16 +942,20 @@ export function mapSocialFetchFacebookPost(data: unknown): RawReview[] {
   const text = asString(post["title"]);
   if (!sourceUrl || !text) return [];
   const author = asString(post["author"]);
-  return [{
-    platform: "facebook",
-    reviewer_name: author || null,
-    reviewer_profile_url: asString(post["author_url"]) || null,
-    source_url: sourceUrl,
-    text: text.slice(0, 5000),
-    // Public oEmbed responses usually omit publication dates. Never invent one:
-    // the existing metadata recovery + strict 48-hour gate remains authoritative.
-    published_at: normalizePublishedDate(post["published_at"] ?? post["created_at"] ?? post["timestamp"]),
-  }];
+  return [
+    {
+      platform: "facebook",
+      reviewer_name: author || null,
+      reviewer_profile_url: asString(post["author_url"]) || null,
+      source_url: sourceUrl,
+      text: text.slice(0, 5000),
+      // Public oEmbed responses usually omit publication dates. Never invent one:
+      // the existing metadata recovery + strict 48-hour gate remains authoritative.
+      published_at: normalizePublishedDate(
+        post["published_at"] ?? post["created_at"] ?? post["timestamp"],
+      ),
+    },
+  ];
 }
 
 interface DiscoveredSocialLinks {
@@ -984,13 +1002,19 @@ async function discoverCompetitorSocialLinks(c: CompetitorCtx): Promise<Discover
     const host = url.hostname.toLowerCase();
     if (host === "instagram.com" || host.endsWith(".instagram.com")) {
       const handle = url.pathname.split("/").filter(Boolean)[0] ?? "";
-      if (handle && !/^(p|reel|reels|tv|stories|explore|accounts|direct)$/i.test(handle) &&
-          /^[a-z0-9._]{1,30}$/i.test(handle)) {
+      if (
+        handle &&
+        !/^(p|reel|reels|tv|stories|explore|accounts|direct)$/i.test(handle) &&
+        /^[a-z0-9._]{1,30}$/i.test(handle)
+      ) {
         instagramHandles.add(handle);
       }
     }
-    if ((host === "facebook.com" || host.endsWith(".facebook.com") || host === "fb.watch") &&
-        (/\/(posts|videos|watch|reel|reels|share\/p|share\/v)\//i.test(url.pathname) || host === "fb.watch")) {
+    if (
+      (host === "facebook.com" || host.endsWith(".facebook.com") || host === "fb.watch") &&
+      (/\/(posts|videos|watch|reel|reels|share\/p|share\/v)\//i.test(url.pathname) ||
+        host === "fb.watch")
+    ) {
       facebookPostUrls.add(url.toString());
     }
   }
@@ -1001,13 +1025,15 @@ async function discoverCompetitorSocialLinks(c: CompetitorCtx): Promise<Discover
 }
 
 async function xLookup(c: CompetitorCtx, opts: ScrapePlatformOptions = {}): Promise<RawReview[]> {
-  const base = (process.env["X_LOOKUP_BASE_URL"]?.trim() || "https://x-lookup.mynameistito.com")
-    .replace(/\/+$/, "");
+  const base = (
+    process.env["X_LOOKUP_BASE_URL"]?.trim() || "https://x-lookup.mynameistito.com"
+  ).replace(/\/+$/, "");
   const query = c.name.trim();
   if (!query) return [];
-  const requestQuery = opts.apply48HourFilter === false
-    ? query
-    : `${query} since:${new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10)}`;
+  const requestQuery =
+    opts.apply48HourFilter === false
+      ? query
+      : `${query} since:${new Date(Date.now() - 48 * 3_600_000).toISOString().slice(0, 10)}`;
   const url = new URL(`${base}/search`);
   url.searchParams.set("q", requestQuery);
   url.searchParams.set("feed", "latest");
@@ -1027,18 +1053,24 @@ async function xLookup(c: CompetitorCtx, opts: ScrapePlatformOptions = {}): Prom
     if (!post) return [];
     const author = asRecord(post["author"]);
     const handle = asString(author?.["screen_name"]).replace(/^@/, "");
-    const sourceUrl = asString(post["url"]) ||
-      (handle && asString(post["id"]) ? `https://x.com/${handle}/status/${asString(post["id"])}` : "");
+    const sourceUrl =
+      asString(post["url"]) ||
+      (handle && asString(post["id"])
+        ? `https://x.com/${handle}/status/${asString(post["id"])}`
+        : "");
     const text = asString(post["text"]);
     if (!sourceUrl || !text) return [];
-    return [{
-      platform: "x",
-      reviewer_name: handle ? `@${handle}` : asString(author?.["name"]) || null,
-      reviewer_profile_url: asString(author?.["url"]) || (handle ? `https://x.com/${handle}` : null),
-      source_url: sourceUrl,
-      text: text.slice(0, 5000),
-      published_at: normalizePublishedDate(post["created_at"] ?? post["created_timestamp"]),
-    }];
+    return [
+      {
+        platform: "x",
+        reviewer_name: handle ? `@${handle}` : asString(author?.["name"]) || null,
+        reviewer_profile_url:
+          asString(author?.["url"]) || (handle ? `https://x.com/${handle}` : null),
+        source_url: sourceUrl,
+        text: text.slice(0, 5000),
+        published_at: normalizePublishedDate(post["created_at"] ?? post["created_timestamp"]),
+      },
+    ];
   });
 }
 
@@ -1050,28 +1082,35 @@ async function scrapeSocialFetchReddit(c: CompetitorCtx): Promise<RawReview[]> {
 
 async function instagram(c: CompetitorCtx): Promise<RawReview[]> {
   const { instagramHandles } = await discoverCompetitorSocialLinks(c);
-  if (!instagramHandles.length) throw new NoMatch("no public Instagram handle linked from competitor website");
-  const results = await Promise.allSettled(instagramHandles.map(async (handle) => {
-    const data = await runSocialFetch(["ig", "user", handle, "--limit", "40"]);
-    return mapSocialFetchInstagramPosts(data, handle);
-  }));
-  const reviews = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  if (!instagramHandles.length)
+    throw new NoMatch("no public Instagram handle linked from competitor website");
+  const results = await Promise.allSettled(
+    instagramHandles.map(async (handle) => {
+      const data = await runSocialFetch(["ig", "user", handle, "--limit", "40"]);
+      return mapSocialFetchInstagramPosts(data, handle);
+    }),
+  );
+  const reviews = results.flatMap((result) => (result.status === "fulfilled" ? result.value : []));
   if (!reviews.length) throw new NoMatch("no public Instagram posts available");
   return reviews;
 }
 
 async function facebook(c: CompetitorCtx): Promise<RawReview[]> {
   const { facebookPostUrls } = await discoverCompetitorSocialLinks(c);
-  if (!facebookPostUrls.length) throw new NoMatch("no public Facebook post URLs linked from competitor website");
-  const results = await Promise.allSettled(facebookPostUrls.map(async (url) => {
-    const parsed = new URL(url);
-    const action = /\/(videos|watch|reel|reels)\//i.test(parsed.pathname) || parsed.hostname === "fb.watch"
-      ? "video"
-      : "post";
-    const data = await runSocialFetch(["fb", action, url]);
-    return mapSocialFetchFacebookPost(data);
-  }));
-  const reviews = results.flatMap((result) => result.status === "fulfilled" ? result.value : []);
+  if (!facebookPostUrls.length)
+    throw new NoMatch("no public Facebook post URLs linked from competitor website");
+  const results = await Promise.allSettled(
+    facebookPostUrls.map(async (url) => {
+      const parsed = new URL(url);
+      const action =
+        /\/(videos|watch|reel|reels)\//i.test(parsed.pathname) || parsed.hostname === "fb.watch"
+          ? "video"
+          : "post";
+      const data = await runSocialFetch(["fb", action, url]);
+      return mapSocialFetchFacebookPost(data);
+    }),
+  );
+  const reviews = results.flatMap((result) => (result.status === "fulfilled" ? result.value : []));
   if (!reviews.length) throw new NoMatch("no public Facebook post metadata available");
   return reviews;
 }
@@ -1655,17 +1694,25 @@ export async function filterAndRecoverJirosearchReviews(
 }
 
 async function linkedin(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
-  const { searchAndScrapeLinkedInPosts } = await import("./public-social-scrapers.server");
-  const posts = await searchAndScrapeLinkedInPosts(c, {
-    apply24HourFilter: opts.apply48HourFilter ?? true,
-    limit: 12,
-  });
+  const { LinkedInScraperError, searchAndScrapeLinkedInPosts } =
+    await import("./public-social-scrapers.server");
+  let posts;
+  try {
+    posts = await searchAndScrapeLinkedInPosts(c, {
+      apply24HourFilter: opts.apply48HourFilter ?? true,
+      limit: 12,
+    });
+  } catch (error) {
+    if (
+      error instanceof LinkedInScraperError &&
+      (error.kind === "zero_results" || error.kind === "rejected_by_validation")
+    ) {
+      throw new NoMatch(error.message);
+    }
+    throw error;
+  }
   if (!posts.length) {
-    throw new NoMatch(
-      opts.apply48HourFilter === false
-        ? "LinkedIn Google Search returned no readable public post previews"
-        : "LinkedIn Google Search returned no readable post previews with a verifiable publication time in the last 24 hours",
-    );
+    throw new NoMatch("Zero LinkedIn results returned for competitor.");
   }
 
   return posts.map((post): RawReview => ({
@@ -1977,7 +2024,12 @@ export async function scrapePlatform(
 ): Promise<SourceResult> {
   const apply48HourFilter = opts.apply48HourFilter ?? true;
   try {
-    if (JIROSEARCH_PLATFORM_SET.has(platform) && platform !== "threads" && platform !== "linkedin" && !hasJirosearchConfig()) {
+    if (
+      JIROSEARCH_PLATFORM_SET.has(platform) &&
+      platform !== "threads" &&
+      platform !== "linkedin" &&
+      !hasJirosearchConfig()
+    ) {
       return { status: "no_key", reviews: [] };
     }
     const all = await SOURCES[platform](c, opts);
