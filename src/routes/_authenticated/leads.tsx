@@ -168,6 +168,13 @@ interface FindContactUpdatePayload {
   reviewer_name?: string | null | undefined;
   reviewer_profile_url?: string | null | undefined;
   lead_type?: string | undefined;
+  email_enrichment?: {
+    source: string;
+    evidence: string;
+    tier: string;
+    confidence_pct: number;
+    reasons: string;
+  } | undefined;
 }
 
 function HowToContact({
@@ -181,7 +188,8 @@ function HowToContact({
 }) {
   const refind = useServerFn(reenrichContacts);
   const [busy, setBusy] = useState(false);
-  const [osintBusy, setOsintBusy] = useState(false);
+  const [emailBusy, setEmailBusy] = useState(false);
+  const [profileBusy, setProfileBusy] = useState(false);
 
   async function run() {
     setBusy(true);
@@ -196,25 +204,24 @@ function HowToContact({
     }
   }
 
-  async function runOsintSearch() {
-    setOsintBusy(true);
+  async function callLeadDiscovery(action: "email" | "profile") {
+    if (action === "email") setEmailBusy(true);
+    else setProfileBusy(true);
     try {
       const { data } = await supabase.auth.getSession();
       const token = data.session?.access_token;
-      if (!token) {
-        toast.error("Session expired — please sign in again.");
-        return;
-      }
+      if (!token) throw new Error("Session expired — please sign in again.");
 
       const res = await fetch(`/api/leads/${lead.id}/find-contact`, {
         method: "POST",
         headers: {
           Accept: "application/json",
+          "Content-Type": "application/json",
           Authorization: `Bearer ${token}`,
         },
+        body: JSON.stringify({ action }),
       });
-
-      const payload = (await res.json()) as {
+      const payload = await res.json() as {
         ok?: boolean;
         osint_checked?: boolean;
         emails?: string[];
@@ -223,54 +230,43 @@ function HowToContact({
         osint_contacts?: unknown;
         email?: string | null;
         email_status?: string | null;
+        email_enrichment?: FindContactUpdatePayload["email_enrichment"];
         linkedin_url?: string | null;
-        job_title?: string | null;
-        company?: string | null;
-        company_domain?: string | null;
-        reviewer_name?: string | null;
         reviewer_profile_url?: string | null;
-        lead_type?: string;
         error?: string;
       };
+      if (!res.ok || !payload.ok) throw new Error(payload.error || "Discovery failed");
 
-      if (!res.ok || !payload.ok) {
-        throw new Error(payload.error || "Contact search failed");
-      }
-
-      const structured = normalizeStoredOsintContacts(
-        payload.osint_contacts ?? {
+      if (action === "email") {
+        const structured = normalizeStoredOsintContacts(payload.osint_contacts ?? lead.osint_contacts);
+        onOsintUpdated({
+          osint_contacts: structured,
+          osint_checked: Boolean(payload.osint_checked ?? lead.osint_checked),
+          email: payload.email,
+          email_status: payload.email_status,
+          email_enrichment: payload.email_enrichment,
+        });
+        toast.success(payload.email ? "Email found and saved" : "No email found; both free sources returned no usable address.");
+      } else {
+        const structured = normalizeStoredOsintContacts(payload.osint_contacts ?? {
           emails: payload.emails ?? [],
           social_profiles: payload.social_profiles ?? {},
           other_contacts: payload.other_contacts ?? [],
-        },
-      );
-      const discoveredNewPrimary =
-        (!lead.email && Boolean(payload.email)) ||
-        (!lead.linkedin_url && Boolean(payload.linkedin_url));
-      const totalFound =
-        structured.emails.length +
-        Object.keys(structured.social_profiles).length +
-        structured.other_contacts.length +
-        (discoveredNewPrimary ? 1 : 0);
-
-      onOsintUpdated({
-        osint_contacts: structured,
-        osint_checked: Boolean(payload.osint_checked ?? true),
-        email: payload.email,
-        email_status: payload.email_status,
-        linkedin_url: payload.linkedin_url,
-        job_title: payload.job_title,
-        company: payload.company,
-        company_domain: payload.company_domain,
-        reviewer_name: payload.reviewer_name,
-        reviewer_profile_url: payload.reviewer_profile_url,
-        lead_type: payload.lead_type,
-      });
-      toast.success(totalFound > 0 ? "Contact search completed" : "No additional contacts found.");
+        });
+        onOsintUpdated({
+          osint_contacts: structured,
+          osint_checked: Boolean(payload.osint_checked ?? true),
+          linkedin_url: payload.linkedin_url,
+          reviewer_profile_url: payload.reviewer_profile_url,
+        });
+        const count = Object.keys(structured.social_profiles).length;
+        toast.success(count ? `Found ${count} public profile(s)` : "No matching public profiles found.");
+      }
     } catch (err) {
-      toast.error(err instanceof Error ? err.message : "Could not run contact search");
+      toast.error(err instanceof Error ? err.message : "Could not run discovery");
     } finally {
-      setOsintBusy(false);
+      setEmailBusy(false);
+      setProfileBusy(false);
     }
   }
 
@@ -304,8 +300,14 @@ function HowToContact({
               {lead.email}
             </a>
             <span className="text-xs text-muted-foreground">
-              {EMAIL_SOURCE[lead.email_status ?? ""] ?? "best guess from common formats"}
+              {EMAIL_SOURCE[lead.email_status ?? ""] ?? (lead.email_status?.startsWith("openleads_") ? lead.email_status.replace("openleads_", "OpenLeads: ") : lead.email_status === "linkook" ? "Found through Linkook; ownership not independently confirmed" : "Email source not recorded")}
             </span>
+            {(() => {
+              const meta = lead.osint_contacts && typeof lead.osint_contacts === "object" && !Array.isArray(lead.osint_contacts)
+                ? (lead.osint_contacts as Record<string, unknown>)["email_enrichment"] as { confidence_pct?: number; tier?: string; evidence?: string } | undefined
+                : undefined;
+              return meta ? <span className="rounded bg-muted px-2 py-0.5 text-xs">{meta.confidence_pct ?? "—"}% confidence · {meta.evidence ?? meta.tier ?? "unverified"}</span> : null;
+            })()}
           </li>
         )}
         {profile && (
@@ -347,22 +349,18 @@ function HowToContact({
       </ul>
 
       <div className="mt-4 border-t pt-4">
-        <Button
-          size="sm"
-          variant="outline"
-          onClick={runOsintSearch}
-          disabled={osintBusy}
-          className="w-full sm:w-auto"
-        >
-          {osintBusy ? <Loader2 className="animate-spin" /> : <Globe />}
-          {osintBusy
-            ? "Searching public web..."
-            : hasAnyOsint || hasPrimaryContact
-              ? "Find Another Contact"
-              : "Find Contact"}
-        </Button>
+        <div className="flex flex-wrap gap-2">
+          <Button size="sm" variant="outline" onClick={() => void callLeadDiscovery("email")} disabled={emailBusy || profileBusy}>
+            {emailBusy ? <Loader2 className="animate-spin" /> : <Mail />}
+            {emailBusy ? "Finding email..." : "Find Email"}
+          </Button>
+          <Button size="sm" variant="outline" onClick={() => void callLeadDiscovery("profile")} disabled={emailBusy || profileBusy}>
+            {profileBusy ? <Loader2 className="animate-spin" /> : <Globe />}
+            {profileBusy ? "Finding profiles..." : "Find Profile"}
+          </Button>
+        </div>
         <p className="mt-1.5 text-xs text-muted-foreground">
-          Automated open-web &amp; B2B contact search across public profiles and company sites.
+          Find Email checks OpenLeads first and uses Linkook only if needed. Find Profile searches public accounts with Maigret.
         </p>
 
         {osintData.emails.length > 0 && (
@@ -916,7 +914,9 @@ function LeadsPage() {
                   onOsintUpdated={(update) => {
                     setOpen({
                       ...open,
-                      osint_contacts: update.osint_contacts,
+                      osint_contacts: update.email_enrichment
+                        ? { ...update.osint_contacts, email_enrichment: update.email_enrichment }
+                        : update.osint_contacts,
                       osint_checked: update.osint_checked,
                       ...(update.email !== undefined ? { email: update.email } : {}),
                       ...(update.email_status !== undefined

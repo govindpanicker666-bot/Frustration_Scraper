@@ -6,6 +6,7 @@ services:
     buildCommand: >
       npm install &&
       python3 -m pip install --break-system-packages --disable-pip-version-check -r scripts/toolzerhub/requirements.txt &&
+      python3 -m pip install --break-system-packages --disable-pip-version-check openleads maigret &&
       PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers" npx playwright install --with-deps chromium &&
       npm run build &&
       node scripts/verify-playwright-runtime.mjs

@@ -17,6 +17,17 @@ export const Route = createFileRoute("/api/leads_/$id_/find-contact")({
             return Response.json({ ok: false, error: "Invalid lead ID" }, { status: 400 });
           }
 
+          const body = await request.json().catch(() => ({})) as { action?: string };
+          if (body.action === "email") {
+            const { runEmailEnrichmentForLead } = await import("@/lib/lead-discovery.server");
+            const result = await runEmailEnrichmentForLead(auth.supabase, parsedId.data);
+            return Response.json({ ok: true, ...result });
+          }
+          if (body.action === "profile") {
+            const { runMaigretProfileSearchForLead } = await import("@/lib/lead-discovery.server");
+            const result = await runMaigretProfileSearchForLead(auth.supabase, parsedId.data);
+            return Response.json({ ok: true, ...result });
+          }
           const { runOsintDiscoveryForLead } = await import("@/lib/osint.server");
           const result = await runOsintDiscoveryForLead(auth.supabase, auth.userId, parsedId.data);
           return Response.json({ ok: true, ...result });

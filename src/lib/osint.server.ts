@@ -152,7 +152,7 @@ async function saveFallbackOsintCache(
   );
 }
 
-async function runLinkookScanner(
+export async function runLinkookScanner(
   handle: string,
   excludeUrls: Array<string | null | undefined>,
 ): Promise<ScannerRunResult> {
