@@ -275,11 +275,6 @@ function HowToContact({
   const osintProfileEntries = (
     Object.entries(osintData.social_profiles) as Array<[B2BSocialPlatform, string]>
   ).filter(([, url]) => Boolean(url));
-  const hasAnyOsint =
-    osintData.emails.length > 0 ||
-    osintProfileEntries.length > 0 ||
-    osintData.other_contacts.length > 0;
-  const hasPrimaryContact = Boolean(lead.email || lead.linkedin_url);
   const osintChecked = Boolean(lead.osint_checked);
 
   return (
