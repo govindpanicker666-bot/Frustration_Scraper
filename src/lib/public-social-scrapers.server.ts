@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
+import { existsSync } from "node:fs";
 import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
 import { linkedinAuthorFromPost } from "./pipeline";
 
@@ -128,6 +129,15 @@ async function getLinkedInGoogleContext(): Promise<BrowserContext> {
   }
 
   if (!linkedInBrowserPromise) {
+    const executablePath = chromium.executablePath();
+    if (!existsSync(executablePath)) {
+      throw new Error(
+        "Chromium executable is missing at " + executablePath +
+          ". Check that Render installed Playwright Chromium into PLAYWRIGHT_BROWSERS_PATH.",
+      );
+    }
+    console.info("[LinkedIn] Chromium executable verified", { executablePath });
+
     linkedInBrowserPromise = chromium
       .launch({
         headless: true,

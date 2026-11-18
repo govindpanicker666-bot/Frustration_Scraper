@@ -3,10 +3,15 @@ services:
     name: frustration-scraper
     env: node
     plan: free
-    buildCommand: npm install && python3 -m pip install --break-system-packages --disable-pip-version-check -r scripts/toolzerhub/requirements.txt && PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install --with-deps --only-shell chromium && npm run build
+    buildCommand: >
+      npm install &&
+      python3 -m pip install --break-system-packages --disable-pip-version-check -r scripts/toolzerhub/requirements.txt &&
+      PLAYWRIGHT_BROWSERS_PATH=/ms-playwright npx playwright install --with-deps --only-shell chromium &&
+      PLAYWRIGHT_BROWSERS_PATH=/ms-playwright node --input-type=module -e "import { chromium } from 'playwright'; import { existsSync } from 'node:fs'; const executable = chromium.executablePath(); if (!existsSync(executable)) throw new Error('Chromium missing at ' + executable); console.log('Verified Chromium at ' + executable);" &&
+      npm run build
     startCommand: node .output/server/index.mjs
     envVars:
       - key: PLAYWRIGHT_BROWSERS_PATH
-        value: "0"
+        value: /ms-playwright
       - key: NITRO_PRESET
         value: render-com
