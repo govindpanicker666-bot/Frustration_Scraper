@@ -198,7 +198,8 @@ export async function runMaigretProfileSearchForLead(db: SupabaseClient<Database
   if (!rawLead) throw new Error("LEAD_NOT_FOUND");
   const lead = rawLead as LeadWithOsint;
   const profileUrl = lead.reviewer_profile_url && lead.reviewer_profile_url !== lead.source_url
-    ? lead.reviewer_profile_url : lead.source_url;
+    ? lead.reviewer_profile_url
+    : guessProfileUrl(lead.source_platform, lead.source_url, lead.reviewer_name) ?? lead.source_url;
   const handle = extractOsintHandle(lead.reviewer_name, profileUrl);
   if (!handle) return { osint_checked: true, osint_contacts: lead.osint_contacts, social_profiles: {}, emails: [], other_contacts: [], reviewer_profile_url: lead.reviewer_profile_url, linkedin_url: lead.linkedin_url };
 
