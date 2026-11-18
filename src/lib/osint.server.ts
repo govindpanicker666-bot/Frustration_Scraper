@@ -47,7 +47,7 @@ interface ScannerRunResult {
   rawTexts: string[];
 }
 
-function guessProfileUrl(platform: string, sourceUrl: string, name: string | null): string | null {
+export function guessProfileUrl(platform: string, sourceUrl: string, name: string | null): string | null {
   const cleanHandle = (name ?? "").trim().replace(/^@+/, "");
   if (platform === "bluesky") {
     const h = sourceUrl.match(/profile\/([^/?#]+)/)?.[1];

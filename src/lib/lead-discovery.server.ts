@@ -12,7 +12,7 @@ import {
   type B2BSocialPlatform,
   type OsintStructuredContacts,
 } from "./pipeline";
-import { runLinkookScanner, validateOsintUrls } from "./osint.server";
+import { guessProfileUrl, runLinkookScanner, validateOsintUrls } from "./osint.server";
 
 const execFileAsync = promisify(execFile);
 const EMAIL_RE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
@@ -96,7 +96,8 @@ export async function runEmailEnrichmentForLead(db: SupabaseClient<Database>, le
   let selected = openLeads;
   if (!selected) {
     const profileUrl = lead.reviewer_profile_url && lead.reviewer_profile_url !== lead.source_url
-      ? lead.reviewer_profile_url : lead.source_url;
+      ? lead.reviewer_profile_url
+      : guessProfileUrl(lead.source_platform, lead.source_url, lead.reviewer_name) ?? lead.source_url;
     const handle = extractOsintHandle(lead.reviewer_name, profileUrl);
     if (handle) {
       const linkook = await runLinkookScanner(handle, [lead.source_url, lead.reviewer_profile_url]);
@@ -161,7 +162,7 @@ async function runMaigret(handle: string): Promise<string[]> {
   try {
     let stdout = "";
     try {
-      const result = await execFileAsync("maigret", [handle, "--json", "simple", "--no-progressbar", "-o", dir], {
+      const result = await execFileAsync("maigret", [handle, "--json", "simple", "--no-progressbar", "--folderoutput", dir], {
         cwd: dir, env: process.env, timeout: 120_000, maxBuffer: 16 * 1024 * 1024,
       });
       stdout = result.stdout ?? "";
