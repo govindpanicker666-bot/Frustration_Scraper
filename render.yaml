@@ -6,12 +6,12 @@ services:
     buildCommand: >
       npm install &&
       python3 -m pip install --break-system-packages --disable-pip-version-check -r scripts/toolzerhub/requirements.txt &&
-      PLAYWRIGHT_BROWSERS_PATH=/ms-playwright npx playwright install --with-deps chromium &&
-      PLAYWRIGHT_BROWSERS_PATH=/ms-playwright node --input-type=module -e "import { chromium } from 'playwright'; const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--no-sandbox'] }); console.log('Verified full headless Chromium launch: ' + chromium.executablePath()); await browser.close();" &&
+      PLAYWRIGHT_BROWSERS_PATH=0 npx playwright install --with-deps chromium &&
+      PLAYWRIGHT_BROWSERS_PATH=0 node --input-type=module -e "import { chromium } from 'playwright'; const executable = chromium.executablePath(); const browser = await chromium.launch({ headless: true, channel: 'chromium', args: ['--no-sandbox'] }); console.log('Verified project-local Chromium launch: ' + executable); await browser.close();" &&
       npm run build
     startCommand: node .output/server/index.mjs
     envVars:
       - key: PLAYWRIGHT_BROWSERS_PATH
-        value: /ms-playwright
+        value: "0"
       - key: NITRO_PRESET
         value: render-com
