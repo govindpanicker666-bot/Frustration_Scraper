@@ -2,7 +2,7 @@ import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
 import { existsSync } from "node:fs";
-import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import type { Browser, BrowserContext, Page } from "playwright";
 import { linkedinAuthorFromPost } from "./pipeline";
 
 const execFileAsync = promisify(execFile);
@@ -121,7 +121,18 @@ let linkedInBrowser: Browser | null = null;
 let linkedInBrowserPromise: Promise<Browser> | null = null;
 let linkedInGoogleContextPromise: Promise<BrowserContext> | null = null;
 
+let linkedInChromium: typeof import("playwright").chromium | null = null;
+
 async function getLinkedInGoogleContext(): Promise<BrowserContext> {
+  // Pin both browser installation and launch to Playwright's project-local .local-browsers
+  // directory. Do this before importing Playwright so dashboard env overrides cannot
+  // silently redirect runtime to Render's default ~/.cache/ms-playwright directory.
+  process.env["PLAYWRIGHT_BROWSERS_PATH"] = "0";
+  if (!linkedInChromium) {
+    linkedInChromium = (await import("playwright")).chromium;
+  }
+  const chromium = linkedInChromium;
+
   if (linkedInBrowser && !linkedInBrowser.isConnected()) {
     linkedInBrowser = null;
     linkedInBrowserPromise = null;
@@ -133,7 +144,7 @@ async function getLinkedInGoogleContext(): Promise<BrowserContext> {
     if (!existsSync(executablePath)) {
       throw new Error(
         "Chromium executable is missing at " + executablePath +
-          ". Check that Render installed Playwright Chromium into PLAYWRIGHT_BROWSERS_PATH.",
+          ". Playwright is pinned to node_modules/playwright-core/.local-browsers; verify the Render build installed Chromium there.",
       );
     }
     console.info("[LinkedIn] Chromium executable verified", { executablePath });
