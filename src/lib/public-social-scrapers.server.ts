@@ -141,6 +141,7 @@ async function getLinkedInGoogleContext(): Promise<BrowserContext> {
     linkedInBrowserPromise = chromium
       .launch({
         headless: true,
+        channel: "chromium",
         args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
       })
       .then((browser) => {
