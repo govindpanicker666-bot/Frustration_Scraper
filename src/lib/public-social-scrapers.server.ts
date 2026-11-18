@@ -1,7 +1,8 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import { join } from "node:path";
-import { linkedinAuthorFromPost, parseBingRss, parseDdgHtml, type SearchResult } from "./pipeline";
+import { chromium, type Browser, type BrowserContext, type Page } from "playwright";
+import { linkedinAuthorFromPost } from "./pipeline";
 
 const execFileAsync = promisify(execFile);
 const SCRAPER_DIR = join(process.cwd(), "scripts", "toolzerhub");
@@ -13,9 +14,12 @@ export interface LinkedInPublicPost {
 export interface ThreadsPublicPost {
   url: string; code: string; text: string; createdAt: string; username: string | null; fullName: string | null;
 }
-interface LinkedInSearchHit extends SearchResult { publishedAt?: string }
-type LinkedInSearchProvider = "Google" | "DuckDuckGo" | "Bing";
-type LinkedInProviderResultCounts = Record<LinkedInSearchProvider, number>;
+interface LinkedInSearchHit {
+  url: string;
+  title: string;
+  snippet: string;
+  publishedAt?: string;
+}
 
 async function runPython(script: string, args: string[], timeoutMs: number): Promise<string> {
   try {
@@ -107,24 +111,194 @@ function activityDate(url: string): string {
     return Number.isFinite(milliseconds) && !Number.isNaN(date.getTime()) ? date.toISOString() : "";
   } catch { return ""; }
 }
-const LINKEDIN_MAX_AGE_MS = 48 * 60 * 60 * 1000;
+const LINKEDIN_MAX_AGE_MS = 24 * 60 * 60 * 1000;
+const LINKEDIN_SEARCH_UA =
+  "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36";
 
-const LINKEDIN_SEARCH_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36";
+// A single headless Chromium instance and cookie-preserving context serve all competitor searches.
+let linkedInBrowser: Browser | null = null;
+let linkedInBrowserPromise: Promise<Browser> | null = null;
+let linkedInGoogleContextPromise: Promise<BrowserContext> | null = null;
+
+async function getLinkedInGoogleContext(): Promise<BrowserContext> {
+  if (linkedInBrowser && !linkedInBrowser.isConnected()) {
+    linkedInBrowser = null;
+    linkedInBrowserPromise = null;
+    linkedInGoogleContextPromise = null;
+  }
+
+  if (!linkedInBrowserPromise) {
+    linkedInBrowserPromise = chromium
+      .launch({
+        headless: true,
+        args: ["--no-sandbox", "--disable-dev-shm-usage", "--disable-gpu"],
+      })
+      .then((browser) => {
+        linkedInBrowser = browser;
+        return browser;
+      })
+      .catch((error: unknown) => {
+        linkedInBrowserPromise = null;
+        throw new Error(
+          "Could not launch headless Chromium for LinkedIn Google search: " +
+            (error instanceof Error ? error.message : String(error)),
+        );
+      });
+  }
+
+  const browser = await linkedInBrowserPromise;
+  if (!linkedInGoogleContextPromise) {
+    linkedInGoogleContextPromise = browser
+      .newContext({
+        locale: "en-US",
+        timezoneId: "UTC",
+        viewport: { width: 1440, height: 1000 },
+        userAgent: LINKEDIN_SEARCH_UA,
+      })
+      .catch((error: unknown) => {
+        linkedInGoogleContextPromise = null;
+        throw error;
+      });
+  }
+  return linkedInGoogleContextPromise;
+}
+
+async function clickVisibleGoogleControl(page: Page, label: string): Promise<void> {
+  const candidates = [
+    page.getByRole("button", { name: label, exact: true }),
+    page.getByRole("menuitem", { name: label, exact: true }),
+    page.getByText(label, { exact: true }),
+  ];
+
+  for (const locator of candidates) {
+    const count = await locator.count().catch(() => 0);
+    for (let index = count - 1; index >= 0; index--) {
+      const candidate = locator.nth(index);
+      if (!(await candidate.isVisible().catch(() => false))) continue;
+      await candidate.click({ timeout: 7_000 });
+      return;
+    }
+  }
+  throw new Error('Google Search did not expose the "' + label + '" control.');
+}
+
+async function handleGoogleConsent(page: Page): Promise<void> {
+  for (const label of ["Reject all", "Accept all", "I agree"]) {
+    const button = page.getByRole("button", { name: label, exact: true }).last();
+    if (await button.isVisible().catch(() => false)) {
+      await button.click({ timeout: 5_000 }).catch(() => undefined);
+      await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+      return;
+    }
+  }
+}
+
+function isGoogleSearchChallenge(text: string): boolean {
+  return /our systems have detected unusual traffic|unusual traffic from your computer network|sorry\/index|not a robot|automated queries/i.test(
+    text,
+  );
+}
+
+async function applyGooglePast24HoursFilter(page: Page): Promise<void> {
+  // Apply the filter through Google's visible controls; do not add date operators to the search text.
+  await clickVisibleGoogleControl(page, "Tools");
+  await page.waitForTimeout(250);
+  await clickVisibleGoogleControl(page, "Any time");
+  await page.waitForTimeout(150);
+  await clickVisibleGoogleControl(page, "Past 24 hours");
+
+  await page.waitForURL(
+    (url) => (url.searchParams.get("tbs") ?? "").includes("qdr:d"),
+    { timeout: 12_000 },
+  ).catch(() => undefined);
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+  await page.waitForTimeout(500);
+
+  const appliedFilter = (new URL(page.url()).searchParams.get("tbs") ?? "").includes("qdr:d");
+  if (!appliedFilter) {
+    throw new Error(
+      'Clicked Google Tools > Any time > Past 24 hours, but Google did not confirm the Past 24 hours filter.',
+    );
+  }
+}
+
+async function searchGoogleForLinkedInPosts(
+  page: Page,
+  competitorName: string,
+  apply24HourFilter: boolean,
+): Promise<LinkedInSearchHit[]> {
+  const homeUrl = new URL("https://www.google.com/");
+  homeUrl.searchParams.set("hl", "en");
+  await page.goto(homeUrl.toString(), { waitUntil: "domcontentloaded", timeout: 30_000 });
+  await handleGoogleConsent(page);
+
+  const searchBox = page.locator('textarea[name="q"], input[name="q"]').first();
+  await searchBox.waitFor({ state: "visible", timeout: 12_000 });
+  await searchBox.fill(competitorName);
+  await searchBox.press("Enter");
+  await page.waitForURL(
+    (url) => url.hostname.includes("google") && url.pathname.includes("/search"),
+    { timeout: 18_000 },
+  );
+  await page.waitForLoadState("domcontentloaded").catch(() => undefined);
+  await page.waitForTimeout(500);
+
+  const initialBody = await page.locator("body").innerText().catch(() => "");
+  if (isGoogleSearchChallenge(initialBody)) {
+    throw new Error("Google Search returned an automated-traffic or verification challenge.");
+  }
+
+  if (apply24HourFilter) {
+    await applyGooglePast24HoursFilter(page);
+  }
+
+  const resultCards = await page.locator("a:has(h3)").evaluateAll((anchors) =>
+    anchors.map((node) => {
+      const anchor = node as HTMLAnchorElement;
+      const heading = anchor.querySelector("h3");
+      const card = (
+        anchor.closest("div.MjjYud") ??
+        anchor.closest("div[data-hveid]") ??
+        anchor.parentElement?.parentElement ??
+        anchor.parentElement
+      ) as HTMLElement | null;
+      return {
+        url: anchor.href,
+        title: heading?.textContent?.trim() ?? "",
+        snippet: card?.innerText?.replace(/\s+/g, " ").trim() ?? "",
+      };
+    }),
+  ) as LinkedInSearchHit[];
+
+  return resultCards
+    .map((hit) => ({
+      ...hit,
+      url: unwrapSearchResultUrl(hit.url),
+      publishedAt: parseLinkedInSearchDate(hit.snippet),
+    }))
+    .filter((hit) => Boolean(hit.url && hit.title));
+}
 
 export function parseLinkedInSearchDate(value: string, now = Date.now()): string {
   const text = value.replace(/\s+/g, " ").trim();
   if (!text) return "";
+
   const relative = text.match(
     /(?:^|[|·•–—]\s*|\b(?:posted|published|created|updated)\s*(?:on|at|:)?\s*)(just now|moments ago|today|yesterday|\d{1,4}\s*(?:seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|mo|years?|y)(?:\s*ago)?)(?=$|[\s|·•–—])/i,
   );
-  if (relative && relative[1]) {
+  if (relative?.[1]) {
     const label = relative[1].toLowerCase();
-    if (label === "just now" || label === "moments ago" || label === "today") return new Date(now).toISOString();
-    if (label === "yesterday") return new Date(now - 36 * 60 * 60 * 1000).toISOString();
-    const amountMatch = label.match(/(\d{1,4})\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|mo|years?|y)/i);
+    if (label === "just now" || label === "moments ago" || label === "today") {
+      return new Date(now).toISOString();
+    }
+    if (label === "yesterday") return new Date(now - 24 * 60 * 60 * 1000).toISOString();
+
+    const amountMatch = label.match(
+      /(\d{1,4})\s*(seconds?|secs?|s|minutes?|mins?|m|hours?|hrs?|h|days?|d|weeks?|w|months?|mo|years?|y)/i,
+    );
     if (amountMatch) {
       const amount = Number(amountMatch[1]);
-      const unit = amountMatch[2].toLowerCase();
+      const unit = amountMatch[2]!.toLowerCase();
       const unitMs = /^(s|sec|secs|second|seconds)$/.test(unit) ? 1000
         : /^(m|min|mins|minute|minutes)$/.test(unit) ? 60 * 1000
         : /^(h|hr|hrs|hour|hours)$/.test(unit) ? 60 * 60 * 1000
@@ -132,140 +306,26 @@ export function parseLinkedInSearchDate(value: string, now = Date.now()): string
         : /^(w|week|weeks)$/.test(unit) ? 7 * 24 * 60 * 60 * 1000
         : /^(mo|month|months)$/.test(unit) ? 30 * 24 * 60 * 60 * 1000
         : 365 * 24 * 60 * 60 * 1000;
-      const conservativeOffset = /^(d|day|days)$/.test(unit) ? 12 * 60 * 60 * 1000 : 0;
-      return new Date(now - amount * unitMs - conservativeOffset).toISOString();
+      return new Date(now - amount * unitMs).toISOString();
     }
   }
+
   const absolute = text.match(
     /(?:^|[|·•–—]\s*|\b(?:posted|published|created|updated)\s*(?:on|at|:)?\s*)(20\d{2}-\d{1,2}-\d{1,2}(?:[T ][0-9:.Z+-]+)?|(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)\s+\d{1,2}(?:,?\s+20\d{2})?|\d{1,2}\s+(?:Jan(?:uary)?|Feb(?:ruary)?|Mar(?:ch)?|Apr(?:il)?|May|Jun(?:e)?|Jul(?:y)?|Aug(?:ust)?|Sep(?:tember)?|Oct(?:ober)?|Nov(?:ember)?|Dec(?:ember)?)(?:\s+20\d{2})?)(?=$|[\s|·•–—])/i,
   );
-  if (!absolute || !absolute[1]) return "";
+  if (!absolute?.[1]) return "";
   const dateText = absolute[1];
-  const normalizedDate = /\b20\d{2}\b/.test(dateText) ? dateText : dateText + ", " + new Date(now).getUTCFullYear();
+  const normalizedDate = /\b20\d{2}\b/.test(dateText)
+    ? dateText
+    : dateText + ", " + new Date(now).getUTCFullYear();
   const parsed = new Date(normalizedDate);
   return Number.isNaN(parsed.getTime()) ? "" : parsed.toISOString();
 }
 
-export function isLinkedInPostWithin48Hours(publishedAt: string, now: number): boolean {
+export function isLinkedInPostWithin24Hours(publishedAt: string, now: number): boolean {
   const timestamp = Date.parse(publishedAt);
   const age = now - timestamp;
-  return Number.isFinite(timestamp) && age >= -5 * 60 * 1000 && age <= 48 * 60 * 60 * 1000;
-}
-
-function stripSearchMarkup(value: string): string {
-  return decodeSearchHtml(value.replace(/<[^>]*>/g, " ")).replace(/\s+/g, " ").trim();
-}
-
-export function parseGoogleLinkedInResults(html: string): LinkedInSearchHit[] {
-  const results: LinkedInSearchHit[] = [];
-  const blocks = html.split(/<div\b[^>]*class=["'][^"']*\bMjjYud\b[^"']*["'][^>]*>/i).slice(1);
-  const candidates = blocks.length ? blocks : [html];
-
-  for (const block of candidates) {
-    const anchor = block.match(
-      /<a\b[^>]*href=(["'])(.*?)\1[^>]*>[\s\S]*?<h3\b[^>]*>([\s\S]*?)<\/h3>[\s\S]*?<\/a>/i,
-    );
-    if (!anchor?.[2] || !anchor[3]) continue;
-
-    const snippetMatch = block.match(
-      /<(?:div|span)\b[^>]*class=(["'])[^"']*(?:VwiC3b|IsZvec|aCOpRe|s3v9rd|yXK7lf)[^"']*\1[^>]*>([\s\S]*?)<\/(?:div|span)>/i,
-    );
-    const title = stripSearchMarkup(anchor[3]);
-    const snippet = snippetMatch?.[2] ? stripSearchMarkup(snippetMatch[2]) : "";
-    const cardText = stripSearchMarkup(block);
-    const publishedAt = parseLinkedInSearchDate(cardText);
-
-    results.push({
-      url: decodeSearchHtml(anchor[2]),
-      title,
-      snippet,
-      ...(publishedAt ? { publishedAt } : {}),
-    });
-  }
-  return results;
-}
-
-function dateForGoogleSearch(value: string): string {
-  const [year, month, day] = value.split("-");
-  return month + "/" + day + "/" + year;
-}
-
-async function searchLinkedInIndex(
-  query: string,
-  recent: boolean,
-  startDate: string,
-  endDate: string,
-): Promise<{
-  results: LinkedInSearchHit[];
-  errors: string[];
-  successfulProviders: LinkedInSearchProvider[];
-  providerResultCounts: LinkedInProviderResultCounts;
-}> {
-  const headers = {
-    "User-Agent": LINKEDIN_SEARCH_UA,
-    "Accept-Language": "en-US,en;q=0.9",
-  };
-
-  const googleUrl = new URL("https://www.google.com/search");
-  googleUrl.searchParams.set("q", query);
-  googleUrl.searchParams.set("num", "20");
-  if (recent) {
-    googleUrl.searchParams.set(
-      "tbs",
-      "cdr:1,cd_min:" + dateForGoogleSearch(startDate) + ",cd_max:" + dateForGoogleSearch(endDate),
-    );
-  }
-
-  const ddgUrl = new URL("https://html.duckduckgo.com/html/");
-  ddgUrl.searchParams.set("q", query);
-  if (recent) ddgUrl.searchParams.set("df", "w");
-
-  const bingUrl = new URL("https://www.bing.com/search");
-  bingUrl.searchParams.set("format", "rss");
-  bingUrl.searchParams.set("q", query);
-  if (recent) bingUrl.searchParams.set("filters", 'ex1:"ez2"');
-
-  const attempts = await Promise.allSettled([
-    fetch(googleUrl, {headers, signal:AbortSignal.timeout(12_000)}).then(async response => {
-      if (!response.ok) throw new Error("Google HTTP " + response.status);
-      const html = await response.text();
-      if (/unusual traffic|sorry\/index|our systems have detected/i.test(html)) {
-        throw new Error("Google returned an automated-traffic challenge");
-      }
-      return parseGoogleLinkedInResults(html);
-    }),
-    fetch(ddgUrl, {headers, signal:AbortSignal.timeout(9_000)}).then(async response => {
-      if (!response.ok) throw new Error("DuckDuckGo HTTP " + response.status);
-      return parseDdgHtml(await response.text());
-    }),
-    fetch(bingUrl, {headers, signal:AbortSignal.timeout(9_000)}).then(async response => {
-      if (!response.ok) throw new Error("Bing HTTP " + response.status);
-      return parseBingRss(await response.text());
-    }),
-  ]);
-
-  const results: LinkedInSearchHit[] = [];
-  const errors: string[] = [];
-  const successfulProviders: LinkedInSearchProvider[] = [];
-  const providerResultCounts: LinkedInProviderResultCounts = {
-    Google: 0,
-    "DuckDuckGo": 0,
-    Bing: 0,
-  };
-  const providerNames: LinkedInSearchProvider[] = ["Google", "DuckDuckGo", "Bing"];
-  attempts.forEach((attempt, index) => {
-    const providerName = providerNames[index]!;
-    if (attempt.status === "fulfilled") {
-      successfulProviders.push(providerName);
-      providerResultCounts[providerName] = attempt.value.length;
-      results.push(...attempt.value);
-    } else {
-      const reason = attempt.reason instanceof Error ? attempt.reason.message : String(attempt.reason);
-      errors.push(providerName + ": " + reason);
-    }
-  });
-
-  return {results, errors, successfulProviders, providerResultCounts};
+  return Number.isFinite(timestamp) && age >= -5 * 60 * 1000 && age <= LINKEDIN_MAX_AGE_MS;
 }
 
 export function normalizeLinkedInScrapedPosts(payload: unknown): LinkedInPublicPost[] {
@@ -329,107 +389,88 @@ export async function scrapeLinkedInPostUrls(urls: string[]): Promise<LinkedInPu
 }
 export async function searchAndScrapeLinkedInPosts(
   competitor: { name: string; domain: string | null },
-  options: { apply48HourFilter?: boolean; limit?: number } = {},
+  options: { apply24HourFilter?: boolean; limit?: number } = {},
 ): Promise<LinkedInPublicPost[]> {
-  const name = competitor.name.replace(/["']/g, "").replace(/\s+/g, " ").trim();
+  const name = competitor.name.trim();
   if (!name) return [];
-  const recent = options.apply48HourFilter ?? true;
-  const limit = Math.max(1, Math.min(15, Math.floor(options.limit ?? 12)));
-  const now = Date.now();
-  const startDate = new Date(now - LINKEDIN_MAX_AGE_MS).toISOString().slice(0, 10);
-  const endDate = new Date(now).toISOString().slice(0, 10);
-  const tomorrow = new Date(Date.parse(endDate + "T00:00:00.000Z") + 24 * 60 * 60 * 1000).toISOString().slice(0, 10);
-  const dateClauses = recent ? " after:" + startDate + " before:" + tomorrow : "";
-  const queries = [
-    "site:linkedin.com/posts " + name + dateClauses,
-    "site:linkedin.com/feed/update " + name + dateClauses,
-  ];
-  const batches = await Promise.all(queries.map(query => searchLinkedInIndex(query, recent, startDate, endDate)));
-  const successfulProviders = Array.from(new Set(batches.flatMap((batch) => batch.successfulProviders)));
-  const providerResultCounts: LinkedInProviderResultCounts = {
-    Google: batches.reduce((total, batch) => total + batch.providerResultCounts.Google, 0),
-    "DuckDuckGo": batches.reduce((total, batch) => total + batch.providerResultCounts["DuckDuckGo"], 0),
-    Bing: batches.reduce((total, batch) => total + batch.providerResultCounts.Bing, 0),
-  };
-  const successfulSearchRequests = batches.reduce((total, batch) => total + batch.successfulProviders.length, 0);
-  const providerErrors = batches.flatMap(batch => batch.errors);
-  if (successfulSearchRequests === 0) {
-    throw new Error("LinkedIn search providers failed: " + (providerErrors.join("; ") || "no provider response"));
-  }
 
-  const hitsByUrl = new Map<string, LinkedInSearchHit>();
-  for (const batch of batches) {
-    for (const hit of batch.results) {
+  const apply24HourFilter = options.apply24HourFilter ?? true;
+  const limit = Math.max(1, Math.min(15, Math.floor(options.limit ?? 12)));
+  const context = await getLinkedInGoogleContext();
+  const page = await context.newPage();
+  page.setDefaultTimeout(12_000);
+
+  try {
+    const hits = await searchGoogleForLinkedInPosts(page, name, apply24HourFilter);
+    const hitsByUrl = new Map<string, LinkedInSearchHit>();
+    for (const hit of hits) {
       const url = normalizeLinkedInPostUrl(hit.url);
       if (!url) continue;
       const previous = hitsByUrl.get(url);
-      if (!previous) {
+      if (!previous || hit.snippet.length > previous.snippet.length) {
         hitsByUrl.set(url, {...hit, url});
-      } else {
-        const betterText = hit.snippet.length > previous.snippet.length ? hit : previous;
-        const publishedAt = betterText.publishedAt || previous.publishedAt || hit.publishedAt;
-        hitsByUrl.set(url, {
-          ...betterText,
-          url,
-          ...(publishedAt ? { publishedAt } : {}),
-        });
+      } else if (!previous.publishedAt && hit.publishedAt) {
+        hitsByUrl.set(url, {...previous, publishedAt: hit.publishedAt});
       }
     }
-  }
 
-  const posts: LinkedInPublicPost[] = [];
-  let undated = 0;
-  let outsideWindow = 0;
-  let unreadablePreview = 0;
-  for (const [url, hit] of hitsByUrl) {
-    const title = hit.title.replace(/\s*(?:\||[-–—])\s*LinkedIn\s*$/i, "").trim();
-    const snippet = hit.snippet.trim();
-    const body = [title, snippet].filter(Boolean).join("\n").trim();
-    if (body.length < 40) {
-      unreadablePreview++;
-      continue;
+    const now = Date.now();
+    const posts: LinkedInPublicPost[] = [];
+    let undated = 0;
+    let outside24Hours = 0;
+    let unreadablePreview = 0;
+
+    for (const [url, hit] of hitsByUrl) {
+      const body = (hit.snippet || hit.title).replace(/\s+/g, " ").trim();
+      if (body.length < 30) {
+        unreadablePreview++;
+        continue;
+      }
+
+      const publishedAt = parseLinkedInSearchDate(body, now) || hit.publishedAt || activityDate(url);
+      if (apply24HourFilter && !publishedAt) {
+        undated++;
+        continue;
+      }
+      if (apply24HourFilter && !isLinkedInPostWithin24Hours(publishedAt, now)) {
+        outside24Hours++;
+        continue;
+      }
+
+      const inferred = linkedinAuthorFromPost(url);
+      const authorFromTitle = hit.title.match(/^(.{2,80}?)\s+on LinkedIn\s*:/i);
+      posts.push({
+        url,
+        text: body.slice(0, 5_000),
+        publishedAt,
+        authorName: authorFromTitle?.[1]?.trim() || inferred?.name || null,
+        authorUrl: inferred?.profile ?? null,
+      });
+      if (posts.length >= limit) break;
     }
-    const publishedAt = parseLinkedInSearchDate(snippet + " " + hit.title, now) || hit.publishedAt || activityDate(url);
-    if (recent && !publishedAt) {
-      undated++;
-      continue;
-    }
-    if (recent && !isLinkedInPostWithin48Hours(publishedAt, now)) {
-      outsideWindow++;
-      continue;
-    }
-    const inferred = linkedinAuthorFromPost(url);
-    const authorFromTitle = hit.title.match(/^(.{2,80}?)\s+on LinkedIn\s*:/i);
-    posts.push({
-      url,
-      text: body.slice(0, 5000),
-      publishedAt,
-      authorName: (authorFromTitle && authorFromTitle[1].trim()) || inferred?.name || null,
-      authorUrl: inferred?.profile ?? null,
+
+    console.info("[LinkedIn] Google UI search diagnostics", {
+      competitor: name,
+      query: name,
+      timeFilter: apply24HourFilter ? "Tools > Any time > Past 24 hours" : "Any time (filter disabled)",
+      browserMode: "headless",
+      indexedResults: hits.length,
+      matchingPostUrls: hitsByUrl.size,
+      readablePosts: posts.length,
+      undated,
+      outside24Hours,
+      unreadablePreview,
+      sampleResults: hits.slice(0, 10).map((hit) => ({
+        url: hit.url.slice(0, 350),
+        title: hit.title.slice(0, 180),
+        snippet: hit.snippet.slice(0, 260),
+        publishedAt: hit.publishedAt ?? "",
+      })),
     });
-    if (posts.length >= limit) break;
-  }
 
-  console.info("[LinkedIn] Search diagnostics", {
-    competitor: name,
-    queries,
-    searchTimeWindow: recent ? {after:startDate, before:tomorrow, maxAgeHours:48} : "unrestricted",
-    successfulProviders,
-    successfulSearchRequests,
-    providerResultCounts,
-    providerErrors,
-    indexedResults: batches.reduce((total, batch) => total + batch.results.length, 0),
-    matchingPostUrls: hitsByUrl.size,
-    sampleIndexedHits: batches.flatMap((batch) => batch.results).slice(0, 10).map((hit) => ({
-      url: hit.url.slice(0, 400),
-      normalizedPostUrl: normalizeLinkedInPostUrl(hit.url),
-      title: hit.title.slice(0, 180),
-      snippet: hit.snippet.slice(0, 240),
-    })),
-    readablePreviews: posts.length,
-    undated,
-    outside48Hours: outsideWindow,
-    unreadablePreview,
-  });
-  return posts;
+    return posts;
+  } finally {
+    await page.close().catch(() => undefined);
+  }
 }
+

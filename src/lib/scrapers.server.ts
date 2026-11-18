@@ -1657,14 +1657,14 @@ export async function filterAndRecoverJirosearchReviews(
 async function linkedin(c: CompetitorCtx, opts: ScrapePlatformOptions = {}) {
   const { searchAndScrapeLinkedInPosts } = await import("./public-social-scrapers.server");
   const posts = await searchAndScrapeLinkedInPosts(c, {
-    apply48HourFilter: opts.apply48HourFilter ?? true,
+    apply24HourFilter: opts.apply48HourFilter ?? true,
     limit: 12,
   });
   if (!posts.length) {
     throw new NoMatch(
       opts.apply48HourFilter === false
-        ? "LinkedIn search returned no readable public post previews"
-        : "LinkedIn search returned no readable post previews with a verifiable publication time in the last 48 hours",
+        ? "LinkedIn Google Search returned no readable public post previews"
+        : "LinkedIn Google Search returned no readable post previews with a verifiable publication time in the last 24 hours",
     );
   }
 
