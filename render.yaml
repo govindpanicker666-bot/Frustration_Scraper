@@ -5,14 +5,18 @@ services:
     plan: free
     buildCommand: >
       npm install &&
-      python3 -m pip install --break-system-packages --disable-pip-version-check -r scripts/toolzerhub/requirements.txt &&
-      python3 -m pip install --break-system-packages --disable-pip-version-check openleads maigret linkook &&
+      python3 -m venv .venv &&
+      .venv/bin/python -m pip install --upgrade pip setuptools wheel &&
+      .venv/bin/python -m pip install --disable-pip-version-check -r scripts/toolzerhub/requirements.txt &&
+      .venv/bin/python -m pip install --disable-pip-version-check openleads==5.6.0 maigret linkook==1.1.3 &&
       PLAYWRIGHT_BROWSERS_PATH="$PWD/.playwright-browsers" npx playwright install --with-deps chromium &&
       npm run build &&
       node scripts/verify-playwright-runtime.mjs &&
-      node scripts/verify-lead-discovery-tools.mjs
+      PYTHON_EXECUTABLE="$PWD/.venv/bin/python" node scripts/verify-lead-discovery-tools.mjs
     startCommand: node .output/server/index.mjs
     envVars:
+      - key: PYTHON_EXECUTABLE
+        value: /opt/render/project/src/.venv/bin/python
       - key: PLAYWRIGHT_BROWSERS_PATH
         value: /opt/render/project/src/.playwright-browsers
       - key: NITRO_PRESET

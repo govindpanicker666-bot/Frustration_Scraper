@@ -16,6 +16,7 @@ import { guessProfileUrl, runLinkookScanner, validateOsintUrls } from "./osint.s
 
 const execFileAsync = promisify(execFile);
 const PYTHON = process.env["PYTHON_EXECUTABLE"]?.trim() || "python3";
+const OPENLEADS_BIN = path.join(path.dirname(PYTHON), "openleads");
 const EMAIL_RE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
 const csvCell = (value: string) => `"${value.replace(/"/g, '""')}"`;
 
@@ -48,7 +49,7 @@ async function runOpenLeads(name: string, company: string | null, domain: string
       ["name", "company", "domain", "email"].map(csvCell).join(","),
       [name, company ?? "", domain ?? "", ""].map(csvCell).join(","),
     ].join("\n"), "utf8");
-    const result = await execFileAsync(PYTHON, ["-m", "openleads", "enrich", input, "-o", output], {
+    const result = await execFileAsync(OPENLEADS_BIN, ["enrich", input, "-o", output], {
       env: { ...process.env, OPENLEADS_HOME: path.join(dir, "workspace") },
       timeout: 55_000,
       maxBuffer: 4 * 1024 * 1024,
