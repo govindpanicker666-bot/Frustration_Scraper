@@ -15,6 +15,7 @@ import {
 import { guessProfileUrl, runLinkookScanner, validateOsintUrls } from "./osint.server";
 
 const execFileAsync = promisify(execFile);
+const PYTHON = process.env["PYTHON_EXECUTABLE"]?.trim() || "python3";
 const EMAIL_RE = /^[a-z0-9._%+-]+@[a-z0-9.-]+\.[a-z]{2,}$/i;
 const csvCell = (value: string) => `"${value.replace(/"/g, '""')}"`;
 
@@ -47,7 +48,7 @@ async function runOpenLeads(name: string, company: string | null, domain: string
       ["name", "company", "domain", "email"].map(csvCell).join(","),
       [name, company ?? "", domain ?? "", ""].map(csvCell).join(","),
     ].join("\n"), "utf8");
-    const result = await execFileAsync("openleads", ["enrich", input, "-o", output], {
+    const result = await execFileAsync(PYTHON, ["-m", "openleads", "enrich", input, "-o", output], {
       env: { ...process.env, OPENLEADS_HOME: path.join(dir, "workspace") },
       timeout: 55_000,
       maxBuffer: 4 * 1024 * 1024,
@@ -58,16 +59,19 @@ async function runOpenLeads(name: string, company: string | null, domain: string
     if (rows.length < 2) return null;
     const headers = rows[0]!.map((h) => h.trim().toLowerCase());
     const values = rows[1]!;
-    const get = (key: string) => values[headers.indexOf(key)]?.trim() ?? "";
+    const get = (...keys: string[]) => {
+      const index = headers.findIndex((header) => keys.includes(header));
+      return index >= 0 ? values[index]?.trim() ?? "" : "";
+    };
     const email = get("email").toLowerCase();
-    if (!EMAIL_RE.test(email) || get("tier").toLowerCase() === "bad") return null;
-    const evidence = get("evidence").toLowerCase() || "guessed";
-    const tier = get("tier").toLowerCase() || "risky";
-    const parsedConfidence = Number(get("confidence_pct"));
+    if (!EMAIL_RE.test(email) || get("email tier", "tier").toLowerCase() === "bad") return null;
+    const evidence = get("email evidence", "evidence").toLowerCase() || "guessed";
+    const tier = get("email tier", "tier").toLowerCase() || "risky";
+    const parsedConfidence = Number(get("confidence %", "confidence_pct"));
     const confidence_pct = Number.isFinite(parsedConfidence)
       ? Math.max(0, Math.min(100, parsedConfidence))
       : evidence === "found" ? 90 : evidence === "pattern" ? 70 : 40;
-    return { email, evidence, tier, confidence_pct, reasons: get("reasons") };
+    return { email, evidence, tier, confidence_pct, reasons: get("reasons") || `OpenLeads: ${get("email confidence") || evidence}; score ${get("email score") || "not supplied"}.` };
   } catch (error) {
     console.warn("[email-enrichment][openleads] unavailable or no result:", error);
     return null;
@@ -170,7 +174,7 @@ async function runMaigret(handle: string): Promise<string[]> {
   try {
     let stdout = "";
     try {
-      const result = await execFileAsync("maigret", [handle, "--json", "simple", "--no-progressbar", "--folderoutput", dir], {
+      const result = await execFileAsync(PYTHON, ["-m", "maigret", handle, "--json", "simple", "--no-progressbar", "--folderoutput", dir], {
         cwd: dir, env: process.env, timeout: 120_000, maxBuffer: 16 * 1024 * 1024,
       });
       stdout = result.stdout ?? "";

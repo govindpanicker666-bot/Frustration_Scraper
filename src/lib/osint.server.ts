@@ -21,6 +21,7 @@ import {
 } from "./pipeline";
 
 const execFileAsync = promisify(execFile);
+const PYTHON = process.env["PYTHON_EXECUTABLE"]?.trim() || "python3";
 
 export interface OsintDiscoveryResult {
   leadId: string;
@@ -161,7 +162,7 @@ export async function runLinkookScanner(
     const args = [handle, "--no-color", "--show-summary", "--scan-all", "--neo4j", "-o", tempDir];
     let stdout = "";
     try {
-      const res = await execFileAsync("linkook", args, {
+      const res = await execFileAsync(PYTHON, ["-m", "linkook", ...args], {
         cwd: tempDir,
         env: process.env,
         timeout: 35_000,
